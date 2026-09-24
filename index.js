@@ -73,6 +73,13 @@ const defaultSettings = Object.freeze({
     aspectRatio: '1:1',
     imageSize: '1K',
     npcReferences: [],
+    characterReferenceLibrary: {
+        characters: {},
+        users: {},
+    },
+    characterLibraryEnabled: true,
+    characterLibrarySelectedKind: 'char',
+    characterLibrarySelectedKey: '',
     wardrobeItems: [],
     activeWardrobeChar: null,
     activeWardrobeUser: null,
@@ -219,6 +226,15 @@ function getSettings() {
             s[key] = defaultSettings[key];
         }
     }
+    if (!s.characterReferenceLibrary || typeof s.characterReferenceLibrary !== 'object') {
+        s.characterReferenceLibrary = { characters: {}, users: {} };
+    }
+    if (!s.characterReferenceLibrary.characters || typeof s.characterReferenceLibrary.characters !== 'object') {
+        s.characterReferenceLibrary.characters = {};
+    }
+    if (!s.characterReferenceLibrary.users || typeof s.characterReferenceLibrary.users !== 'object') {
+        s.characterReferenceLibrary.users = {};
+    }
     // Migrate wardrobe items without description
     for (const item of (s.wardrobeItems || [])) {
         if (!Object.hasOwn(item, 'description')) item.description = '';
@@ -296,6 +312,122 @@ function formatNaisteraDescription(value) {
         return Object.values(value).filter(Boolean).join(' ');
     }
     return String(value);
+}
+
+function getCharacterLibraryKey(character, index = 0) {
+    const avatar = String(character?.avatar || '').trim();
+    if (avatar) return `avatar:${avatar}`;
+    const name = String(character?.name || '').trim();
+    return name ? `name:${name}` : `character:${index}`;
+}
+
+function getCurrentCharacterLibraryKey() {
+    const context = SillyTavern.getContext();
+    const id = context.characterId;
+    return getCharacterLibraryKey(context.characters?.[id], id);
+}
+
+function getCurrentUserLibraryKey(settings = getSettings()) {
+    return `avatar:${String(settings.userAvatarFile || 'default').trim() || 'default'}`;
+}
+
+function makeCharacterLibraryEntry(raw = {}) {
+    const primary = raw.primary && typeof raw.primary === 'object' ? raw.primary : {};
+    const appearanceItems = Array.isArray(raw.appearanceItems) ? raw.appearanceItems : [];
+    return {
+        displayName: String(raw.displayName || '').trim(),
+        primary: {
+            enabled: primary.enabled !== false,
+            imageData: String(primary.imageData || ''),
+            description: String(primary.description || '').trim(),
+        },
+        appearanceItems: appearanceItems.map((item, index) => ({
+            id: String(item?.id || `appearance_${Date.now()}_${index}_${Math.random().toString(36).slice(2, 7)}`),
+            type: item?.type === 'image' ? 'image' : 'text',
+            enabled: item?.enabled !== false,
+            imageData: String(item?.imageData || ''),
+            description: String(item?.description || '').trim(),
+        })).filter(item => item.type === 'text' || item.imageData),
+    };
+}
+
+function getCharacterLibraryEntry(kind, key, settings = getSettings(), create = false) {
+    const bucket = kind === 'user'
+        ? settings.characterReferenceLibrary.users
+        : settings.characterReferenceLibrary.characters;
+    const normalizedKey = String(key || '').trim();
+    if (!normalizedKey) return null;
+    if (!bucket[normalizedKey] && create) {
+        bucket[normalizedKey] = makeCharacterLibraryEntry();
+    }
+    if (!bucket[normalizedKey]) return null;
+    bucket[normalizedKey] = makeCharacterLibraryEntry(bucket[normalizedKey]);
+    return bucket[normalizedKey];
+}
+
+function getCurrentLibraryEntity(kind, settings = getSettings()) {
+    if (kind === 'user') {
+        const key = getCurrentUserLibraryKey(settings);
+        return { key, title: settings.userAvatarFile || 'User' };
+    }
+    const context = SillyTavern.getContext();
+    const character = context.characters?.[context.characterId];
+    return {
+        key: getCurrentCharacterLibraryKey(),
+        title: character?.name || character?.avatar || 'Character',
+    };
+}
+
+function readLibraryFileAsBase64(file) {
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result || '').split(',')[1] || '');
+        reader.onerror = reject;
+        reader.readAsDataURL(file);
+    });
+}
+
+async function collectCharacterLibraryReferences(kind, settings = getSettings()) {
+    if (!settings.characterLibraryEnabled) return { refs: [], descriptions: [], hasPrimary: false };
+    const entity = getCurrentLibraryEntity(kind, settings);
+    const entry = getCharacterLibraryEntry(kind, entity.key, settings, false);
+    if (!entry) return { refs: [], descriptions: [], hasPrimary: false };
+
+    const refs = [];
+    const descriptions = [];
+    const addDescription = (description) => {
+        const value = String(description || '').trim();
+        if (value) descriptions.push(`[CHARACTER APPEARANCE for "${entity.title}"]: ${value}`);
+    };
+    addDescription(entry.primary.description);
+    for (const item of entry.appearanceItems) {
+        if (item.enabled !== false && item.type === 'text') addDescription(item.description);
+    }
+
+    if (entry.primary.enabled !== false && entry.primary.imageData) {
+        refs.push({
+            data: entry.primary.imageData,
+            mimeType: detectMimeType(entry.primary.imageData),
+            name: entity.title,
+            description: entry.primary.description,
+            type: 'face',
+        });
+    }
+    for (const item of entry.appearanceItems) {
+        if (item.enabled === false || item.type !== 'image' || !item.imageData) continue;
+        refs.push({
+            data: item.imageData,
+            mimeType: detectMimeType(item.imageData),
+            name: entity.title,
+            description: item.description,
+            type: 'face',
+        });
+    }
+    return {
+        refs,
+        descriptions,
+        hasPrimary: entry.primary.enabled !== false && Boolean(entry.primary.imageData),
+    };
 }
 
 // ============================================================
@@ -1092,11 +1224,16 @@ async function collectReferenceImages(prompt) {
     const charName = context.characters?.[context.characterId]?.name || null;
     const userName = context.name1 || null;
 
+    const characterLibrary = await collectCharacterLibraryReferences('char', settings);
+    const userLibrary = await collectCharacterLibraryReferences('user', settings);
+    textDirectives.push(...characterLibrary.descriptions, ...userLibrary.descriptions);
+
     // ===== STEP 1: Collect face references (HIGHEST PRIORITY) =====
 
     const useNaisteraRefs = settings.apiType === 'naistera';
-    const needCharAvatar = (useNaisteraRefs ? settings.naisteraSendCharAvatar : settings.sendCharAvatar) ||
-        (settings.autoDetectNames && charName && nameAppearsInPrompt(charName, prompt));
+    const needCharAvatar = !characterLibrary.hasPrimary && ((useNaisteraRefs ? settings.naisteraSendCharAvatar : settings.sendCharAvatar) ||
+        (settings.autoDetectNames && charName && nameAppearsInPrompt(charName, prompt)));
+    if (characterLibrary.refs.length > 0) faceRefs.push(...characterLibrary.refs);
 
     if (needCharAvatar) {
         const charAvatar = await getCharacterAvatarBase64();
@@ -1112,8 +1249,9 @@ async function collectReferenceImages(prompt) {
         }
     }
 
-    const needUserAvatar = (useNaisteraRefs ? settings.naisteraSendUserAvatar : settings.sendUserAvatar) ||
-        (settings.autoDetectNames && userName && nameAppearsInPrompt(userName, prompt));
+    const needUserAvatar = !userLibrary.hasPrimary && ((useNaisteraRefs ? settings.naisteraSendUserAvatar : settings.sendUserAvatar) ||
+        (settings.autoDetectNames && userName && nameAppearsInPrompt(userName, prompt)));
+    if (userLibrary.refs.length > 0) faceRefs.push(...userLibrary.refs);
 
     if (needUserAvatar) {
         const userAvatar = await getUserAvatarBase64();
@@ -3333,6 +3471,143 @@ function updateCharAvatarPreview() {
     }
 }
 
+function getCharacterLibraryEntities(settings = getSettings()) {
+    const context = SillyTavern.getContext();
+    const entities = [];
+    (context.characters || []).forEach((character, index) => {
+        const key = getCharacterLibraryKey(character, index);
+        entities.push({ key, title: character?.name || character?.avatar || `Character ${index + 1}` });
+    });
+    return entities;
+}
+
+function renderCharacterLibrary() {
+    const settings = getSettings();
+    const container = document.getElementById('iig_character_library');
+    if (!container) return;
+    const kind = settings.characterLibrarySelectedKind === 'user' ? 'user' : 'char';
+    const entities = kind === 'user'
+        ? [{ key: getCurrentUserLibraryKey(settings), title: settings.userAvatarFile || 'User' }]
+        : getCharacterLibraryEntities(settings);
+    let selectedKey = settings.characterLibrarySelectedKey;
+    if (!entities.some(entity => entity.key === selectedKey)) selectedKey = entities[0]?.key || '';
+    settings.characterLibrarySelectedKey = selectedKey;
+    const selected = entities.find(entity => entity.key === selectedKey);
+    const entry = selectedKey ? getCharacterLibraryEntry(kind, selectedKey, settings, false) : null;
+
+    const entityOptions = entities.map(entity =>
+        `<option value="${escapeHtml(entity.key)}" ${entity.key === selectedKey ? 'selected' : ''}>${escapeHtml(entity.title)}</option>`
+    ).join('');
+    const appearanceHtml = (entry?.appearanceItems || []).map(item => `
+        <div class="iig-library-item" data-library-item-id="${escapeHtml(item.id)}" style="border:1px solid rgba(255,255,255,.1);border-radius:6px;padding:6px;margin:6px 0;">
+            <label class="checkbox_label"><input type="checkbox" class="iig-library-item-enabled" ${item.enabled !== false ? 'checked' : ''}><span>Использовать</span></label>
+            <div class="flex-row">
+                <span style="font-size:11px;">${item.type === 'image' ? 'Изображение' : 'Текст'}</span>
+                <button type="button" class="menu_button iig-library-item-remove">Удалить</button>
+            </div>
+            ${item.type === 'image'
+                ? `<img src="data:image/png;base64,${item.imageData}" style="width:80px;height:80px;object-fit:cover;border-radius:5px;display:block;margin:5px 0;">`
+                : ''}
+            <textarea class="text_pole iig-library-item-description" rows="2" placeholder="Описание внешности...">${escapeHtml(item.description)}</textarea>
+        </div>
+    `).join('');
+
+    container.innerHTML = `
+        <div style="display:flex;gap:6px;margin-bottom:8px;">
+            <button type="button" class="menu_button iig-library-kind ${kind === 'char' ? 'selected' : ''}" data-library-kind="char">Персонажи</button>
+            <button type="button" class="menu_button iig-library-kind ${kind === 'user' ? 'selected' : ''}" data-library-kind="user">Юзер</button>
+        </div>
+        <div class="flex-row">
+            <label>Запись</label>
+            <select id="iig_library_entity" class="flex1">${entityOptions || '<option value="">Нет персонажей</option>'}</select>
+        </div>
+        ${selectedKey ? `
+            <div style="margin-top:8px;">
+                <label class="checkbox_label"><input type="checkbox" id="iig_library_enabled" ${settings.characterLibraryEnabled !== false ? 'checked' : ''}><span>Включить библиотеку</span></label>
+                <div class="flex-row"><strong>${escapeHtml(selected?.title || selectedKey)}</strong><button type="button" class="menu_button" id="iig_library_create">Создать/изменить запись</button></div>
+                ${entry ? `
+                    <label class="checkbox_label"><input type="checkbox" id="iig_library_primary_enabled" ${entry.primary.enabled !== false ? 'checked' : ''}><span>Использовать основной reference</span></label>
+                    ${entry.primary.imageData ? `<img src="data:image/png;base64,${entry.primary.imageData}" style="width:100px;height:100px;object-fit:cover;border-radius:6px;display:block;margin:5px 0;">` : '<p class="hint">Основной reference ещё не загружен.</p>'}
+                    <input type="file" id="iig_library_primary_file" accept="image/*" style="display:none">
+                    <button type="button" class="menu_button" id="iig_library_primary_upload">Загрузить основной reference</button>
+                    <textarea id="iig_library_primary_description" class="text_pole" rows="2" placeholder="Общее описание персонажа...">${escapeHtml(entry.primary.description)}</textarea>
+                    <div style="display:flex;gap:6px;margin-top:6px;">
+                        <button type="button" class="menu_button" id="iig_library_add_text">Добавить текстовое описание</button>
+                        <button type="button" class="menu_button" id="iig_library_add_image">Добавить image reference</button>
+                    </div>
+                    <input type="file" id="iig_library_item_file" accept="image/*" style="display:none">
+                    <div>${appearanceHtml || '<p class="hint">Дополнительных элементов нет.</p>'}</div>
+                ` : '<p class="hint">Нажмите «Создать/изменить запись», чтобы начать.</p>'}
+            </div>
+        ` : '<p class="hint">Сначала выберите персонажа в SillyTavern.</p>'}
+        <p class="hint">Активная запись автоматически используется как reference для Naistera/NovelAI.</p>
+    `;
+
+    container.querySelectorAll('.iig-library-kind').forEach(button => button.addEventListener('click', () => {
+        settings.characterLibrarySelectedKind = button.dataset.libraryKind;
+        settings.characterLibrarySelectedKey = '';
+        saveSettings();
+        renderCharacterLibrary();
+    }));
+    container.querySelector('#iig_library_entity')?.addEventListener('change', event => {
+        settings.characterLibrarySelectedKey = event.target.value;
+        saveSettings();
+        renderCharacterLibrary();
+    });
+    container.querySelector('#iig_library_enabled')?.addEventListener('change', event => { settings.characterLibraryEnabled = event.target.checked; saveSettings(); });
+    container.querySelector('#iig_library_create')?.addEventListener('click', () => {
+        getCharacterLibraryEntry(kind, selectedKey, settings, true);
+        saveSettings();
+        renderCharacterLibrary();
+    });
+    container.querySelector('#iig_library_primary_enabled')?.addEventListener('change', event => {
+        const current = getCharacterLibraryEntry(kind, selectedKey, settings, true);
+        current.primary.enabled = event.target.checked;
+        saveSettings();
+    });
+    container.querySelector('#iig_library_primary_description')?.addEventListener('input', event => {
+        const current = getCharacterLibraryEntry(kind, selectedKey, settings, true);
+        current.primary.description = event.target.value;
+        saveSettings();
+    });
+    container.querySelector('#iig_library_primary_upload')?.addEventListener('click', () => container.querySelector('#iig_library_primary_file')?.click());
+    container.querySelector('#iig_library_primary_file')?.addEventListener('change', async event => {
+        const file = event.target.files?.[0];
+        if (!file) return;
+        const current = getCharacterLibraryEntry(kind, selectedKey, settings, true);
+        current.primary.imageData = await readLibraryFileAsBase64(file);
+        saveSettings();
+        renderCharacterLibrary();
+    });
+    container.querySelector('#iig_library_add_text')?.addEventListener('click', () => {
+        const current = getCharacterLibraryEntry(kind, selectedKey, settings, true);
+        current.appearanceItems.push({ id: `appearance_${Date.now()}`, type: 'text', enabled: true, imageData: '', description: '' });
+        saveSettings();
+        renderCharacterLibrary();
+    });
+    container.querySelector('#iig_library_add_image')?.addEventListener('click', () => container.querySelector('#iig_library_item_file')?.click());
+    container.querySelector('#iig_library_item_file')?.addEventListener('change', async event => {
+        const file = event.target.files?.[0];
+        if (!file) return;
+        const current = getCharacterLibraryEntry(kind, selectedKey, settings, true);
+        current.appearanceItems.push({ id: `appearance_${Date.now()}`, type: 'image', enabled: true, imageData: await readLibraryFileAsBase64(file), description: '' });
+        saveSettings();
+        renderCharacterLibrary();
+    });
+    container.querySelectorAll('.iig-library-item').forEach(row => {
+        const item = getCharacterLibraryEntry(kind, selectedKey, settings, true).appearanceItems.find(candidate => candidate.id === row.dataset.libraryItemId);
+        if (!item) return;
+        row.querySelector('.iig-library-item-enabled')?.addEventListener('change', event => { item.enabled = event.target.checked; saveSettings(); });
+        row.querySelector('.iig-library-item-description')?.addEventListener('input', event => { item.description = event.target.value; saveSettings(); });
+        row.querySelector('.iig-library-item-remove')?.addEventListener('click', () => {
+            const current = getCharacterLibraryEntry(kind, selectedKey, settings, true);
+            current.appearanceItems = current.appearanceItems.filter(candidate => candidate.id !== item.id);
+            saveSettings();
+            renderCharacterLibrary();
+        });
+    });
+}
+
 // ============================================================
 // SETTINGS UI
 // ============================================================
@@ -3714,6 +3989,18 @@ function createSettingsUI() {
                                 <div class="menu_button" id="iig_npc_add"><i class="fa-solid fa-plus"></i> Добавить</div>
                             </div>
                             <div id="iig_npc_list"></div>
+                        </div>
+                    </div>
+
+                    <!-- ======= SECTION: Character Library ======= -->
+                    <div class="iig-collapsible" data-section-id="character_library">
+                        <div class="iig-collapsible-header">
+                            <i class="fa-solid fa-chevron-down iig-collapse-icon"></i>
+                            <span>📚 Библиотека персонажей</span>
+                        </div>
+                        <div class="iig-collapsible-content">
+                            <p class="hint">Хранит основной reference, дополнительные изображения и текстовые описания для текущих персонажей. Эти данные отправляются в Naistera/NovelAI.</p>
+                            <div id="iig_character_library"></div>
                         </div>
                     </div>
 
@@ -4140,6 +4427,7 @@ function bindSettingsEvents() {
     renderHairstyleGrid('char');
     renderHairstyleGrid('user');
     renderStyleGallery();
+    renderCharacterLibrary();
 }
 
 // ============================================================

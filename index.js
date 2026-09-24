@@ -63,6 +63,7 @@ const defaultSettings = Object.freeze({
     naisteraPollIntervalMs: 3000,
     naisteraPollTimeoutMs: 600000,
     novelaiModel: 'nai-diffusion-5-full',
+    novelaiApiKey: '',
     novelaiWidth: 832,
     novelaiHeight: 1216,
     novelaiSteps: 28,
@@ -248,6 +249,7 @@ function getSettings() {
         context.extensionSettings[MODULE_NAME] = structuredClone(defaultSettings);
     }
     const s = context.extensionSettings[MODULE_NAME];
+    if (s.apiType === 'novelai-custom') s.apiType = 'novelai-direct';
     for (const key of Object.keys(defaultSettings)) {
         if (!Object.hasOwn(s, key)) {
             s[key] = defaultSettings[key];
@@ -428,7 +430,7 @@ async function collectCharacterLibraryReferences(kind, settings = getSettings())
     };
     if (entry.primary.enabled !== false) addDescription(entry.primary.description);
     for (const item of entry.appearanceItems) {
-        if (item.enabled !== false && (item.type === 'text' || settings.apiType === 'novelai')) addDescription(item.description);
+        if (item.enabled !== false && (item.type === 'text' || ['novelai', 'novelai-direct'].includes(settings.apiType))) addDescription(item.description);
     }
 
     if (entry.primary.enabled !== false && entry.primary.imageData) {
@@ -463,7 +465,7 @@ async function collectCharacterLibraryReferences(kind, settings = getSettings())
 
 async function fetchModels() {
     const settings = getSettings();
-    if (settings.apiType === 'novelai') return NOVELAI_MODELS.map(([id]) => id);
+    if (['novelai', 'novelai-direct'].includes(settings.apiType)) return NOVELAI_MODELS.map(([id]) => id);
     if (settings.apiType === 'naistera') {
         return await fetchNaisteraModels();
     }
@@ -1270,7 +1272,7 @@ async function collectReferenceImages(prompt) {
     // ===== STEP 1: Collect face references (HIGHEST PRIORITY) =====
 
     const useNaisteraRefs = settings.apiType === 'naistera';
-    const needCharAvatar = settings.apiType !== 'novelai' && !characterLibrary.hasPrimary && ((useNaisteraRefs ? settings.naisteraSendCharAvatar : settings.sendCharAvatar) ||
+    const needCharAvatar = !['novelai', 'novelai-direct'].includes(settings.apiType) && !characterLibrary.hasPrimary && ((useNaisteraRefs ? settings.naisteraSendCharAvatar : settings.sendCharAvatar) ||
         (settings.autoDetectNames && charName && nameAppearsInPrompt(charName, prompt)));
     if (characterLibrary.refs.length > 0) faceRefs.push(...characterLibrary.refs);
 
@@ -1288,7 +1290,7 @@ async function collectReferenceImages(prompt) {
         }
     }
 
-    const needUserAvatar = settings.apiType !== 'novelai' && !userLibrary.hasPrimary && ((useNaisteraRefs ? settings.naisteraSendUserAvatar : settings.sendUserAvatar) ||
+    const needUserAvatar = !['novelai', 'novelai-direct'].includes(settings.apiType) && !userLibrary.hasPrimary && ((useNaisteraRefs ? settings.naisteraSendUserAvatar : settings.sendUserAvatar) ||
         (settings.autoDetectNames && userName && nameAppearsInPrompt(userName, prompt)));
     if (userLibrary.refs.length > 0) faceRefs.push(...userLibrary.refs);
 
@@ -1371,9 +1373,9 @@ async function collectReferenceImages(prompt) {
         });
     }
 
-    // The stock SillyTavern NovelAI route is text-only. Do not drop outfit
+    // Both NovelAI routes are text-only. Do not drop outfit
     // descriptions just because the four image slots are already full.
-    if (settings.apiType === 'novelai') {
+    if (['novelai', 'novelai-direct'].includes(settings.apiType)) {
         return {
             imageRefs: [],
             textOnlyClothing: clothingRefs.filter(ref => ref.description).map(ref => ({
@@ -1581,8 +1583,56 @@ async function generateImageNaistera(prompt, style, refData, options = {}) {
     return dataUrl;
 }
 
-// SillyTavern owns the NovelAI token, builds the API payload and unpacks the ZIP.
-// Its stock endpoint does not forward image references; use text descriptions only.
+// Direct NovelAI returns a ZIP; extract the first PNG without server access or dependencies.
+async function extractNovelAIPng(archive) {
+    const bytes = new Uint8Array(archive);
+    if (bytes.length < 22 || bytes.length > 60 * 1024 * 1024) throw new Error('NovelAI не вернул ZIP с изображением.');
+    const view = new DataView(archive);
+    const uint16 = offset => view.getUint16(offset, true);
+    const uint32 = offset => view.getUint32(offset, true);
+    let end = -1;
+    for (let pos = bytes.length - 22; pos >= Math.max(0, bytes.length - 65557); pos--) {
+        if (uint32(pos) === 0x06054b50 && pos + 22 + uint16(pos + 20) === bytes.length) { end = pos; break; }
+    }
+    if (end < 0) throw new Error('NovelAI не вернул ZIP с изображением.');
+    const entries = uint16(end + 10);
+    let offset = uint32(end + 16);
+    if (entries > 100 || offset >= end) throw new Error('Некорректный ZIP-ответ NovelAI.');
+    for (let index = 0; index < entries; index++) {
+        if (offset + 46 > end || uint32(offset) !== 0x02014b50) break;
+        const flags = uint16(offset + 8);
+        const method = uint16(offset + 10);
+        const length = uint32(offset + 20);
+        const nameLength = uint16(offset + 28);
+        const extraLength = uint16(offset + 30);
+        const commentLength = uint16(offset + 32);
+        const localOffset = uint32(offset + 42);
+        const next = offset + 46 + nameLength + extraLength + commentLength;
+        if (next > end) break;
+        const name = new TextDecoder().decode(bytes.subarray(offset + 46, offset + 46 + nameLength));
+        if (name.toLowerCase().endsWith('.png') && !name.startsWith('__MACOSX/')) {
+            if (flags & 1 || ![0, 8].includes(method) || localOffset + 30 > bytes.length || uint32(localOffset) !== 0x04034b50) break;
+            const start = localOffset + 30 + uint16(localOffset + 26) + uint16(localOffset + 28);
+            if (start + length > bytes.length || length > 50 * 1024 * 1024) break;
+            const compressed = bytes.subarray(start, start + length);
+            const png = method === 0 ? compressed : new Uint8Array(await new Response(
+                new Blob([compressed]).stream().pipeThrough(new DecompressionStream('deflate-raw')),
+            ).arrayBuffer());
+            if (png.length > 50 * 1024 * 1024 || png.length < 8 || ![137, 80, 78, 71, 13, 10, 26, 10].every((byte, i) => png[i] === byte)) {
+                throw new Error('NovelAI вернул ZIP без корректного PNG.');
+            }
+            let base64 = '';
+            for (let i = 0; i < png.length; i += 0x6000) {
+                base64 += String.fromCharCode(...png.subarray(i, i + 0x6000));
+            }
+            return btoa(base64);
+        }
+        offset = next;
+    }
+    throw new Error('NovelAI вернул ZIP без PNG.');
+}
+
+// Both NovelAI routes use text descriptions only, not image references.
 async function generateImageNovelAI(prompt, style, refData = {}, options = {}) {
     const settings = getSettings();
     const parts = [];
@@ -1625,18 +1675,45 @@ async function generateImageNovelAI(prompt, style, refData = {}, options = {}) {
         decrisper: settings.novelaiDecrisper,
         variety_boost: settings.novelaiVarietyBoost,
     };
-    iigLog('INFO', `NovelAI via SillyTavern: model=${body.model}, size=${width}x${height}, text=${body.prompt.length} chars`);
-    const response = await fetch('/api/novelai/generate-image', {
+    const direct = settings.apiType === 'novelai-direct';
+    const token = direct ? normalizeApiKey(settings.novelaiApiKey) : '';
+    if (direct && !token) throw new Error('Введите NovelAI Access Token в настройках haruspics.');
+    iigLog('INFO', `NovelAI ${direct ? 'direct' : 'SillyTavern'}: model=${body.model}, size=${width}x${height}, text=${body.prompt.length} chars`);
+    const negative = body.negative_prompt || '';
+    const directBody = direct ? {
+        action: 'generate', input: body.prompt, model: body.model,
+        parameters: {
+            params_version: body.model.startsWith('nai-diffusion-5-') ? 4 : 3,
+            prefer_brownian: true, negative_prompt: negative,
+            width, height, steps: body.steps, scale: body.scale,
+            seed: body.seed >= 0 ? body.seed : Math.floor(Math.random() * 9999999999),
+            sampler: body.sampler, noise_schedule: body.scheduler, n_samples: 1,
+            ucPreset: 0, qualityToggle: false, add_original_image: false,
+            controlnet_strength: 1, deliberate_euler_ancestral_bug: false,
+            dynamic_thresholding: body.decrisper, legacy: false, legacy_v3_extend: false,
+            sm: body.sm, sm_dyn: body.sm_dyn, uncond_scale: 1,
+            skip_cfg_above_sigma: null, use_coords: false, characterPrompts: [],
+            reference_image_multiple: [], reference_information_extracted_multiple: [], reference_strength_multiple: [],
+            v4_negative_prompt: { caption: { base_caption: negative, char_captions: [] } },
+            v4_prompt: { caption: { base_caption: body.prompt, char_captions: [] }, use_coords: false, use_order: true },
+        },
+    } : null;
+    const response = await fetch(direct ? 'https://image.novelai.net/ai/generate-image' : '/api/novelai/generate-image', {
         method: 'POST',
-        headers: SillyTavern.getContext().getRequestHeaders(),
-        body: JSON.stringify(body),
+        headers: direct ? { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` } : SillyTavern.getContext().getRequestHeaders(),
+        body: JSON.stringify(direct ? directBody : body),
         signal: options.signal,
     });
     if (!response.ok) {
+        if (direct) {
+            const detail = (await response.text().catch(() => '')).slice(0, 1000);
+            throw new Error(`NovelAI HTTP ${response.status}: ${detail.replaceAll(token, '[redacted]') || response.statusText}`);
+        }
         if (response.status === 400) throw new Error('NovelAI: укажите Access Token в секретах SillyTavern.');
         if (response.status === 404) throw new Error('NovelAI: сервер SillyTavern не поддерживает /api/novelai/generate-image. Обновите SillyTavern.');
         throw new Error(`NovelAI через SillyTavern: HTTP ${response.status}. Проверьте токен, модель и журнал сервера.`);
     }
+    if (direct) return `data:image/png;base64,${await extractNovelAIPng(await response.arrayBuffer())}`;
     const base64 = (await response.text()).trim();
     if (!base64.startsWith('iVBORw0KGgo') || base64.length % 4 !== 0 || !/^[A-Za-z0-9+/]+={0,2}$/.test(base64)) {
         throw new Error('NovelAI: SillyTavern вернул некорректное изображение.');
@@ -2048,14 +2125,15 @@ async function generateImageGemini(prompt, style, refData, options = {}) {
 function validateSettings() {
     const settings = getSettings();
     const errors = [];
-    if (!['naistera', 'novelai'].includes(settings.apiType) && !settings.endpoint) errors.push('URL эндпоинта не настроен');
-    if (settings.apiType !== 'novelai' && !settings.apiKey) errors.push('API ключ не настроен');
+    if (!['naistera', 'novelai', 'novelai-direct'].includes(settings.apiType) && !settings.endpoint) errors.push('URL эндпоинта не настроен');
+    if (!['novelai', 'novelai-direct'].includes(settings.apiType) && !settings.apiKey) errors.push('API ключ не настроен');
+    if (settings.apiType === 'novelai-direct' && !normalizeApiKey(settings.novelaiApiKey)) errors.push('Укажите NovelAI Access Token в расширении');
     const selectedModel = settings.apiType === 'naistera' ? normalizeNaisteraModel(settings.naisteraModel)
-        : settings.apiType === 'novelai' ? settings.novelaiModel : settings.model;
-    if (!selectedModel || (settings.apiType === 'novelai' && !NOVELAI_MODELS.some(([id]) => id === selectedModel))) {
+        : ['novelai', 'novelai-direct'].includes(settings.apiType) ? settings.novelaiModel : settings.model;
+    if (!selectedModel || (['novelai', 'novelai-direct'].includes(settings.apiType) && !NOVELAI_MODELS.some(([id]) => id === selectedModel))) {
         errors.push('Модель не выбрана');
     }
-    if (settings.apiType === 'novelai' && (
+    if (['novelai', 'novelai-direct'].includes(settings.apiType) && (
         !Number.isInteger(Number(settings.novelaiWidth)) || Number(settings.novelaiWidth) < 64 || Number(settings.novelaiWidth) > 2048 ||
         !Number.isInteger(Number(settings.novelaiHeight)) || Number(settings.novelaiHeight) < 64 || Number(settings.novelaiHeight) > 2048 ||
         !Number.isInteger(Number(settings.novelaiSteps)) || Number(settings.novelaiSteps) < 1 || Number(settings.novelaiSteps) > 50 ||
@@ -2103,7 +2181,7 @@ async function generateImageWithRetry(prompt, style, onStatusUpdate, options = {
             if (settings.apiType === 'naistera') {
                 return await generateImageNaistera(prompt, style, refData, genOptions);
             }
-            if (settings.apiType === 'novelai') {
+            if (['novelai', 'novelai-direct'].includes(settings.apiType)) {
                 return await generateImageNovelAI(prompt, style, refData, genOptions);
             }
             const useChatApi = settings.apiType === 'openai-chat' ||
@@ -3914,21 +3992,22 @@ function createSettingsUI() {
                                     <option value="gemini" ${settings.apiType === 'gemini' ? 'selected' : ''}>Gemini (nano-banana)</option>
                                     <option value="naistera" ${settings.apiType === 'naistera' ? 'selected' : ''}>Naistera (включая NovelAI)</option>
                                     <option value="novelai" ${settings.apiType === 'novelai' ? 'selected' : ''}>NovelAI официальный (через SillyTavern)</option>
+                                    <option value="novelai-direct" ${settings.apiType === 'novelai-direct' ? 'selected' : ''}>NovelAI напрямую (свой Access Token)</option>
                                 </select>
                             </div>
 
-                            <div class="flex-row ${settings.apiType === 'novelai' ? 'hidden' : ''}" id="iig_endpoint_row">
+                            <div class="flex-row ${['novelai', 'novelai-direct'].includes(settings.apiType) ? 'hidden' : ''}" id="iig_endpoint_row">
                                 <label>Эндпоинт</label>
                                 <input type="text" id="iig_endpoint" class="text_pole flex1" value="${settings.endpoint || ''}" placeholder="${settings.apiType === 'naistera' ? 'https://naistera.org' : 'https://api.openai.com'}">
                             </div>
 
-                            <div class="flex-row ${settings.apiType === 'novelai' ? 'hidden' : ''}" id="iig_api_key_row">
+                            <div class="flex-row ${['novelai', 'novelai-direct'].includes(settings.apiType) ? 'hidden' : ''}" id="iig_api_key_row">
                                 <label>API ключ</label>
                                 <input type="password" id="iig_api_key" class="text_pole flex1" value="${settings.apiKey || ''}" placeholder="sk-...">
                                 <div class="menu_button iig-key-toggle" id="iig_key_toggle"><i class="fa-solid fa-eye"></i></div>
                             </div>
 
-                            <div class="flex-row ${['naistera', 'novelai'].includes(settings.apiType) ? 'hidden' : ''}" id="iig_standard_model_row">
+                            <div class="flex-row ${['naistera', 'novelai', 'novelai-direct'].includes(settings.apiType) ? 'hidden' : ''}" id="iig_standard_model_row">
                                 <label>Модель</label>
                                 <select id="iig_model" class="flex1">
                                     ${settings.model ? `<option value="${settings.model}" selected>${settings.model}</option>` : '<option value="">Выберите модель</option>'}
@@ -3936,8 +4015,13 @@ function createSettingsUI() {
                                 <div class="menu_button iig-refresh-btn" id="iig_refresh_models" title="Обновить список моделей"><i class="fa-solid fa-arrows-rotate"></i></div>
                             </div>
 
-                            <div id="iig_novelai_section" class="${settings.apiType !== 'novelai' ? 'hidden' : ''}">
-                                <p class="hint">Официальный NovelAI: Access Token задаётся в секретах SillyTavern, не в этом расширении. Стандартный серверный маршрут принимает только текстовые описания, изображения из библиотеки не отправляются.</p>
+                            <div id="iig_novelai_section" class="${!['novelai', 'novelai-direct'].includes(settings.apiType) ? 'hidden' : ''}">
+                                <p class="hint">Прямой режим не требует доступа к серверу: запрос идёт из браузера на image.novelai.net. Access Token сохраняется в настройках расширения SillyTavern (не в защищённых секретах сервера). Не используйте его в чужой установке SillyTavern. Изображения-референсы не отправляются.</p>
+                                <div class="flex-row ${settings.apiType !== 'novelai-direct' ? 'hidden' : ''}" id="iig_novelai_token_row">
+                                    <label>NovelAI Access Token</label>
+                                    <input type="password" id="iig_novelai_token" class="text_pole flex1" value="${escapeHtml(settings.novelaiApiKey || '')}" autocomplete="off" placeholder="Вставьте NovelAI Access Token">
+                                    <div class="menu_button" id="iig_novelai_token_toggle" title="Показать или скрыть токен"><i class="fa-solid fa-eye"></i></div>
+                                </div>
                                 <div class="flex-row">
                                     <label>Модель NovelAI</label>
                                     <select id="iig_novelai_model" class="flex1">
@@ -4352,12 +4436,13 @@ function bindSettingsEvents() {
     const settings = getSettings();
 
     const updateProviderVisibility = (type) => {
-        document.getElementById('iig_endpoint_row')?.classList.toggle('hidden', type === 'novelai');
-        document.getElementById('iig_api_key_row')?.classList.toggle('hidden', type === 'novelai');
-        document.getElementById('iig_standard_model_row')?.classList.toggle('hidden', ['naistera', 'novelai'].includes(type));
+        document.getElementById('iig_endpoint_row')?.classList.toggle('hidden', ['novelai', 'novelai-direct'].includes(type));
+        document.getElementById('iig_api_key_row')?.classList.toggle('hidden', ['novelai', 'novelai-direct'].includes(type));
+        document.getElementById('iig_standard_model_row')?.classList.toggle('hidden', ['naistera', 'novelai', 'novelai-direct'].includes(type));
         document.getElementById('iig_gemini_section')?.classList.toggle('hidden', type !== 'gemini');
         document.getElementById('iig_naistera_section')?.classList.toggle('hidden', type !== 'naistera');
-        document.getElementById('iig_novelai_section')?.classList.toggle('hidden', type !== 'novelai');
+        document.getElementById('iig_novelai_section')?.classList.toggle('hidden', !['novelai', 'novelai-direct'].includes(type));
+        document.getElementById('iig_novelai_token_row')?.classList.toggle('hidden', type !== 'novelai-direct');
     };
 
     document.getElementById('iig_enabled')?.addEventListener('change', (e) => { settings.enabled = e.target.checked; saveSettings(); });
@@ -4450,6 +4535,11 @@ function bindSettingsEvents() {
     document.getElementById('iig_naistera_poll_timeout')?.addEventListener('change', (e) => { settings.naisteraPollTimeoutMs = Math.max(30000, parseInt(e.target.value, 10) || 600000); saveSettings(); });
 
     document.getElementById('iig_novelai_model')?.addEventListener('change', (e) => { settings.novelaiModel = e.target.value; saveSettings(); });
+    document.getElementById('iig_novelai_token')?.addEventListener('change', (e) => { settings.novelaiApiKey = normalizeApiKey(e.target.value); e.target.value = settings.novelaiApiKey; saveSettings(); });
+    document.getElementById('iig_novelai_token_toggle')?.addEventListener('click', () => {
+        const input = document.getElementById('iig_novelai_token');
+        input.type = input.type === 'password' ? 'text' : 'password';
+    });
     for (const [id, field] of [
         ['width', 'novelaiWidth'], ['height', 'novelaiHeight'], ['steps', 'novelaiSteps'],
         ['scale', 'novelaiScale'], ['seed', 'novelaiSeed'],
@@ -4487,14 +4577,22 @@ function bindSettingsEvents() {
         const button = e.currentTarget;
         button.classList.add('loading');
         try {
-            const response = await fetch('/api/novelai/status', {
-                method: 'POST',
-                headers: SillyTavern.getContext().getRequestHeaders(),
-                body: JSON.stringify({}),
+            const direct = settings.apiType === 'novelai-direct';
+            const token = normalizeApiKey(document.getElementById('iig_novelai_token')?.value || settings.novelaiApiKey);
+            if (direct && !token) throw new Error('Введите NovelAI Access Token');
+            const response = await fetch(direct ? 'https://image.novelai.net/user/subscription' : '/api/novelai/status', direct ? {
+                method: 'GET', headers: { Authorization: `Bearer ${token}` },
+            } : {
+                method: 'POST', headers: SillyTavern.getContext().getRequestHeaders(), body: JSON.stringify({}),
             });
-            if (!response.ok) throw new Error(response.status === 400 ? 'Access Token не задан в SillyTavern' : `HTTP ${response.status}`);
-            const result = await response.json();
-            if (result?.error) throw new Error('NovelAI отклонил токен. Проверьте секреты SillyTavern.');
+            if (!response.ok) {
+                throw new Error(response.status === 401 && direct ? 'Неверный NovelAI Access Token' : response.status === 400 && !direct ? 'Access Token не задан в SillyTavern' : `HTTP ${response.status}`);
+            }
+            if (!direct) {
+                const result = await response.json();
+                if (result?.error) throw new Error('NovelAI отклонил токен. Проверьте секреты SillyTavern.');
+            }
+            if (direct) { settings.novelaiApiKey = token; saveSettings(); }
             toastr.success('NovelAI подключён', 'Генерация картинок');
         } catch (error) {
             toastr.error(`NovelAI: ${error.message}`, 'Генерация картинок');

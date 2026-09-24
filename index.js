@@ -62,7 +62,7 @@ const defaultSettings = Object.freeze({
     naisteraPolling: false,
     naisteraPollIntervalMs: 3000,
     naisteraPollTimeoutMs: 600000,
-    novelaiModel: 'nai-diffusion-4-5-full',
+    novelaiModel: 'nai-diffusion-5-full',
     novelaiWidth: 832,
     novelaiHeight: 1216,
     novelaiSteps: 28,
@@ -130,6 +130,8 @@ const IMAGE_MODEL_KEYWORDS = [
 ];
 
 const NOVELAI_MODELS = [
+    ['nai-diffusion-5-full', 'NAI Diffusion V5 (Full)'],
+    ['nai-diffusion-5-curated', 'NAI Diffusion V5 (Curated)'],
     ['nai-diffusion-4-5-full', 'NAI Diffusion Anime V4.5 (Full)'],
     ['nai-diffusion-4-5-curated', 'NAI Diffusion Anime V4.5 (Curated)'],
     ['nai-diffusion-4-full', 'NAI Diffusion Anime V4 (Full)'],

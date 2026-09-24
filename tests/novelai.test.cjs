@@ -12,7 +12,7 @@ assert.ok(start >= 0 && end > start, 'NovelAI provider must exist');
 function setup(response, settings = {}) {
     const requests = [];
     const config = {
-        novelaiModel: 'nai-diffusion-4-5-full', novelaiWidth: 832, novelaiHeight: 1216,
+        novelaiModel: 'nai-diffusion-5-full', novelaiWidth: 832, novelaiHeight: 1216,
         novelaiSteps: 28, novelaiScale: 5, novelaiSampler: 'k_dpmpp_2m',
         novelaiScheduler: 'karras', novelaiNegativePrompt: 'blurry', novelaiSeed: -1,
         novelaiSm: false, novelaiSmDyn: false, novelaiDecrisper: false,
@@ -41,7 +41,7 @@ test('sends text only via SillyTavern and converts its base64 PNG response', asy
     assert.equal(requests[0].url, '/api/novelai/generate-image');
     assert.equal(requests[0].init.headers['X-CSRF-Token'], 'test');
     const body = JSON.parse(requests[0].init.body);
-    assert.equal(body.model, 'nai-diffusion-4-5-full');
+    assert.equal(body.model, 'nai-diffusion-5-full');
     assert.equal(body.negative_prompt, 'low quality');
     assert.equal(body.width, body.height);
     assert.match(body.prompt, /anime.*red hair.*blue coat.*forest/);

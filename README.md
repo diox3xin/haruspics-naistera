@@ -19,6 +19,27 @@ NovelAI** через встроенный серверный маршрут Sill
    ширину и высоту относительно выбранной площади; `negative_prompt` переопределяет
    настройку для отдельной картинки. Стиль добавляется как обычный текст.
 
+В списке доступны **NovelAI Diffusion V5 Full** (`nai-diffusion-5-full`) и
+**V5 Curated** (`nai-diffusion-5-curated`), а также предыдущие модели для
+совместимости. V5 Full выбран по умолчанию.
+
+**Важно для V5:** на момент проверки встроенный маршрут SillyTavern принудительно
+отправляет `params_version: 3`, тогда как V5 использует `params_version: 4`.
+Если ваша версия SillyTavern ещё не поддерживает V5, можно остановить его и
+применить патч к локальной установке (нужен Node.js):
+
+```powershell
+node "C:\Users\diox3\Downloads\haruspics\tools\patch-sillytavern-novelai.cjs" "C:\путь\к\SillyTavern"
+```
+
+Патчер меняет только `/generate-image` в `src/endpoints/novelai.js` и создаёт
+`novelai.js.haruspics-backup`. После обновления SillyTavern патч может потребоваться
+повторить; если код маршрута изменился, патчер откажется вносить изменения.
+**Сам ZIP-маршрут с V5 не проверен live** (нужен NovelAI Access Token); если
+сервер вернёт HTTP 500, проверьте журнал SillyTavern. V5 может требовать
+`/ai/generate-image-stream` с обработкой msgpack вместо ZIP, что потребует
+обновления серверного маршрута SillyTavern.
+
 Токен не сохраняется в `haruspics`: расширение обращается к
 `POST /api/novelai/generate-image` SillyTavern, который вызывает NovelAI,
 распаковывает ZIP и возвращает base64 PNG. Проверьте, что ваша версия

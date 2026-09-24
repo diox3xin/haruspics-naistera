@@ -13,6 +13,8 @@ const MODULE_NAME = 'inline_image_gen';
 
 const processingMessages = new Set();
 const activeAbortControllers = new Map();
+let iigLibraryPersonaFiles = [];
+let iigLibraryPersonasLoaded = false;
 
 const logBuffer = [];
 const MAX_LOG_ENTRIES = 200;
@@ -498,7 +500,15 @@ async function fetchUserAvatars() {
             headers: context.getRequestHeaders(),
         });
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        return await response.json();
+        const payload = await response.json();
+        const avatars = Array.isArray(payload)
+            ? payload
+            : Array.isArray(payload?.avatars)
+                ? payload.avatars
+                : Array.isArray(payload?.files)
+                    ? payload.files
+                    : [];
+        return avatars.map(avatar => String(avatar || '').trim()).filter(Boolean);
     } catch (error) {
         console.error('[IIG] Failed to fetch user avatars:', error);
         return [];
@@ -3612,6 +3622,136 @@ function renderCharacterLibrary() {
 // SETTINGS UI
 // ============================================================
 
+function getLibraryCatalogEntities(kind, settings = getSettings()) {
+    const context = SillyTavern.getContext();
+    const entities = new Map();
+    const library = kind === 'user'
+        ? settings.characterReferenceLibrary.users
+        : settings.characterReferenceLibrary.characters;
+    if (kind === 'char') {
+        (Array.isArray(context.characters) ? context.characters : []).forEach((character, index) => {
+            const key = getCharacterLibraryKey(character, index);
+            const entry = getCharacterLibraryEntry(kind, key, settings, false);
+            entities.set(key, {
+                kind, key,
+                title: entry?.displayName || character?.name || character?.avatar || `Character ${index + 1}`,
+                fallbackTitle: character?.name || character?.avatar || `Character ${index + 1}`,
+                preview: character?.avatar ? `/thumbnail?type=avatar&file=${encodeURIComponent(character.avatar)}` : '',
+                active: Number(context.characterId) === index,
+                configured: Boolean(entry),
+            });
+        });
+    } else {
+        const personaFiles = new Set(iigLibraryPersonaFiles);
+        const personas = context.powerUserSettings?.personas && typeof context.powerUserSettings.personas === 'object'
+            ? context.powerUserSettings.personas : {};
+        Object.keys(personas).forEach(file => personaFiles.add(file));
+        Object.keys(library || {}).forEach(key => personaFiles.add(key.replace(/^avatar:/, '')));
+        [...personaFiles].forEach(avatarFile => {
+            const key = `avatar:${avatarFile}`;
+            const entry = getCharacterLibraryEntry(kind, key, settings, false);
+            entities.set(key, {
+                kind, key,
+                title: entry?.displayName || personas[avatarFile] || avatarFile.replace(/\.[^.]+$/, ''),
+                fallbackTitle: personas[avatarFile] || avatarFile,
+                preview: `/thumbnail?type=persona&file=${encodeURIComponent(avatarFile)}`,
+                active: settings.userAvatarFile === avatarFile,
+                configured: Boolean(entry),
+            });
+        });
+        Object.keys(library || {}).forEach(key => {
+            if (entities.has(key)) return;
+            const avatarFile = key.replace(/^avatar:/, '');
+            const entry = getCharacterLibraryEntry(kind, key, settings, false);
+            entities.set(key, {
+                kind, key,
+                title: entry?.displayName || avatarFile || 'Persona',
+                fallbackTitle: avatarFile || 'Persona',
+                preview: avatarFile ? `/thumbnail?type=persona&file=${encodeURIComponent(avatarFile)}` : '',
+                active: settings.userAvatarFile === avatarFile,
+                configured: true,
+            });
+        });
+    }
+    return [...entities.values()].sort((a, b) => String(a.title).localeCompare(String(b.title)));
+}
+
+function libraryPreviewHtml(src, fallback = 'fa-user') {
+    return src
+        ? `<img src="${escapeHtml(src)}" alt="" loading="lazy" onerror="this.style.display='none'">`
+        : `<span><i class="fa-solid ${fallback}"></i></span>`;
+}
+
+async function renderCharacterLibraryV2() {
+    const settings = getSettings();
+    const container = document.getElementById('iig_character_library');
+    if (!container) return;
+    const kind = settings.characterLibrarySelectedKind === 'user' ? 'user' : 'char';
+    if (kind === 'user' && !iigLibraryPersonasLoaded) {
+        iigLibraryPersonaFiles = await fetchUserAvatars();
+        iigLibraryPersonasLoaded = true;
+    }
+    const entities = getLibraryCatalogEntities(kind, settings);
+    let selectedKey = settings.characterLibrarySelectedKey;
+    if (!entities.some(entity => entity.key === selectedKey)) selectedKey = entities.find(entity => entity.active)?.key || entities[0]?.key || '';
+    settings.characterLibrarySelectedKey = selectedKey;
+    const selected = entities.find(entity => entity.key === selectedKey);
+    const entry = selectedKey ? getCharacterLibraryEntry(kind, selectedKey, settings, false) : null;
+    const primaryPreview = entry?.primary?.imageData
+        ? `data:image/png;base64,${entry.primary.imageData}`
+        : selected?.preview || '';
+    const cards = entities.map(entity => `
+        <button type="button" class="iig-library-card ${entity.key === selectedKey ? 'selected' : ''} ${entity.active ? 'active' : ''}" data-library-card-key="${escapeHtml(entity.key)}">
+            <div class="iig-library-card-preview">${libraryPreviewHtml(entity.preview, kind === 'char' ? 'fa-user-pen' : 'fa-user')}</div>
+            <strong>${escapeHtml(entity.title)}</strong>
+            <small>${entity.active ? 'Активная' : entity.configured ? 'Настроена' : ''}</small>
+        </button>`).join('');
+    const items = entry?.appearanceItems || [];
+    const itemHtml = items.map(item => `
+        <div class="iig-library-detail-row ${item.enabled === false ? 'disabled' : ''}" data-library-item-id="${escapeHtml(item.id)}">
+            <label class="checkbox_label"><input type="checkbox" class="iig-library-item-enabled" ${item.enabled !== false ? 'checked' : ''}><span></span></label>
+            <div class="iig-library-detail-preview">${item.type === 'image' ? libraryPreviewHtml(`data:image/png;base64,${item.imageData}`, 'fa-image') : '<i class="fa-solid fa-align-left"></i>'}</div>
+            <textarea class="text_pole iig-library-item-description" rows="2" placeholder="Описание...">${escapeHtml(item.description)}</textarea>
+            <button type="button" class="menu_button iig-library-item-remove" title="Удалить"><i class="fa-solid fa-trash"></i></button>
+        </div>`).join('');
+    container.innerHTML = `
+        <div class="iig-library-v2-toolbar">
+            <div class="iig-library-v2-tabs">
+                <button type="button" class="menu_button ${kind === 'char' ? 'selected' : ''}" data-library-kind="char"><i class="fa-solid fa-address-card"></i> Персонажи (${kind === 'char' ? entities.length : getLibraryCatalogEntities('char', settings).length})</button>
+                <button type="button" class="menu_button ${kind === 'user' ? 'selected' : ''}" data-library-kind="user"><i class="fa-solid fa-user"></i> Персоны (${kind === 'user' ? entities.length : getLibraryCatalogEntities('user', settings).length})</button>
+            </div>
+            <input id="iig_library_search_v2" class="text_pole" type="search" placeholder="Поиск персонажа или персоны..." value="${escapeHtml(settings.characterLibrarySearch || '')}">
+        </div>
+        <div class="iig-library-v2-layout">
+            <div class="iig-library-v2-cards">${cards || '<div class="iig-library-empty">Сущности не найдены</div>'}</div>
+            <div class="iig-library-v2-editor">
+                ${selected ? `<div class="iig-library-editor-title"><div class="iig-library-editor-avatar">${libraryPreviewHtml(primaryPreview, kind === 'char' ? 'fa-user-pen' : 'fa-user')}</div><div><h3>${escapeHtml(selected.title)}</h3><small>${kind === 'char' ? 'Персонаж' : 'Персона'}</small></div><button type="button" class="menu_button" id="iig_library_create_v2">${entry ? 'Изменить запись' : 'Создать запись'}</button></div>
+                    ${entry ? `<div class="iig-library-editor-section"><h4>Основной reference</h4><div class="iig-library-primary-v2"><div class="iig-library-primary-preview">${libraryPreviewHtml(primaryPreview, 'fa-image')}</div><div class="iig-library-primary-controls"><label class="checkbox_label"><input type="checkbox" id="iig_library_primary_enabled_v2" ${entry.primary.enabled !== false ? 'checked' : ''}><span>Использовать</span></label><textarea id="iig_library_primary_description_v2" class="text_pole" rows="3" placeholder="Описание основного reference...">${escapeHtml(entry.primary.description)}</textarea><input type="file" id="iig_library_primary_file_v2" accept="image/*" hidden><button type="button" class="menu_button" id="iig_library_primary_upload_v2"><i class="fa-solid fa-upload"></i> Загрузить/заменить</button></div></div></div><div class="iig-library-editor-section"><div class="iig-library-section-head-v2"><h4>Дополнительные appearance details</h4><div><button type="button" class="menu_button" id="iig_library_add_text_v2"><i class="fa-solid fa-align-left"></i> Текст</button><button type="button" class="menu_button" id="iig_library_add_image_v2"><i class="fa-solid fa-image"></i> Фото</button><input type="file" id="iig_library_item_file_v2" accept="image/*" hidden></div></div>${itemHtml || '<div class="iig-library-empty">Дополнительных элементов нет</div>'}</div>` : '<div class="iig-library-empty">Нажми «Создать запись», чтобы добавить reference и описания.</div>'}` : '<div class="iig-library-empty">Выбери карточку слева.</div>'}
+            </div>
+        </div>`;
+    container.querySelectorAll('[data-library-kind]').forEach(button => button.addEventListener('click', () => { settings.characterLibrarySelectedKind = button.dataset.libraryKind; settings.characterLibrarySelectedKey = ''; saveSettings(); renderCharacterLibraryV2(); }));
+    container.querySelectorAll('.iig-library-card').forEach(card => card.addEventListener('click', () => {
+        settings.characterLibrarySelectedKey = card.dataset.libraryCardKey;
+        if (kind === 'user' && settings.characterLibrarySelectedKey.startsWith('avatar:')) {
+            settings.userAvatarFile = settings.characterLibrarySelectedKey.slice('avatar:'.length);
+        }
+        saveSettings();
+        renderCharacterLibraryV2();
+    }));
+    container.querySelector('#iig_library_search_v2')?.addEventListener('input', event => { settings.characterLibrarySearch = event.target.value; const query = settings.characterLibrarySearch.toLowerCase(); container.querySelectorAll('.iig-library-card').forEach(card => { card.style.display = card.textContent.toLowerCase().includes(query) ? '' : 'none'; }); });
+    if (!selectedKey) return;
+    container.querySelector('#iig_library_create_v2')?.addEventListener('click', () => { getCharacterLibraryEntry(kind, selectedKey, settings, true); saveSettings(); renderCharacterLibraryV2(); });
+    if (!entry) return;
+    container.querySelector('#iig_library_primary_enabled_v2')?.addEventListener('change', event => { entry.primary.enabled = event.target.checked; saveSettings(); });
+    container.querySelector('#iig_library_primary_description_v2')?.addEventListener('input', event => { entry.primary.description = event.target.value; saveSettings(); });
+    container.querySelector('#iig_library_primary_upload_v2')?.addEventListener('click', () => container.querySelector('#iig_library_primary_file_v2')?.click());
+    container.querySelector('#iig_library_primary_file_v2')?.addEventListener('change', async event => { const file = event.target.files?.[0]; if (!file) return; entry.primary.imageData = await readLibraryFileAsBase64(file); saveSettings(); renderCharacterLibraryV2(); });
+    container.querySelector('#iig_library_add_text_v2')?.addEventListener('click', () => { entry.appearanceItems.push({ id: `appearance_${Date.now()}`, type: 'text', enabled: true, imageData: '', description: '' }); saveSettings(); renderCharacterLibraryV2(); });
+    container.querySelector('#iig_library_add_image_v2')?.addEventListener('click', () => container.querySelector('#iig_library_item_file_v2')?.click());
+    container.querySelector('#iig_library_item_file_v2')?.addEventListener('change', async event => { const file = event.target.files?.[0]; if (!file) return; entry.appearanceItems.push({ id: `appearance_${Date.now()}`, type: 'image', enabled: true, imageData: await readLibraryFileAsBase64(file), description: '' }); saveSettings(); renderCharacterLibraryV2(); });
+    container.querySelectorAll('.iig-library-detail-row').forEach(row => { const item = entry.appearanceItems.find(candidate => candidate.id === row.dataset.libraryItemId); if (!item) return; row.querySelector('.iig-library-item-enabled')?.addEventListener('change', event => { item.enabled = event.target.checked; saveSettings(); row.classList.toggle('disabled', !item.enabled); }); row.querySelector('.iig-library-item-description')?.addEventListener('input', event => { item.description = event.target.value; saveSettings(); }); row.querySelector('.iig-library-item-remove')?.addEventListener('click', () => { entry.appearanceItems = entry.appearanceItems.filter(candidate => candidate.id !== item.id); saveSettings(); renderCharacterLibraryV2(); }); });
+}
+
 function createSettingsUI() {
     const settings = getSettings();
     const container = document.getElementById('extensions_settings');
@@ -4427,7 +4567,7 @@ function bindSettingsEvents() {
     renderHairstyleGrid('char');
     renderHairstyleGrid('user');
     renderStyleGallery();
-    renderCharacterLibrary();
+    renderCharacterLibraryV2();
 }
 
 // ============================================================

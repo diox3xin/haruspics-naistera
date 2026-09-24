@@ -2,7 +2,8 @@
  * Inline Image Generation Extension for SillyTavern
  *
  * Catches [IMG:GEN:{json}] tags in AI messages and generates images via configured API.
- * Supports OpenAI-compatible and Gemini-compatible (nano-banana) endpoints.
+ * Supports OpenAI-compatible, Gemini-compatible (nano-banana), and Naistera
+ * endpoints (including NovelAI models exposed by Naistera).
  *
  * v3.0: Wardrobe system, 4-slot priority refs, Vision API descriptions,
  *       AbortController, request timeout, sequential generation, TreeWalker fix
@@ -49,6 +50,16 @@ const defaultSettings = Object.freeze({
     endpoint: '',
     apiKey: '',
     model: '',
+    naisteraModel: '',
+    naisteraAspectRatio: '1:1',
+    naisteraNegativePrompt: '',
+    naisteraPreset: '',
+    naisteraCharacterDescriptionsMode: 'as-is',
+    naisteraSendCharAvatar: false,
+    naisteraSendUserAvatar: false,
+    naisteraPolling: false,
+    naisteraPollIntervalMs: 3000,
+    naisteraPollTimeoutMs: 600000,
     size: '1024x1024',
     quality: 'standard',
     maxRetries: 0,
@@ -241,12 +252,61 @@ function saveSettings() {
     context.saveSettingsDebounced();
 }
 
+function normalizeNaisteraModel(model) {
+    return String(model || '').trim();
+}
+
+function isNaisteraNovelAIModel(model) {
+    return /^novelai(?:-|$)/i.test(normalizeNaisteraModel(model));
+}
+
+function normalizeNaisteraCharacterDescriptionsMode(value) {
+    return ['none', 'as-is', 'character-prompt'].includes(value) ? value : 'as-is';
+}
+
+function normalizeNaisteraEndpoint(endpoint) {
+    const value = String(endpoint || '').trim().replace(/\/+$/, '');
+    if (!value) return 'https://naistera.org';
+    return value.replace(/\/api\/(?:generate|models)$/i, '');
+}
+
+function normalizeEndpointForProviderSwitch(apiType, endpoint) {
+    const current = String(endpoint || '').trim().replace(/\/+$/, '').toLowerCase();
+    const knownDefaults = new Set([
+        'https://api.openai.com',
+        'https://generativelanguage.googleapis.com',
+        'https://naistera.org',
+    ]);
+    if (apiType === 'naistera' && (!current || knownDefaults.has(current))) {
+        return 'https://naistera.org';
+    }
+    if (apiType !== 'naistera' && current === 'https://naistera.org') {
+        return '';
+    }
+    return endpoint;
+}
+
+function formatNaisteraDescription(value) {
+    if (!value) return '';
+    if (typeof value === 'string') return value;
+    if (typeof value === 'object') {
+        if (value.charName || value.description) {
+            return `[CLOTHING: ${value.charName || 'Character'} is wearing: ${value.description || ''}]`;
+        }
+        return Object.values(value).filter(Boolean).join(' ');
+    }
+    return String(value);
+}
+
 // ============================================================
 // FETCH FUNCTIONS
 // ============================================================
 
 async function fetchModels() {
     const settings = getSettings();
+    if (settings.apiType === 'naistera') {
+        return await fetchNaisteraModels();
+    }
     if (!settings.endpoint || !settings.apiKey) return [];
     const url = buildOpenAIUrl(settings.endpoint, 'models');
     try {
@@ -267,6 +327,35 @@ async function fetchModels() {
         toastr.error(`Ошибка загрузки моделей: ${error.message}`, 'Генерация картинок');
         return [];
     }
+}
+
+let naisteraModelCatalog = new Map();
+
+async function fetchNaisteraModels() {
+    const settings = getSettings();
+    const endpoint = normalizeNaisteraEndpoint(settings.endpoint);
+    const headers = { Accept: 'application/json' };
+    if (settings.apiKey) headers.Authorization = `Bearer ${settings.apiKey}`;
+
+    const response = await fetch(`${endpoint}/api/models`, { method: 'GET', headers });
+    if (!response.ok) {
+        const detail = await response.text().catch(() => '');
+        throw new Error(`Naistera /api/models ${response.status}: ${String(detail).slice(0, 500)}`);
+    }
+
+    const payload = await response.json();
+    const models = (Array.isArray(payload?.models) ? payload.models : [])
+        .filter(model => model?.id && model.visible !== false && model.deprecated !== true)
+        .map(model => ({
+            id: String(model.id),
+            name: String(model.name || model.id),
+            references: model.references !== false,
+            negativePrompt: model.negative_prompt === true,
+        }));
+
+    naisteraModelCatalog = new Map(models.map(model => [model.id, model]));
+    iigLog('INFO', `Naistera models loaded: ${models.length}`);
+    return models.map(model => model.id);
 }
 
 async function fetchUserAvatars() {
@@ -870,7 +959,11 @@ function updateWardrobeInjection() {
 
 const PRESET_FIELDS = [
     'apiType', 'endpoint', 'apiKey', 'model',
-    'size', 'quality', 'aspectRatio', 'imageSize'
+    'size', 'quality', 'aspectRatio', 'imageSize',
+    'naisteraModel', 'naisteraAspectRatio', 'naisteraNegativePrompt',
+    'naisteraPreset', 'naisteraCharacterDescriptionsMode',
+    'naisteraSendCharAvatar', 'naisteraSendUserAvatar',
+    'naisteraPolling', 'naisteraPollIntervalMs', 'naisteraPollTimeoutMs'
 ];
 
 function saveCurrentAsPreset(name) {
@@ -1001,7 +1094,8 @@ async function collectReferenceImages(prompt) {
 
     // ===== STEP 1: Collect face references (HIGHEST PRIORITY) =====
 
-    const needCharAvatar = settings.sendCharAvatar ||
+    const useNaisteraRefs = settings.apiType === 'naistera';
+    const needCharAvatar = (useNaisteraRefs ? settings.naisteraSendCharAvatar : settings.sendCharAvatar) ||
         (settings.autoDetectNames && charName && nameAppearsInPrompt(charName, prompt));
 
     if (needCharAvatar) {
@@ -1018,7 +1112,7 @@ async function collectReferenceImages(prompt) {
         }
     }
 
-    const needUserAvatar = settings.sendUserAvatar ||
+    const needUserAvatar = (useNaisteraRefs ? settings.naisteraSendUserAvatar : settings.sendUserAvatar) ||
         (settings.autoDetectNames && userName && nameAppearsInPrompt(userName, prompt));
 
     if (needUserAvatar) {
@@ -1142,6 +1236,159 @@ async function collectReferenceImages(prompt) {
 // ============================================================
 // IMAGE GENERATION: OpenAI
 // ============================================================
+
+function getNaisteraModelInfo(model) {
+    return naisteraModelCatalog.get(normalizeNaisteraModel(model)) || null;
+}
+
+function extractNaisteraDataUrl(result) {
+    const candidates = [];
+    const push = value => {
+        if (value == null) return;
+        if (typeof value === 'string') candidates.push(value);
+        if (typeof value === 'object') {
+            candidates.push(value.data_url, value.url, value.uri, value.image,
+                value.b64_json, value.b64, value.base64);
+        }
+    };
+
+    push(result?.data_url);
+    push(result?.image);
+    push(result?.url);
+    push(result?.images?.[0]);
+    push(result?.data?.[0]);
+    push(result?.result);
+
+    for (const candidate of candidates) {
+        const normalized = normalizeReturnedImage(candidate);
+        if (normalized) return normalized;
+        if (typeof candidate === 'string' && /^[A-Za-z0-9+/=\r\n]+$/.test(candidate) && candidate.length > 100) {
+            return `data:image/png;base64,${candidate.replace(/\s+/g, '')}`;
+        }
+    }
+    return null;
+}
+
+function naisteraAbortError() {
+    return new Error('Генерация отменена пользователем');
+}
+
+async function pollNaisteraJob(endpoint, jobId, settings, signal) {
+    const base = normalizeNaisteraEndpoint(endpoint);
+    const url = `${base}/api/generate/jobs/${encodeURIComponent(jobId)}`;
+    const intervalMs = Math.max(1000, Math.min(30000, Number(settings.naisteraPollIntervalMs) || 3000));
+    const timeoutMs = Math.max(30000, Math.min(900000, Number(settings.naisteraPollTimeoutMs) || 600000));
+    const started = Date.now();
+
+    while (Date.now() - started < timeoutMs) {
+        if (signal?.aborted) throw naisteraAbortError();
+        const response = await fetch(url, {
+            method: 'GET',
+            headers: {
+                Authorization: `Bearer ${settings.apiKey}`,
+                Accept: 'application/json',
+            },
+            signal,
+        });
+        const text = await response.text().catch(() => '');
+        let result = null;
+        try { result = text ? JSON.parse(text) : null; } catch (_) { /* handled below */ }
+
+        if (!response.ok) {
+            throw new Error(`Naistera polling error (${response.status}): ${text.slice(0, 800)}`);
+        }
+        if (extractNaisteraDataUrl(result)) return result;
+
+        const status = String(result?.status || '').toLowerCase();
+        if (status === 'failed' || result?.error) {
+            throw new Error(`Naistera generation failed: ${result?.detail || result?.error?.detail || result?.error || 'Unknown error'}`);
+        }
+
+        await new Promise(resolve => {
+            const timer = setTimeout(resolve, intervalMs);
+            signal?.addEventListener('abort', () => { clearTimeout(timer); resolve(); }, { once: true });
+        });
+    }
+    throw new Error(`Naistera polling timed out after ${Math.round(timeoutMs / 1000)}s`);
+}
+
+async function generateImageNaistera(prompt, style, refData, options = {}) {
+    const settings = getSettings();
+    const endpoint = normalizeNaisteraEndpoint(settings.endpoint);
+    const model = normalizeNaisteraModel(settings.naisteraModel);
+    if (!getNaisteraModelInfo(model)) {
+        try {
+            await fetchNaisteraModels();
+        } catch (error) {
+            iigLog('WARN', `Naistera model metadata unavailable: ${error?.message || error}`);
+        }
+    }
+    const modelInfo = getNaisteraModelInfo(model);
+    const descriptionMode = normalizeNaisteraCharacterDescriptionsMode(settings.naisteraCharacterDescriptionsMode);
+    const { imageRefs = [], textOnlyClothing = [], textDirectives = [] } = refData || {};
+
+    const promptParts = [];
+    // sillyimages sends NovelAI styles as ordinary prompt text, while other
+    // Naistera models receive the explicit style marker.
+    if (style) promptParts.push(isNaisteraNovelAIModel(model) ? style : `[Style: ${style}]`);
+    if (descriptionMode === 'as-is') {
+        promptParts.push(...textDirectives);
+        for (const clothing of textOnlyClothing) {
+            promptParts.push(`[CLOTHING: ${clothing.charName || 'Character'} is wearing: ${clothing.description || ''}]`);
+        }
+    }
+    if (descriptionMode === 'character-prompt') {
+        const descriptions = [...textDirectives, ...textOnlyClothing]
+            .map(formatNaisteraDescription)
+            .filter(Boolean);
+        if (descriptions.length > 0) promptParts.push(`[CHARACTER DESCRIPTIONS]\n${descriptions.join('\n')}`);
+    }
+    promptParts.push(prompt);
+
+    const body = {
+        prompt: promptParts.join('\n\n'),
+        aspect_ratio: options.aspectRatio || settings.naisteraAspectRatio || '1:1',
+        model,
+    };
+
+    const negativePrompt = String(options.negativePrompt ?? settings.naisteraNegativePrompt ?? '').trim();
+    if (negativePrompt && modelInfo?.negativePrompt === true) body.negative_prompt = negativePrompt;
+    const preset = String(options.preset ?? settings.naisteraPreset ?? '').trim();
+    if (preset) body.preset = preset;
+
+    if (imageRefs.length > 0 && modelInfo?.references !== false) {
+        body.reference_objects = imageRefs.map(ref => ({
+            image: `data:${ref.mimeType || 'image/png'};base64,${ref.data}`,
+            description: descriptionMode === 'none'
+                ? ''
+                : (ref.description || ref.outfitName || ref.name || ''),
+        })).filter(ref => ref.image);
+    }
+    if (settings.naisteraPolling) body.sync = false;
+
+    iigLog('INFO', `Naistera request: model=${model}, refs=${body.reference_objects?.length || 0}, polling=${!!settings.naisteraPolling}`);
+    const response = await fetch(`${endpoint}/api/generate`, {
+        method: 'POST',
+        headers: {
+            Authorization: `Bearer ${settings.apiKey}`,
+            'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(body),
+        signal: options.signal,
+    });
+    if (!response.ok) {
+        const text = await response.text().catch(() => '');
+        throw new Error(`Naistera API error (${response.status}): ${text.slice(0, 800)}`);
+    }
+
+    let result = await response.json();
+    if (result?.job_id && !extractNaisteraDataUrl(result)) {
+        result = await pollNaisteraJob(endpoint, result.job_id, settings, options.signal);
+    }
+    const dataUrl = extractNaisteraDataUrl(result);
+    if (!dataUrl) throw new Error('Naistera response does not contain an image');
+    return dataUrl;
+}
 
 async function generateImageOpenAI(prompt, style, refData, options = {}) {
     const settings = getSettings();
@@ -1547,9 +1794,11 @@ async function generateImageGemini(prompt, style, refData, options = {}) {
 function validateSettings() {
     const settings = getSettings();
     const errors = [];
-    if (!settings.endpoint) errors.push('URL эндпоинта не настроен');
+    if (settings.apiType !== 'naistera' && !settings.endpoint) errors.push('URL эндпоинта не настроен');
     if (!settings.apiKey) errors.push('API ключ не настроен');
-    if (!settings.model) errors.push('Модель не выбрана');
+    if (settings.apiType === 'naistera' ? !normalizeNaisteraModel(settings.naisteraModel) : !settings.model) {
+        errors.push('Модель не выбрана');
+    }
     if (errors.length > 0) throw new Error(`Ошибка настроек: ${errors.join(', ')}`);
 }
 
@@ -1589,6 +1838,9 @@ async function generateImageWithRetry(prompt, style, onStatusUpdate, options = {
 
             const isRouterApi = isRouterEndpoint(settings.endpoint);
             const useGeminiApi = settings.apiType === 'gemini' && !isRouterApi;
+            if (settings.apiType === 'naistera') {
+                return await generateImageNaistera(prompt, style, refData, genOptions);
+            }
             const useChatApi = settings.apiType === 'openai-chat' ||
                 (isRouterApi && (settings.apiType === 'openai' || settings.apiType === 'gemini'));
 
@@ -1695,6 +1947,8 @@ async function parseImageTags(text, options = {}) {
                 aspectRatio: data.aspect_ratio || data.aspectRatio || null,
                 imageSize: data.image_size || data.imageSize || null,
                 quality: data.quality || null,
+                preset: data.preset || null,
+                negativePrompt: data.negative_prompt || data.negativePrompt || null,
                 isNewFormat: true, existingSrc: hasPath ? srcValue : null
             });
         } catch (e) {
@@ -1745,6 +1999,8 @@ async function parseImageTags(text, options = {}) {
                 aspectRatio: data.aspect_ratio || data.aspectRatio || null,
                 imageSize: data.image_size || data.imageSize || null,
                 quality: data.quality || null,
+                preset: data.preset || null,
+                negativePrompt: data.negative_prompt || data.negativePrompt || null,
                 isNewFormat: false
             });
         } catch (e) {
@@ -1948,6 +2204,7 @@ async function processMessageTags(messageId) {
                 (s) => { if (statusEl) statusEl.textContent = s; },
                 {
                     aspectRatio: tag.aspectRatio, imageSize: tag.imageSize, quality: tag.quality,
+                    preset: tag.preset, negativePrompt: tag.negativePrompt,
                     refData: sharedRefData,
                     signal: abortController.signal
                 }
@@ -2048,7 +2305,7 @@ async function regenerateSingleImage(messageId, tagIndex) {
         const dataUrl = await generateImageWithRetry(
             tag.prompt, tagStyle,
             (s) => { if (statusEl) statusEl.textContent = s; },
-            { aspectRatio: tag.aspectRatio, imageSize: tag.imageSize, quality: tag.quality, refData, signal: abortController.signal }
+                { aspectRatio: tag.aspectRatio, imageSize: tag.imageSize, quality: tag.quality, preset: tag.preset, negativePrompt: tag.negativePrompt, refData, signal: abortController.signal }
         );
         if (statusEl) statusEl.textContent = 'Сохранение...';
         const imagePath = await saveImageToFile(dataUrl);
@@ -2129,7 +2386,15 @@ async function regenerateMessageImages(messageId) {
             const dataUrl = await generateImageWithRetry(
                 tag.prompt, tagStyle,
                 (s) => { if (statusEl) statusEl.textContent = s; },
-                { aspectRatio: tag.aspectRatio, imageSize: tag.imageSize, quality: tag.quality, refData: sharedRefData, signal: abortController.signal }
+                {
+                    aspectRatio: tag.aspectRatio,
+                    imageSize: tag.imageSize,
+                    quality: tag.quality,
+                    preset: tag.preset,
+                    negativePrompt: tag.negativePrompt,
+                    refData: sharedRefData,
+                    signal: abortController.signal
+                }
             );
 
             if (statusEl) statusEl.textContent = 'Сохранение...';
@@ -3115,12 +3380,13 @@ function createSettingsUI() {
                                     <option value="openai" ${settings.apiType === 'openai' ? 'selected' : ''}>OpenAI Images API (/v1/images)</option>
                                     <option value="openai-chat" ${settings.apiType === 'openai-chat' ? 'selected' : ''}>OpenAI Chat/Router (/v1/chat/completions)</option>
                                     <option value="gemini" ${settings.apiType === 'gemini' ? 'selected' : ''}>Gemini (nano-banana)</option>
+                                    <option value="naistera" ${settings.apiType === 'naistera' ? 'selected' : ''}>Naistera (включая NovelAI)</option>
                                 </select>
                             </div>
 
                             <div class="flex-row">
                                 <label>Эндпоинт</label>
-                                <input type="text" id="iig_endpoint" class="text_pole flex1" value="${settings.endpoint || ''}" placeholder="https://api.openai.com">
+                                <input type="text" id="iig_endpoint" class="text_pole flex1" value="${settings.endpoint || ''}" placeholder="${settings.apiType === 'naistera' ? 'https://naistera.org' : 'https://api.openai.com'}">
                             </div>
 
                             <div class="flex-row">
@@ -3129,12 +3395,65 @@ function createSettingsUI() {
                                 <div class="menu_button iig-key-toggle" id="iig_key_toggle"><i class="fa-solid fa-eye"></i></div>
                             </div>
 
-                            <div class="flex-row">
+                            <div class="flex-row ${settings.apiType === 'naistera' ? 'hidden' : ''}" id="iig_standard_model_row">
                                 <label>Модель</label>
                                 <select id="iig_model" class="flex1">
                                     ${settings.model ? `<option value="${settings.model}" selected>${settings.model}</option>` : '<option value="">Выберите модель</option>'}
                                 </select>
                                 <div class="menu_button iig-refresh-btn" id="iig_refresh_models" title="Обновить список моделей"><i class="fa-solid fa-arrows-rotate"></i></div>
+                            </div>
+
+                            <div id="iig_naistera_section" class="${settings.apiType !== 'naistera' ? 'hidden' : ''}">
+                                <div class="flex-row">
+                                    <label>Модель Naistera / NovelAI</label>
+                                    <select id="iig_naistera_model" class="flex1">
+                                        ${settings.naisteraModel ? `<option value="${escapeHtml(settings.naisteraModel)}" selected>${escapeHtml(settings.naisteraModel)}</option>` : '<option value="">Загрузите список моделей</option>'}
+                                    </select>
+                                    <div class="menu_button iig-refresh-btn" id="iig_refresh_naistera_models" title="Загрузить модели Naistera"><i class="fa-solid fa-arrows-rotate"></i></div>
+                                </div>
+                                <p class="hint">Токен берётся из Telegram-бота Naistera. Модели NovelAI доступны через этот же провайдер.</p>
+                                <label class="checkbox_label">
+                                    <input type="checkbox" id="iig_naistera_send_char_avatar" ${settings.naisteraSendCharAvatar ? 'checked' : ''}>
+                                    <span>Отправлять аватар персонажа в Naistera</span>
+                                </label>
+                                <label class="checkbox_label">
+                                    <input type="checkbox" id="iig_naistera_send_user_avatar" ${settings.naisteraSendUserAvatar ? 'checked' : ''}>
+                                    <span>Отправлять аватар юзера в Naistera</span>
+                                </label>
+                                <div class="flex-row">
+                                    <label>Aspect Ratio</label>
+                                    <select id="iig_naistera_aspect_ratio" class="flex1">
+                                        ${['1:1','2:3','3:2','3:4','4:3','4:5','5:4','9:16','16:9','21:9'].map(r => `<option value="${r}" ${settings.naisteraAspectRatio === r ? 'selected' : ''}>${r}</option>`).join('')}
+                                    </select>
+                                </div>
+                                <div class="flex-row">
+                                    <label>Preset</label>
+                                    <input type="text" id="iig_naistera_preset" class="text_pole flex1" value="${escapeHtml(settings.naisteraPreset || '')}" placeholder="Необязательно">
+                                </div>
+                                <div class="flex-row">
+                                    <label>Negative prompt</label>
+                                    <input type="text" id="iig_naistera_negative_prompt" class="text_pole flex1" value="${escapeHtml(settings.naisteraNegativePrompt || '')}" placeholder="Отправляется моделям с поддержкой">
+                                </div>
+                                <div class="flex-row">
+                                    <label>Описание персонажей</label>
+                                    <select id="iig_naistera_character_descriptions" class="flex1">
+                                        <option value="none" ${settings.naisteraCharacterDescriptionsMode === 'none' ? 'selected' : ''}>Не отправлять</option>
+                                        <option value="as-is" ${settings.naisteraCharacterDescriptionsMode === 'as-is' ? 'selected' : ''}>Как есть</option>
+                                        <option value="character-prompt" ${settings.naisteraCharacterDescriptionsMode === 'character-prompt' ? 'selected' : ''}>Блок описаний персонажа</option>
+                                    </select>
+                                </div>
+                                <label class="checkbox_label">
+                                    <input type="checkbox" id="iig_naistera_polling" ${settings.naisteraPolling ? 'checked' : ''}>
+                                    <span>Использовать polling для асинхронной генерации</span>
+                                </label>
+                                <div class="flex-row">
+                                    <label>Интервал polling (мс)</label>
+                                    <input type="number" id="iig_naistera_poll_interval" class="text_pole" value="${settings.naisteraPollIntervalMs}" min="1000" max="30000" step="500">
+                                </div>
+                                <div class="flex-row">
+                                    <label>Таймаут polling (мс)</label>
+                                    <input type="number" id="iig_naistera_poll_timeout" class="text_pole" value="${settings.naisteraPollTimeoutMs}" min="30000" max="900000" step="10000">
+                                </div>
                             </div>
 
                             <div class="flex-row">
@@ -3442,8 +3761,17 @@ function bindSettingsEvents() {
     document.getElementById('iig_enabled')?.addEventListener('change', (e) => { settings.enabled = e.target.checked; saveSettings(); });
 
     document.getElementById('iig_api_type')?.addEventListener('change', (e) => {
-        settings.apiType = e.target.value; saveSettings();
+        settings.apiType = e.target.value;
+        settings.endpoint = normalizeEndpointForProviderSwitch(e.target.value, settings.endpoint);
+        saveSettings();
+        const endpointInput = document.getElementById('iig_endpoint');
+        if (endpointInput) {
+            endpointInput.value = settings.endpoint || '';
+            endpointInput.placeholder = e.target.value === 'naistera' ? 'https://naistera.org' : 'https://api.openai.com';
+        }
         document.getElementById('iig_gemini_section')?.classList.toggle('hidden', e.target.value !== 'gemini');
+        document.getElementById('iig_naistera_section')?.classList.toggle('hidden', e.target.value !== 'naistera');
+        document.getElementById('iig_model')?.closest('.flex-row')?.classList.toggle('hidden', e.target.value === 'naistera');
     });
 
     document.getElementById('iig_endpoint')?.addEventListener('input', (e) => { settings.endpoint = e.target.value; saveSettings(); });
@@ -3477,6 +3805,49 @@ function bindSettingsEvents() {
         } catch (err) { toastr.error('Ошибка загрузки моделей'); }
         finally { btn.classList.remove('loading'); }
     });
+
+    document.getElementById('iig_naistera_model')?.addEventListener('change', (e) => {
+        settings.naisteraModel = normalizeNaisteraModel(e.target.value);
+        saveSettings();
+    });
+
+    document.getElementById('iig_refresh_naistera_models')?.addEventListener('click', async (e) => {
+        const btn = e.currentTarget;
+        btn.classList.add('loading');
+        try {
+            const models = await fetchModels();
+            const select = document.getElementById('iig_naistera_model');
+            const current = normalizeNaisteraModel(settings.naisteraModel);
+            select.innerHTML = '<option value="">-- Выберите модель --</option>';
+            for (const model of models) {
+                const option = document.createElement('option');
+                option.value = model;
+                option.textContent = naisteraModelCatalog.get(model)?.name || model;
+                option.selected = model === current;
+                select.appendChild(option);
+            }
+            if (!current && models.length > 0) {
+                settings.naisteraModel = models[0];
+                select.value = models[0];
+                saveSettings();
+            }
+            toastr.success(`Найдено моделей Naistera: ${models.length}`, 'Генерация картинок');
+        } catch (err) {
+            toastr.error(`Ошибка загрузки моделей Naistera: ${err.message}`, 'Генерация картинок');
+        } finally {
+            btn.classList.remove('loading');
+        }
+    });
+
+    document.getElementById('iig_naistera_aspect_ratio')?.addEventListener('change', (e) => { settings.naisteraAspectRatio = e.target.value; saveSettings(); });
+    document.getElementById('iig_naistera_preset')?.addEventListener('input', (e) => { settings.naisteraPreset = e.target.value; saveSettings(); });
+    document.getElementById('iig_naistera_negative_prompt')?.addEventListener('input', (e) => { settings.naisteraNegativePrompt = e.target.value; saveSettings(); });
+    document.getElementById('iig_naistera_character_descriptions')?.addEventListener('change', (e) => { settings.naisteraCharacterDescriptionsMode = e.target.value; saveSettings(); });
+    document.getElementById('iig_naistera_send_char_avatar')?.addEventListener('change', (e) => { settings.naisteraSendCharAvatar = e.target.checked; saveSettings(); });
+    document.getElementById('iig_naistera_send_user_avatar')?.addEventListener('change', (e) => { settings.naisteraSendUserAvatar = e.target.checked; saveSettings(); });
+    document.getElementById('iig_naistera_polling')?.addEventListener('change', (e) => { settings.naisteraPolling = e.target.checked; saveSettings(); });
+    document.getElementById('iig_naistera_poll_interval')?.addEventListener('change', (e) => { settings.naisteraPollIntervalMs = Math.max(1000, parseInt(e.target.value, 10) || 3000); saveSettings(); });
+    document.getElementById('iig_naistera_poll_timeout')?.addEventListener('change', (e) => { settings.naisteraPollTimeoutMs = Math.max(30000, parseInt(e.target.value, 10) || 600000); saveSettings(); });
 
     document.getElementById('iig_size')?.addEventListener('change', (e) => { settings.size = e.target.value; saveSettings(); });
     document.getElementById('iig_quality')?.addEventListener('change', (e) => { settings.quality = e.target.value; saveSettings(); });
@@ -3653,12 +4024,24 @@ function bindSettingsEvents() {
             const qualityEl = document.getElementById('iig_quality');
             const aspectEl = document.getElementById('iig_aspect_ratio');
             const imgSizeEl = document.getElementById('iig_image_size');
+            const naisteraSectionEl = document.getElementById('iig_naistera_section');
+            const standardModelRowEl = document.getElementById('iig_standard_model_row');
+            const naisteraModelEl = document.getElementById('iig_naistera_model');
+            const naisteraAspectEl = document.getElementById('iig_naistera_aspect_ratio');
+            const naisteraPresetEl = document.getElementById('iig_naistera_preset');
+            const naisteraNegativeEl = document.getElementById('iig_naistera_negative_prompt');
+            const naisteraDescriptionsEl = document.getElementById('iig_naistera_character_descriptions');
+            const naisteraPollingEl = document.getElementById('iig_naistera_polling');
+            const naisteraCharAvatarEl = document.getElementById('iig_naistera_send_char_avatar');
+            const naisteraUserAvatarEl = document.getElementById('iig_naistera_send_user_avatar');
 
             if (endpointEl) endpointEl.value = s.endpoint || '';
             if (apiKeyEl) apiKeyEl.value = s.apiKey || '';
             if (apiTypeEl) {
                 apiTypeEl.value = s.apiType;
                 document.getElementById('iig_gemini_section')?.classList.toggle('hidden', s.apiType !== 'gemini');
+                naisteraSectionEl?.classList.toggle('hidden', s.apiType !== 'naistera');
+                standardModelRowEl?.classList.toggle('hidden', s.apiType === 'naistera');
             }
             if (sizeEl) sizeEl.value = s.size;
             if (qualityEl) qualityEl.value = s.quality;
@@ -3669,6 +4052,14 @@ function bindSettingsEvents() {
             if (modelEl) {
                 modelEl.innerHTML = `<option value="${s.model}" selected>${s.model}</option>`;
             }
+            if (naisteraModelEl) naisteraModelEl.innerHTML = `<option value="${escapeHtml(s.naisteraModel || '')}" selected>${escapeHtml(s.naisteraModel || 'Выберите модель')}</option>`;
+            if (naisteraAspectEl) naisteraAspectEl.value = s.naisteraAspectRatio || '1:1';
+            if (naisteraPresetEl) naisteraPresetEl.value = s.naisteraPreset || '';
+            if (naisteraNegativeEl) naisteraNegativeEl.value = s.naisteraNegativePrompt || '';
+            if (naisteraDescriptionsEl) naisteraDescriptionsEl.value = s.naisteraCharacterDescriptionsMode || 'as-is';
+            if (naisteraPollingEl) naisteraPollingEl.checked = !!s.naisteraPolling;
+            if (naisteraCharAvatarEl) naisteraCharAvatarEl.checked = !!s.naisteraSendCharAvatar;
+            if (naisteraUserAvatarEl) naisteraUserAvatarEl.checked = !!s.naisteraSendUserAvatar;
 
             toastr.success('Пресет загружен', 'Пресеты API');
         }

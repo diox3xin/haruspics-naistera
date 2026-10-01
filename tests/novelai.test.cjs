@@ -132,6 +132,7 @@ test('collector forwards library and wardrobe descriptions, not images, to offic
         getActiveWardrobeItem: (kind) => kind === 'char'
             ? { imageData: 'WARDROBE_IMAGE', description: 'green jacket', name: 'Jacket' }
             : null,
+        getActiveHairstyleItem: () => null,
         detectMimeType: () => 'image/png',
         iigLog: () => {},
         MAX_IMAGE_REFS: 4,

@@ -97,6 +97,7 @@ const defaultSettings = Object.freeze({
     characterLibrarySelectedKind: 'char',
     characterLibrarySelectedKey: '',
     wardrobeItems: [],
+    wardrobeSendMode: 'both', // 'both', 'text', 'none'
     activeWardrobeChar: null,
     activeWardrobeUser: null,
     injectWardrobeToChat: true,
@@ -1349,28 +1350,39 @@ async function collectReferenceImages(prompt) {
 
     // ===== STEP 2: Collect clothing references =====
 
-    const charWardrobeItem = getActiveWardrobeItem('char');
-    if (charWardrobeItem?.imageData) {
-        clothingRefs.push({
-            data: charWardrobeItem.imageData,
-            mimeType: detectMimeType(charWardrobeItem.imageData),
-            name: charName || 'Character',
-            outfitName: charWardrobeItem.name,
-            description: charWardrobeItem.description || '',
-            type: 'clothing'
-        });
-    }
+    const textOnlyProvider = ['novelai', 'novelai-direct'].includes(settings.apiType);
+    for (const target of ['char', 'user']) {
+        const name = target === 'char' ? (charName || 'Character') : (userName || 'User');
+        const outfit = getActiveWardrobeItem(target);
+        const wardrobeMode = settings.wardrobeSendMode || 'both';
+        if (outfit && wardrobeMode !== 'none') {
+            if (outfit.imageData && wardrobeMode === 'both' && !textOnlyProvider) {
+                clothingRefs.push({
+                    data: outfit.imageData, mimeType: detectMimeType(outfit.imageData),
+                    name, outfitName: outfit.name, description: outfit.description || '', type: 'clothing'
+                });
+            } else if (outfit.description?.trim()) {
+                textOnlyClothing.push({ charName: name, outfitName: outfit.name, description: outfit.description });
+            } else {
+                warnings.push(`Одежда "${outfit.name}" для ${name} не отправлена: добавьте текстовое описание.`);
+            }
+        }
 
-    const userWardrobeItem = getActiveWardrobeItem('user');
-    if (userWardrobeItem?.imageData) {
-        clothingRefs.push({
-            data: userWardrobeItem.imageData,
-            mimeType: detectMimeType(userWardrobeItem.imageData),
-            name: userName || 'User',
-            outfitName: userWardrobeItem.name,
-            description: userWardrobeItem.description || '',
-            type: 'clothing'
-        });
+        const hairstyle = getActiveHairstyleItem(target);
+        const hairMode = settings.hairstyleSendMode || 'both';
+        if (hairstyle && hairMode !== 'none') {
+            if (hairstyle.description?.trim()) {
+                textDirectives.push(`[HAIRSTYLE INSTRUCTION for "${name}"]: ${hairstyle.description}`);
+            }
+            if (hairstyle.imageData && hairMode === 'both' && !textOnlyProvider) {
+                clothingRefs.push({
+                    data: hairstyle.imageData, mimeType: detectMimeType(hairstyle.imageData),
+                    name, outfitName: hairstyle.name, description: `Hairstyle for ${name}: ${hairstyle.description || hairstyle.name}`, type: 'hairstyle'
+                });
+            } else if (!hairstyle.description?.trim()) {
+                warnings.push(`Причёска "${hairstyle.name}" для ${name} не отправлена: добавьте текстовое описание.`);
+            }
+        }
     }
 
     // Both NovelAI routes are text-only. Do not drop outfit
@@ -1378,12 +1390,12 @@ async function collectReferenceImages(prompt) {
     if (['novelai', 'novelai-direct'].includes(settings.apiType)) {
         return {
             imageRefs: [],
-            textOnlyClothing: clothingRefs.filter(ref => ref.description).map(ref => ({
+            textOnlyClothing: [...textOnlyClothing, ...clothingRefs.filter(ref => ref.description).map(ref => ({
                 charName: ref.name,
                 description: ref.description,
-            })),
+            }))],
             textDirectives,
-            warnings: [],
+            warnings,
         };
     }
 
@@ -1405,6 +1417,7 @@ async function collectReferenceImages(prompt) {
 
     // Process text-only clothing
     for (const c of clothingAsTextOnly) {
+        if (c.type === 'hairstyle') continue; // Its description is already in textDirectives.
         if (c.description) {
             textOnlyClothing.push({
                 charName: c.name,
@@ -1900,6 +1913,7 @@ async function generateImageOpenAIChat(prompt, style, refData, options = {}) {
     for (const ref of imageRefs) {
         if (ref.type === 'face') promptParts.push(`[FACE REFERENCE: ${ref.name}] Copy this character's face and identity as closely as possible.`);
         if (ref.type === 'clothing') promptParts.push(`[CLOTHING REFERENCE for ${ref.name}: ${ref.description || ref.outfitName || 'copy the outfit only, not the face'}]`);
+        if (ref.type === 'hairstyle') promptParts.push(`[HAIRSTYLE REFERENCE for ${ref.name}: copy only the hair, not the face]`);
     }
     promptParts.push(`[SCENE TO GENERATE]\n${prompt}`);
     const fullPrompt = promptParts.join('\n\n');
@@ -2006,6 +2020,11 @@ async function generateImageGemini(prompt, style, refData, options = {}) {
             clothingLabel += `Outfit details: ${ref.description}\n`;
         }
         parts.push({ text: clothingLabel });
+    }
+
+    for (const ref of imageRefs.filter(ref => ref.type === 'hairstyle')) {
+        parts.push({ inlineData: { mimeType: ref.mimeType, data: ref.data } });
+        parts.push({ text: `[HAIRSTYLE REFERENCE for "${ref.name}"]: Copy only the hair, not the face. ${ref.description || ''}` });
     }
 
     // ===== BUILD MAIN PROMPT =====
@@ -2404,23 +2423,44 @@ function createErrorPlaceholder(tagId, errorMessage, tagInfo) {
 function wrapImageWithRegen(img, messageId, tagIndex) {
     const wrapper = document.createElement('div');
     wrapper.className = 'iig-image-wrapper';
+    wrapper.dataset.tagIndex = tagIndex;
     wrapper.style.cssText = 'position:relative;display:inline-block;';
 
-    const regenBtn = document.createElement('div');
+    const regenBtn = document.createElement('button');
+    regenBtn.type = 'button';
+    regenBtn.className = 'iig-image-regen';
     regenBtn.title = 'Перегенерировать эту картинку';
     regenBtn.innerHTML = '<i class="fa-solid fa-arrows-rotate"></i>';
-    regenBtn.style.cssText = 'position:absolute;top:4px;right:4px;width:26px;height:26px;display:none;align-items:center;justify-content:center;cursor:pointer;border-radius:50%;background:rgba(0,0,0,0.5);color:#fff;font-size:13px;z-index:1;';
+    regenBtn.setAttribute('aria-label', regenBtn.title);
+    regenBtn.style.cssText = 'position:absolute;top:4px;right:4px;width:30px;height:30px;display:flex;align-items:center;justify-content:center;cursor:pointer;border-radius:50%;background:rgba(0,0,0,0.65);color:#fff;font-size:13px;z-index:1;';
     regenBtn.addEventListener('click', async (e) => {
         e.stopPropagation();
         await regenerateSingleImage(messageId, tagIndex);
     });
 
-    wrapper.addEventListener('mouseenter', () => { regenBtn.style.display = 'flex'; });
-    wrapper.addEventListener('mouseleave', () => { regenBtn.style.display = 'none'; });
-
     wrapper.appendChild(regenBtn);
     wrapper.appendChild(img);
     return wrapper;
+}
+
+function buildGeneratedImageTag(tag, imagePath) {
+    const instruction = JSON.stringify({
+        prompt: tag.prompt, style: tag.style, aspect_ratio: tag.aspectRatio,
+        image_size: tag.imageSize, quality: tag.quality, preset: tag.preset,
+        negative_prompt: tag.negativePrompt
+    }).replace(/[&'<>]/g, char => '\\u' + char.charCodeAt(0).toString(16).padStart(4, '0'));
+    return `<img class="iig-generated-image" data-iig-instruction='${instruction}' src="${escapeHtml(imagePath)}">`;
+}
+
+function restoreImageRegenButtons(messageElement, messageId) {
+    const images = messageElement.querySelectorAll('.mes_text img[data-iig-instruction]');
+    images.forEach((img, index) => {
+        const src = img.getAttribute('src') || '';
+        if (!src || src.includes('[IMG:') || img.closest('.iig-image-wrapper')) return;
+        const marker = document.createElement('span');
+        img.replaceWith(marker);
+        marker.replaceWith(wrapImageWithRegen(img, messageId, index));
+    });
 }
 
 // ============================================================
@@ -2570,12 +2610,7 @@ async function processMessageTags(messageId) {
             const wrapped = wrapImageWithRegen(img, messageId, index);
             loadingPlaceholder.replaceWith(wrapped);
 
-            if (tag.isNewFormat) {
-                const updatedTag = tag.fullMatch.replace(/src\s*=\s*(['"])[^'"]*\1/i, `src="${imagePath}"`);
-                message.mes = message.mes.replace(tag.fullMatch, updatedTag);
-            } else {
-                message.mes = message.mes.replace(tag.fullMatch, `[IMG:✓:${imagePath}]`);
-            }
+            message.mes = message.mes.replace(tag.fullMatch, buildGeneratedImageTag(tag, imagePath));
 
             toastr.success(`Картинка ${index + 1}/${tags.length} готова`, 'Генерация картинок', { timeOut: 2000 });
         } catch (error) {
@@ -2584,12 +2619,7 @@ async function processMessageTags(messageId) {
             const errorPlaceholder = createErrorPlaceholder(tagId, error.message, tag);
             loadingPlaceholder.replaceWith(errorPlaceholder);
 
-            if (tag.isNewFormat) {
-                const errorTag = tag.fullMatch.replace(/src\s*=\s*(['"])[^'"]*\1/i, `src="${ERROR_IMAGE_PATH}"`);
-                message.mes = message.mes.replace(tag.fullMatch, errorTag);
-            } else {
-                message.mes = message.mes.replace(tag.fullMatch, `[IMG:ERROR:${error.message.substring(0, 50)}]`);
-            }
+            message.mes = message.mes.replace(tag.fullMatch, buildGeneratedImageTag(tag, ERROR_IMAGE_PATH));
 
             if (abortController.signal.aborted) {
                 toastr.warning('Генерация отменена', 'Генерация картинок');
@@ -2606,6 +2636,7 @@ async function processMessageTags(messageId) {
     if (typeof context.messageFormatting === 'function') {
         mesTextEl.innerHTML = context.messageFormatting(message.mes, message.name, message.is_system, message.is_user, messageId);
     }
+    restoreImageRegenButtons(messageElement, messageId);
 }
 
 // ============================================================
@@ -2613,6 +2644,7 @@ async function processMessageTags(messageId) {
 // ============================================================
 
 async function regenerateSingleImage(messageId, tagIndex) {
+    if (processingMessages.has(messageId)) return;
     const context = SillyTavern.getContext();
     const message = context.chat[messageId];
     if (!message) { toastr.error('Сообщение не найдено'); return; }
@@ -2631,10 +2663,12 @@ async function regenerateSingleImage(messageId, tagIndex) {
 
     const allWrappers = Array.from(mesTextEl.querySelectorAll('.iig-image-wrapper'));
     const allImgs = Array.from(mesTextEl.querySelectorAll('img.iig-generated-image, img.iig-error-image, img[data-iig-instruction]'));
-    const targetEl = allWrappers[tagIndex] || allImgs[tagIndex];
+    const targetEl = allWrappers.find(el => Number(el.dataset.tagIndex) === tagIndex) || allImgs[tagIndex];
     if (!targetEl) { toastr.error('Картинка не найдена в DOM'); return; }
+    processingMessages.add(messageId);
 
     const abortController = new AbortController();
+    activeAbortControllers.set(messageId, abortController);
     const lp = createLoadingPlaceholder(`iig-single-${messageId}-${tagIndex}`, () => abortController.abort());
     targetEl.replaceWith(lp);
     const statusEl = lp.querySelector('.iig-status');
@@ -2668,9 +2702,12 @@ async function regenerateSingleImage(messageId, tagIndex) {
         toastr.success('Картинка перегенерирована', 'Генерация картинок', { timeOut: 2000 });
     } catch (error) {
         iigLog('ERROR', `Single regen failed: ${error.message}`);
-        lp.replaceWith(createErrorPlaceholder(`iig-single-${messageId}-${tagIndex}`, error.message, tag));
+        lp.replaceWith(targetEl);
         if (abortController.signal.aborted) toastr.warning('Генерация отменена');
         else toastr.error(`Ошибка: ${error.message}`);
+    } finally {
+        processingMessages.delete(messageId);
+        activeAbortControllers.delete(messageId);
     }
 }
 
@@ -2790,7 +2827,10 @@ function addButtonsToExistingMessages() {
         if (mesId === null) continue;
         const mid = parseInt(mesId, 10);
         const msg = context.chat[mid];
-        if (msg && !msg.is_user) addRegenerateButton(el, mid);
+        if (msg && !msg.is_user) {
+            addRegenerateButton(el, mid);
+            restoreImageRegenButtons(el, mid);
+        }
     }
 }
 
@@ -2801,6 +2841,7 @@ async function onMessageReceived(messageId) {
     if (!el) return;
     addRegenerateButton(el, messageId);
     await processMessageTags(messageId);
+    restoreImageRegenButtons(el, messageId);
 }
 
 // ============================================================
@@ -3135,6 +3176,168 @@ function renderNpcList() {
 // UI: WARDROBE GRID & DESCRIPTION PANEL
 // ============================================================
 
+function getCropRectangle(start, end, width, height) {
+    const clamp = (value, max) => Math.max(0, Math.min(max, Math.round(value)));
+    const x1 = clamp(start.x, width), y1 = clamp(start.y, height);
+    const x2 = clamp(end.x, width), y2 = clamp(end.y, height);
+    return { x: Math.min(x1, x2), y: Math.min(y1, y2), width: Math.abs(x2 - x1), height: Math.abs(y2 - y1) };
+}
+
+// Returns null on cancel; the caller saves only after explicit confirmation.
+function openReferenceImageEditor(imageData, title = 'Просмотр и обрезка') {
+    return new Promise(resolve => {
+        const previousFocus = document.activeElement;
+        const dialog = document.createElement('dialog');
+        dialog.className = 'iig-image-editor';
+        dialog.innerHTML = `
+            <h3></h3>
+            <p>Выделите область мышью или пальцем. Без выделения сохранится всё изображение.</p>
+            <div class="iig-crop-stage"><img alt="Изображение для обрезки" draggable="false"><div class="iig-crop-selection" hidden></div></div>
+            <p class="iig-crop-status" role="status">Загрузка изображения…</p>
+            <div class="iig-image-editor-actions">
+                <button type="button" class="menu_button" data-action="reset">Сбросить область</button>
+                <button type="button" class="menu_button" data-action="save" disabled>Сохранить</button>
+                <button type="button" class="menu_button" data-action="cancel">Закрыть без сохранения</button>
+            </div>`;
+        dialog.querySelector('h3').textContent = title;
+        const img = dialog.querySelector('img');
+        const stage = dialog.querySelector('.iig-crop-stage');
+        const selection = dialog.querySelector('.iig-crop-selection');
+        const status = dialog.querySelector('.iig-crop-status');
+        const save = dialog.querySelector('[data-action="save"]');
+        let start = null, crop = null, pointerId = null;
+        const finish = result => {
+            dialog.close();
+            dialog.remove();
+            previousFocus?.focus();
+            resolve(result);
+        };
+        const reset = () => {
+            crop = null;
+            selection.hidden = true;
+            status.textContent = `${img.naturalWidth} × ${img.naturalHeight} — всё изображение`;
+            save.textContent = 'Сохранить без обрезки';
+        };
+        const point = event => {
+            const rect = img.getBoundingClientRect();
+            return {
+                x: (event.clientX - rect.left) * img.naturalWidth / rect.width,
+                y: (event.clientY - rect.top) * img.naturalHeight / rect.height
+            };
+        };
+        const update = event => {
+            crop = getCropRectangle(start, point(event), img.naturalWidth, img.naturalHeight);
+            selection.hidden = false;
+            selection.style.left = `${crop.x / img.naturalWidth * 100}%`;
+            selection.style.top = `${crop.y / img.naturalHeight * 100}%`;
+            selection.style.width = `${crop.width / img.naturalWidth * 100}%`;
+            selection.style.height = `${crop.height / img.naturalHeight * 100}%`;
+            status.textContent = `${crop.width} × ${crop.height}`;
+            save.textContent = 'Обрезать и сохранить';
+        };
+        stage.addEventListener('pointerdown', event => {
+            if (save.disabled || (event.pointerType === 'mouse' && event.button !== 0) || pointerId !== null) return;
+            event.preventDefault();
+            pointerId = event.pointerId;
+            start = point(event);
+            stage.setPointerCapture(pointerId);
+            update(event);
+        });
+        stage.addEventListener('pointermove', event => {
+            if (event.pointerId === pointerId) update(event);
+        });
+        stage.addEventListener('pointerup', event => {
+            if (event.pointerId !== pointerId) return;
+            update(event);
+            stage.releasePointerCapture(pointerId);
+            pointerId = null;
+            if (crop.width < 2 || crop.height < 2) reset();
+        });
+        stage.addEventListener('pointercancel', () => { pointerId = null; reset(); });
+        dialog.querySelector('[data-action="reset"]').addEventListener('click', reset);
+        dialog.querySelector('[data-action="cancel"]').addEventListener('click', () => finish(null));
+        dialog.addEventListener('cancel', event => { event.preventDefault(); finish(null); });
+        dialog.addEventListener('keydown', event => event.stopPropagation());
+        save.addEventListener('click', () => {
+            try {
+                if (!crop) { finish(imageData); return; }
+                if (crop.width < 2 || crop.height < 2) return;
+                const canvas = document.createElement('canvas');
+                canvas.width = crop.width;
+                canvas.height = crop.height;
+                canvas.getContext('2d').drawImage(img, crop.x, crop.y, crop.width, crop.height, 0, 0, crop.width, crop.height);
+                finish(canvas.toDataURL('image/png').split(',')[1]);
+            } catch (error) {
+                status.textContent = `Не удалось обрезать изображение: ${error.message}`;
+            }
+        });
+        img.onload = () => { save.disabled = false; reset(); };
+        img.onerror = () => { status.textContent = 'Не удалось открыть изображение. Выберите другой файл.'; };
+        document.body.appendChild(dialog);
+        dialog.showModal();
+        img.src = `data:${detectMimeType(imageData)};base64,${imageData}`;
+    });
+}
+
+function editSavedReferenceImage(item, render) {
+    return openReferenceImageEditor(item.imageData, item.name).then(async edited => {
+        if (edited === null || edited === item.imageData) return;
+        item.imageData = await resizeImageBase64(edited, 512);
+        saveSettings();
+        render();
+        renderQuickWardrobeList();
+        toastr.success('Изображение обрезано и сохранено');
+    });
+}
+
+function addReferenceCardControls(card, item, isActive, onSelect, render) {
+    const img = card.querySelector('img');
+    if (item.imageData && img) {
+        img.src = `data:${detectMimeType(item.imageData)};base64,${item.imageData}`;
+        img.title = 'Открыть изображение / обрезать';
+        img.addEventListener('click', event => { event.stopPropagation(); editSavedReferenceImage(item, render); });
+    } else if (img) {
+        img.remove();
+    }
+    const select = document.createElement('button');
+    select.type = 'button';
+    select.className = 'iig-reference-select';
+    select.textContent = isActive ? '✓ Снять' : 'Выбрать';
+    select.addEventListener('click', event => { event.stopPropagation(); onSelect(); });
+    card.appendChild(select);
+}
+
+function bindReferenceUpload(kind, target) {
+    const fileInput = document.getElementById(`iig_${kind}_${target}_file`);
+    const nameInput = document.getElementById(`iig_${kind}_${target}_name`);
+    const render = () => kind === 'wardrobe' ? renderWardrobeGrid(target) : renderHairstyleGrid(target);
+    document.getElementById(`iig_${kind}_${target}_add`)?.addEventListener('click', () => fileInput?.click());
+    document.getElementById(`iig_${kind}_${target}_text`)?.addEventListener('click', () => {
+        const name = nameInput?.value?.trim() || 'Текстовый наряд';
+        const item = addWardrobeItem(name, null, target);
+        setActiveWardrobe(item.id, target);
+        if (nameInput) nameInput.value = '';
+        render();
+    });
+    fileInput?.addEventListener('change', async () => {
+        const file = fileInput.files[0];
+        if (!file) return;
+        try {
+            const original = await readLibraryFileAsBase64(file);
+            const edited = await openReferenceImageEditor(original, 'Просмотр и обрезка перед добавлением');
+            if (edited === null) return;
+            const resized = await resizeImageBase64(edited, 512);
+            const name = nameInput?.value?.trim() || file.name.replace(/\.[^.]+$/, '');
+            if (kind === 'wardrobe') addWardrobeItem(name, resized, target);
+            else addHairstyleItem(name, resized, target);
+            if (nameInput) nameInput.value = '';
+            render();
+            renderQuickWardrobeList();
+        } catch (error) { toastr.error(`Не удалось добавить изображение: ${error.message}`); }
+        finally { fileInput.value = ''; }
+    });
+}
+
 function renderWardrobeGrid(target) {
     const settings = getSettings();
     const containerId = `iig_wardrobe_${target}`;
@@ -3160,7 +3363,7 @@ function renderWardrobeGrid(target) {
         card.style.cssText = `position:relative;width:80px;height:100px;border-radius:8px;overflow:hidden;cursor:pointer;border:2px solid ${isActive ? '#ffb6c1' : 'rgba(255,255,255,0.08)'};transition:border-color 0.2s;`;
 
         const img = document.createElement('img');
-        img.src = `data:image/png;base64,${item.imageData}`;
+        img.src = item.imageData ? `data:${detectMimeType(item.imageData)};base64,${item.imageData}` : '';
         img.style.cssText = 'width:100%;height:100%;object-fit:cover;';
         card.appendChild(img);
 
@@ -3210,6 +3413,11 @@ function renderWardrobeGrid(target) {
             renderWardrobeGrid(target);
         });
 
+        addReferenceCardControls(card, item, isActive, () => {
+            setActiveWardrobe(item.id, target);
+            renderWardrobeGrid(target);
+        }, () => renderWardrobeGrid(target));
+
         container.appendChild(card);
     }
 
@@ -3240,11 +3448,11 @@ function renderWardrobeDescriptionPanel(target) {
     panel.innerHTML = `
         <div style="font-size:11px;color:#e8e0e0;margin-bottom:4px;">
             <i class="fa-solid fa-shirt" style="margin-right:4px;"></i>
-            Описание: <b>${activeItem.name}</b>
+            Описание: <b>${escapeHtml(activeItem.name)}</b>
         </div>
         <textarea class="text_pole" rows="3" style="width:100%;font-size:11px;resize:vertical;"
             placeholder="Введите описание одежды вручную или сгенерируйте через AI..."
-            data-wardrobe-id="${activeItem.id}">${activeItem.description || ''}</textarea>
+            data-wardrobe-id="${activeItem.id}">${escapeHtml(activeItem.description)}</textarea>
         <div style="display:flex;gap:6px;margin-top:4px;">
             <div class="menu_button iig-ward-desc-generate" data-wardrobe-id="${activeItem.id}" style="flex:1;font-size:11px;">
                 <i class="fa-solid fa-robot"></i> Сгенерировать
@@ -3335,7 +3543,7 @@ function renderHairstyleGrid(target) {
         card.style.cssText = `position:relative;width:80px;height:100px;border-radius:8px;overflow:hidden;cursor:pointer;border:2px solid ${isActive ? '#ffb6c1' : 'rgba(255,255,255,0.08)'};transition:border-color 0.2s;`;
 
         const img = document.createElement('img');
-        img.src = `data:image/png;base64,${item.imageData}`;
+        img.src = item.imageData ? `data:${detectMimeType(item.imageData)};base64,${item.imageData}` : '';
         img.style.cssText = 'width:100%;height:100%;object-fit:cover;';
         card.appendChild(img);
 
@@ -3385,6 +3593,11 @@ function renderHairstyleGrid(target) {
             renderHairstyleGrid(target);
         });
 
+        addReferenceCardControls(card, item, isActive, () => {
+            setActiveHairstyle(item.id, target);
+            renderHairstyleGrid(target);
+        }, () => renderHairstyleGrid(target));
+
         container.appendChild(card);
     }
 
@@ -3415,11 +3628,11 @@ function renderHairstyleDescriptionPanel(target) {
     panel.innerHTML = `
         <div style="font-size:11px;color:#e8e0e0;margin-bottom:4px;">
             <i class="fa-solid fa-scissors" style="margin-right:4px;"></i>
-            Описание: <b>${activeItem.name}</b>
+            Описание: <b>${escapeHtml(activeItem.name)}</b>
         </div>
         <textarea class="text_pole" rows="3" style="width:100%;font-size:11px;resize:vertical;"
             placeholder="Введите описание причёски вручную или сгенерируйте через AI..."
-            data-hairstyle-id="${activeItem.id}">${activeItem.description || ''}</textarea>
+            data-hairstyle-id="${activeItem.id}">${escapeHtml(activeItem.description)}</textarea>
         <div style="display:flex;gap:6px;margin-top:4px;">
             <div class="menu_button iig-hair-desc-generate" data-hairstyle-id="${activeItem.id}" style="flex:1;font-size:11px;">
                 <i class="fa-solid fa-robot"></i> Сгенерировать
@@ -4243,6 +4456,7 @@ function createSettingsUI() {
                             <div style="display:flex;align-items:center;gap:6px;margin-bottom:6px;">
                                 <input type="text" id="iig_wardrobe_char_name" class="text_pole flex1" placeholder="Название наряда...">
                                 <div class="menu_button" id="iig_wardrobe_char_add"><i class="fa-solid fa-plus"></i> Добавить</div>
+                                <button type="button" class="menu_button" id="iig_wardrobe_char_text" title="Создать наряд без изображения">Текст</button>
                                 <input type="file" id="iig_wardrobe_char_file" accept="image/*" style="display:none;">
                             </div>
                             <div id="iig_wardrobe_char"></div>
@@ -4259,6 +4473,7 @@ function createSettingsUI() {
                             <div style="display:flex;align-items:center;gap:6px;margin-bottom:6px;">
                                 <input type="text" id="iig_wardrobe_user_name" class="text_pole flex1" placeholder="Название наряда...">
                                 <div class="menu_button" id="iig_wardrobe_user_add"><i class="fa-solid fa-plus"></i> Добавить</div>
+                                <button type="button" class="menu_button" id="iig_wardrobe_user_text" title="Создать наряд без изображения">Текст</button>
                                 <input type="file" id="iig_wardrobe_user_file" accept="image/*" style="display:none;">
                             </div>
                             <div id="iig_wardrobe_user"></div>
@@ -4269,7 +4484,7 @@ function createSettingsUI() {
                     <div class="iig-collapsible" data-section-id="wardrobe_inject">
                         <div class="iig-collapsible-header">
                             <i class="fa-solid fa-chevron-down iig-collapse-icon"></i>
-                            <span>💉 Инжект гардероба в чат</span>
+                            <span>💉 Отправка гардероба и инжект в чат</span>
                         </div>
                         <div class="iig-collapsible-content">
                             <label class="checkbox_label">
@@ -4277,6 +4492,15 @@ function createSettingsUI() {
                                 <span>Инжектить описание одежды в чат</span>
                             </label>
                             <p class="hint">Описание активной одежды будет добавлено в контекст для текстовой модели.</p>
+                            <div class="flex-row">
+                                <label for="iig_wardrobe_send_mode">В генерацию картинок</label>
+                                <select id="iig_wardrobe_send_mode" class="flex1">
+                                    <option value="both" ${settings.wardrobeSendMode === 'both' ? 'selected' : ''}>Фото + текст</option>
+                                    <option value="text" ${settings.wardrobeSendMode === 'text' ? 'selected' : ''}>Только текст</option>
+                                    <option value="none" ${settings.wardrobeSendMode === 'none' ? 'selected' : ''}>Не отправлять</option>
+                                </select>
+                            </div>
+                            <p class="hint">Для гардероба персонажа и юзера. NovelAI получает только описание независимо от наличия фото. Для Naistera можно выбрать «Только текст». Инжект в чат настраивается отдельно.</p>
                             <div class="flex-row">
                                 <label>Глубина инжекта</label>
                                 <input type="number" id="iig_wardrobe_injection_depth" class="text_pole" value="${settings.wardrobeInjectionDepth || 1}" min="0" max="100" style="width:70px;">
@@ -4677,29 +4901,12 @@ function bindSettingsEvents() {
     });
 
     // Wardrobe add buttons
-    const bindWardrobeAdd = (target) => {
-        const addBtn = document.getElementById(`iig_wardrobe_${target}_add`);
-        const fileInput = document.getElementById(`iig_wardrobe_${target}_file`);
-        const nameInput = document.getElementById(`iig_wardrobe_${target}_name`);
-        addBtn?.addEventListener('click', () => fileInput?.click());
-        fileInput?.addEventListener('change', async (e) => {
-            const file = e.target.files[0];
-            if (!file) return;
-            const reader = new FileReader();
-            reader.onloadend = async () => {
-                const resized = await resizeImageBase64(reader.result.split(',')[1], 512);
-                const name = nameInput?.value?.trim() || file.name.replace(/\.[^.]+$/, '') || 'Outfit';
-                addWardrobeItem(name, resized, target);
-                if (nameInput) nameInput.value = '';
-                fileInput.value = '';
-                renderWardrobeGrid(target);
-                toastr.success(`Одежда "${name}" добавлена`);
-            };
-            reader.readAsDataURL(file);
-        });
-    };
-    bindWardrobeAdd('char');
-    bindWardrobeAdd('user');
+    bindReferenceUpload('wardrobe', 'char');
+    bindReferenceUpload('wardrobe', 'user');
+    document.getElementById('iig_wardrobe_send_mode')?.addEventListener('change', event => {
+        settings.wardrobeSendMode = event.target.value;
+        saveSettings();
+    });
 
     // Vision API settings
     document.getElementById('iig_wardrobe_desc_endpoint')?.addEventListener('input', (e) => { settings.wardrobeDescEndpoint = e.target.value; saveSettings(); });
@@ -4868,29 +5075,8 @@ function bindSettingsEvents() {
     document.getElementById('iig_export_logs')?.addEventListener('click', exportLogs);
 
     // Hairstyle add buttons
-    const bindHairstyleAdd = (target) => {
-        const addBtn = document.getElementById(`iig_hairstyle_${target}_add`);
-        const fileInput = document.getElementById(`iig_hairstyle_${target}_file`);
-        const nameInput = document.getElementById(`iig_hairstyle_${target}_name`);
-        addBtn?.addEventListener('click', () => fileInput?.click());
-        fileInput?.addEventListener('change', async (e) => {
-            const file = e.target.files[0];
-            if (!file) return;
-            const reader = new FileReader();
-            reader.onloadend = async () => {
-                const resized = await resizeImageBase64(reader.result.split(',')[1], 512);
-                const name = nameInput?.value?.trim() || file.name.replace(/\.[^.]+$/, '') || 'Hairstyle';
-                addHairstyleItem(name, resized, target);
-                if (nameInput) nameInput.value = '';
-                fileInput.value = '';
-                renderHairstyleGrid(target);
-                toastr.success(`Причёска "${name}" добавлена`);
-            };
-            reader.readAsDataURL(file);
-        });
-    };
-    bindHairstyleAdd('char');
-    bindHairstyleAdd('user');
+    bindReferenceUpload('hairstyle', 'char');
+    bindReferenceUpload('hairstyle', 'user');
 
     // Hairstyle send mode
     document.getElementById('iig_hairstyle_send_mode')?.addEventListener('change', (e) => {
@@ -5099,14 +5285,14 @@ function renderQuickWardrobeList() {
             ${items.map(item => `
                 <div class="iig-quick-outfit-item ${item.id === activeId ? 'iig-outfit-active' : ''}" data-id="${item.id}">
                     ${item.imageData 
-                        ? `<img class="iig-quick-outfit-thumb" src="data:image/png;base64,${item.imageData}" alt="${item.name}">`
+                        ? `<img class="iig-quick-outfit-thumb" src="data:${detectMimeType(item.imageData)};base64,${item.imageData}" alt="${escapeHtml(item.name)}" title="Открыть изображение / обрезать" role="button" tabindex="0">`
                         : `<div class="iig-quick-outfit-thumb" style="display:flex;align-items:center;justify-content:center;">
                             <i class="fa-solid fa-shirt" style="color:#5a5252;"></i>
                            </div>`
                     }
                     <div class="iig-quick-outfit-info">
-                        <div class="iig-quick-outfit-name">${item.name}</div>
-                        <div class="iig-quick-outfit-desc">${item.description || 'Без описания'}</div>
+                        <div class="iig-quick-outfit-name">${escapeHtml(item.name)}</div>
+                        <div class="iig-quick-outfit-desc">${escapeHtml(item.description || 'Без описания')}</div>
                     </div>
                     ${item.id === activeId ? '<div class="iig-quick-outfit-badge"><i class="fa-solid fa-check"></i></div>' : ''}
                 </div>
@@ -5118,6 +5304,15 @@ function renderQuickWardrobeList() {
     
     // Add click handlers
     content.querySelectorAll('.iig-quick-outfit-item').forEach(itemEl => {
+        const thumb = itemEl.querySelector('img');
+        thumb?.addEventListener('click', event => {
+            event.stopPropagation();
+            const item = settings.wardrobeItems.find(entry => entry.id === itemEl.dataset.id);
+            if (item) editSavedReferenceImage(item, () => renderWardrobeGrid(target));
+        });
+        thumb?.addEventListener('keydown', event => {
+            if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); thumb.click(); }
+        });
         itemEl.addEventListener('click', () => {
             const itemId = itemEl.dataset.id;
             setActiveWardrobe(itemId, target);

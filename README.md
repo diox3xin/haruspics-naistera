@@ -140,6 +140,9 @@ Authorization: Bearer YOUR_NAISTERA_TOKEN
 
 - Кнопка перегенерации в правом верхнем углу изображения доступна после первой
   генерации и восстанавливается после форматирования сообщения и открытия чата.
+  Восстановление также отслеживает повторную отрисовку DOM и не зависит от
+  сохранения `data-iig-instruction` на отображаемом изображении. Нажатия
+  обрабатываются на контейнере чата, включая пересозданные кнопки.
   Новые генерации из старых `[IMG:GEN:{...}]` тегов сохраняют исходный промпт.
   Уже сохранённые старой версией `[IMG:✓:...]` не содержат промпта: автоматически
   восстановить его для них невозможно.
@@ -166,7 +169,12 @@ Authorization: Bearer YOUR_NAISTERA_TOKEN
 ```powershell
 node --check "C:\Users\diox3\Downloads\haruspics\index.js"
 node --test "C:\Users\diox3\Downloads\haruspics\tests\novelai.test.cjs" "C:\Users\diox3\Downloads\haruspics\tests\novelai-patch.test.cjs" "C:\Users\diox3\Downloads\haruspics\tests\wardrobe-ui.test.cjs"
+node --test "C:\Users\diox3\Downloads\haruspics\tests\regen-browser.test.cjs"
 ```
+
+Браузерный тест использует установленный Edge/Chrome (либо путь из переменной
+`IIG_TEST_BROWSER`) и временный изолированный профиль. Без браузера тест пропускается.
+Генерация в нём подменена: реальные API-запросы не выполняются.
 
 ## Ограничения
 

@@ -69,7 +69,7 @@ test('NovelAI uses hairstyle text and reports missing wardrobe descriptions', as
 test('generated legacy tags retain prompt, style and options for regeneration', async () => {
     const context = vm.createContext({ iigLog: () => {} });
     vm.runInContext(section('function escapeHtml(', '// SETTINGS'), context);
-    vm.runInContext(section('function buildGeneratedImageTag(', 'function restoreImageRegenButtons('), context);
+    vm.runInContext(section('function buildGeneratedImageTag(', 'async function restoreImageRegenButtons('), context);
     vm.runInContext(section('async function parseImageTags(', '// DOM HELPERS'), context);
     const tag = { prompt: `Hero's "coat" <red> & blue`, style: 'anime', aspectRatio: '2:3', negativePrompt: 'blur' };
     const html = context.buildGeneratedImageTag(tag, '/images/result.png');
@@ -95,29 +95,32 @@ class Element {
         this.parent = null;
     }
     closest() { return this.parent?.className === 'iig-image-wrapper' ? this.parent : null; }
+    querySelector(selector) { return this.children.find(child => '.' + child.className === selector) || null; }
 }
 
 test('restores visible regen buttons after rendering, without duplicate wrappers', async () => {
     const parent = new Element('div');
     const images = [new Element('img'), new Element('img')];
     for (const img of images) { img.setAttribute('src', '/images/generated.png'); parent.appendChild(img); }
-    const clicks = [];
     const context = vm.createContext({
         document: { createElement: tag => new Element(tag) },
-        regenerateSingleImage: async (...args) => clicks.push(args),
+        SillyTavern: { getContext: () => ({ chat: { 7: { mes: 'saved tags' } } }) },
+        processingMessages: new Set(),
+        parseImageTags: async () => images.map(() => ({ existingSrc: '/images/generated.png' })),
     });
     vm.runInContext(section('function wrapImageWithRegen(', '// MESSAGE PROCESSING'), context);
-    const message = { querySelectorAll: () => images };
-    context.restoreImageRegenButtons(message, 7);
-    context.restoreImageRegenButtons(message, 7);
+    const message = { isConnected: true, querySelectorAll: () => images };
+    await context.restoreImageRegenButtons(message, 7);
+    await context.restoreImageRegenButtons(message, 7);
     assert.equal(parent.children.length, 2);
     for (const wrapper of parent.children) {
         assert.equal(wrapper.className, 'iig-image-wrapper');
         assert.equal(wrapper.children.length, 2);
         assert.match(wrapper.children[0].style.cssText, /display:flex/);
-        await wrapper.children[0].events.click({ stopPropagation() {} });
+        assert.equal(wrapper.children[0].dataset.messageId, 7);
+        assert.equal(wrapper.children[0].dataset.tagIndex, parent.children.indexOf(wrapper));
     }
-    assert.deepEqual(clicks, [[7, 0], [7, 1]]);
+    // Actual clicks (including cloned buttons) are covered by regen-browser.test.cjs.
     const processing = section('async function processMessageTags(', '// SINGLE IMAGE REGENERATION');
     assert.ok(processing.lastIndexOf('restoreImageRegenButtons(') > processing.indexOf('mesTextEl.innerHTML = context.messageFormatting'));
 });

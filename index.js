@@ -2311,7 +2311,7 @@ async function parseImageTags(text, options = {}) {
                 quality: data.quality || null,
                 preset: data.preset || null,
                 negativePrompt: data.negative_prompt || data.negativePrompt || null,
-                isNewFormat: true, existingSrc: hasPath ? srcValue : null
+                isNewFormat: true, existingSrc: srcValue || null
             });
         } catch (e) {
             iigLog('WARN', `Failed to parse instruction JSON: ${e.message}`);
@@ -2429,15 +2429,12 @@ function wrapImageWithRegen(img, messageId, tagIndex) {
     const regenBtn = document.createElement('button');
     regenBtn.type = 'button';
     regenBtn.className = 'iig-image-regen';
+    regenBtn.dataset.messageId = messageId;
+    regenBtn.dataset.tagIndex = tagIndex;
     regenBtn.title = 'Перегенерировать эту картинку';
     regenBtn.innerHTML = '<i class="fa-solid fa-arrows-rotate"></i>';
     regenBtn.setAttribute('aria-label', regenBtn.title);
     regenBtn.style.cssText = 'position:absolute;top:4px;right:4px;width:30px;height:30px;display:flex;align-items:center;justify-content:center;cursor:pointer;border-radius:50%;background:rgba(0,0,0,0.65);color:#fff;font-size:13px;z-index:1;';
-    regenBtn.addEventListener('click', async (e) => {
-        e.stopPropagation();
-        await regenerateSingleImage(messageId, tagIndex);
-    });
-
     wrapper.appendChild(regenBtn);
     wrapper.appendChild(img);
     return wrapper;
@@ -2452,15 +2449,74 @@ function buildGeneratedImageTag(tag, imagePath) {
     return `<img class="iig-generated-image" data-iig-instruction='${instruction}' src="${escapeHtml(imagePath)}">`;
 }
 
-function restoreImageRegenButtons(messageElement, messageId) {
-    const images = messageElement.querySelectorAll('.mes_text img[data-iig-instruction]');
-    images.forEach((img, index) => {
-        const src = img.getAttribute('src') || '';
-        if (!src || src.includes('[IMG:') || img.closest('.iig-image-wrapper')) return;
+async function restoreImageRegenButtons(messageElement, messageId) {
+    const message = SillyTavern.getContext().chat[messageId];
+    if (!message || message.is_user || processingMessages.has(messageId)) return;
+    const text = message.mes;
+    const tags = await parseImageTags(text, { forceAll: true });
+    if (message.mes !== text || !messageElement.isConnected || processingMessages.has(messageId)) return;
+    const images = Array.from(messageElement.querySelectorAll('.mes_text img'));
+    const used = new Set();
+    const normalizeSrc = value => {
+        try { return new URL(value, document.baseURI).href; } catch (_) { return value; }
+    };
+    tags.forEach((tag, index) => {
+        if (!tag.existingSrc || tag.existingSrc.includes('[IMG:')) return;
+        const img = images.find(image => !used.has(image) &&
+            normalizeSrc(image.getAttribute('src')) === normalizeSrc(tag.existingSrc));
+        if (!img) return;
+        used.add(img);
+        const existing = img.closest('.iig-image-wrapper');
+        const button = existing?.querySelector('.iig-image-regen');
+        if (button) {
+            existing.dataset.tagIndex = index;
+            button.dataset.messageId = messageId;
+            button.dataset.tagIndex = index;
+            return;
+        }
         const marker = document.createElement('span');
-        img.replaceWith(marker);
+        (existing || img).replaceWith(marker);
         marker.replaceWith(wrapImageWithRegen(img, messageId, index));
     });
+}
+
+function observeImageRegenButtons() {
+    const chat = document.getElementById('chat');
+    if (!chat || chat.dataset.iigRegenObserver) return;
+    chat.dataset.iigRegenObserver = 'true';
+    const pending = new Set();
+    let timer;
+    const observer = new MutationObserver(records => {
+        for (const record of records) {
+            const element = record.target.nodeType === 1 ? record.target : record.target.parentElement;
+            const message = element?.closest('.mes');
+            if (message) pending.add(message);
+            for (const node of record.addedNodes || []) {
+                if (node.nodeType !== 1) continue;
+                if (node.matches('.mes')) pending.add(node);
+                node.querySelectorAll('.mes').forEach(mes => pending.add(mes));
+            }
+        }
+        clearTimeout(timer);
+        timer = setTimeout(() => {
+            for (const message of pending) {
+                restoreImageRegenButtons(message, Number(message.getAttribute('mesid')))
+                    .catch(error => iigLog('WARN', 'Cannot restore image buttons:', error.message));
+            }
+            pending.clear();
+        }, 50);
+    });
+    observer.observe(chat, { childList: true, subtree: true, attributes: true, attributeFilter: ['src'] });
+    // Capture clicks before links/lightboxes and survive cloned/re-rendered buttons.
+    chat.addEventListener('click', event => {
+        const button = event.target.closest?.('.iig-image-regen');
+        if (!button) return;
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        const messageId = Number(button.closest('.mes')?.getAttribute('mesid'));
+        regenerateSingleImage(messageId, Number(button.dataset.tagIndex))
+            .catch(error => { iigLog('ERROR', error.message); toastr.error(error.message); });
+    }, true);
 }
 
 // ============================================================
@@ -2636,7 +2692,7 @@ async function processMessageTags(messageId) {
     if (typeof context.messageFormatting === 'function') {
         mesTextEl.innerHTML = context.messageFormatting(message.mes, message.name, message.is_system, message.is_user, messageId);
     }
-    restoreImageRegenButtons(messageElement, messageId);
+    await restoreImageRegenButtons(messageElement, messageId);
 }
 
 // ============================================================
@@ -2644,12 +2700,16 @@ async function processMessageTags(messageId) {
 // ============================================================
 
 async function regenerateSingleImage(messageId, tagIndex) {
-    if (processingMessages.has(messageId)) return;
+    if (processingMessages.has(messageId)) {
+        toastr.info('В этом сообщении уже идёт генерация. Дождитесь завершения или отмените её.');
+        return;
+    }
     const context = SillyTavern.getContext();
     const message = context.chat[messageId];
     if (!message) { toastr.error('Сообщение не найдено'); return; }
 
     const tags = await parseImageTags(message.mes, { forceAll: true });
+    if (processingMessages.has(messageId)) return;
     if (!tags[tagIndex]) { toastr.error('Тег не найден'); return; }
     const tag = tags[tagIndex];
 
@@ -2697,7 +2757,7 @@ async function regenerateSingleImage(messageId, tagIndex) {
         const wrapped = wrapImageWithRegen(img, messageId, tagIndex);
         lp.replaceWith(wrapped);
 
-        message.mes = message.mes.replace(tag.fullMatch, tag.fullMatch.replace(/src\s*=\s*(['"])[^'"]*\1/i, `src="${imagePath}"`));
+        message.mes = message.mes.replace(tag.fullMatch, buildGeneratedImageTag(tag, imagePath));
         await context.saveChat();
         toastr.success('Картинка перегенерирована', 'Генерация картинок', { timeOut: 2000 });
     } catch (error) {
@@ -2708,6 +2768,7 @@ async function regenerateSingleImage(messageId, tagIndex) {
     } finally {
         processingMessages.delete(messageId);
         activeAbortControllers.delete(messageId);
+        await restoreImageRegenButtons(messageElement, messageId);
     }
 }
 
@@ -2841,7 +2902,7 @@ async function onMessageReceived(messageId) {
     if (!el) return;
     addRegenerateButton(el, messageId);
     await processMessageTags(messageId);
-    restoreImageRegenButtons(el, messageId);
+    await restoreImageRegenButtons(el, messageId);
 }
 
 // ============================================================
@@ -5104,6 +5165,7 @@ function bindSettingsEvents() {
 
     context.eventSource.on(context.event_types.APP_READY, () => {
         createSettingsUI();
+        observeImageRegenButtons();
         addButtonsToExistingMessages();
         updateWardrobeInjection();
         console.log('[IIG] Inline Image Generation v3.0 loaded');
@@ -5111,6 +5173,7 @@ function bindSettingsEvents() {
 
     context.eventSource.on(context.event_types.CHAT_CHANGED, () => {
         setTimeout(() => {
+            observeImageRegenButtons();
             addButtonsToExistingMessages();
             updateWardrobeInjection();
         }, 100);

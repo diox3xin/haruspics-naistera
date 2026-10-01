@@ -500,6 +500,18 @@
     max-width: 100%;
 }
 
+#chat .mes_text .iig-image-regen {
+    display: flex !important;
+    visibility: visible !important;
+    opacity: 1 !important;
+    pointer-events: auto !important;
+    z-index: 10 !important;
+    padding: 0;
+    margin: 0;
+    border: 1px solid rgba(255, 255, 255, .6);
+    touch-action: manipulation;
+}
+
 /* ---- REGEN BUTTON ON MESSAGES ---- */
 
 .iig-regenerate-btn {

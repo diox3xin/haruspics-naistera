@@ -3179,7 +3179,8 @@ function renderPromptPanel(panel, messageId) {
     if (!panel || !message) return;
     const state = message.extra?.iig_prompt_block || {};
     const instruction = getPromptInstructions().find(item => item.id === state.instructionId) || getActivePromptInstruction();
-    panel.innerHTML = `<div class="iig-prompt-panel-head"><strong><i class="fa-solid fa-wand-magic-sparkles"></i> Image prompt</strong><span class="iig-prompt-status"></span></div>
+    panel.innerHTML = `${state.imagePath ? `<img class="iig-prompt-result-image" src="${escapeHtml(state.imagePath)}" alt="${escapeHtml(state.prompt || 'Generated image')}">` : ''}
+        <div class="iig-prompt-panel-head"><strong><i class="fa-solid fa-wand-magic-sparkles"></i> Image prompt</strong><span class="iig-prompt-status"></span></div>
         <div class="iig-prompt-panel-controls"><span class="iig-prompt-selection">${escapeHtml(instruction.name)}</span><button type="button" class="menu_button iig-prompt-generate"><i class="fa-solid fa-wand-magic-sparkles"></i> Промпт</button><button type="button" class="menu_button iig-image-from-prompt"><i class="fa-solid fa-image"></i> Картинка</button></div>
         <textarea class="iig-prompt-value" rows="3" placeholder="Здесь появится prompt картинки..."></textarea>
         <div class="iig-prompt-meta"><span>Стиль: ${escapeHtml(state.style || buildEffectiveStyle('') || 'не выбран')}</span><span>Негатив: ${escapeHtml(state.negativePrompt || getActiveNegativePrompt() || 'не выбран')}</span></div>`;
@@ -3223,15 +3224,8 @@ function renderPromptPanel(panel, messageId) {
         activeAbortControllers.set(messageId, controller);
         button.classList.add('disabled');
         try {
-            const result = await generateImageFromPromptBlock(messageId, panel, controller.signal);
+            await generateImageFromPromptBlock(messageId, panel, controller.signal);
             renderPromptPanel(panel, messageId);
-            if (result.imagePath) {
-                const image = document.createElement('img');
-                image.className = 'iig-prompt-result-image';
-                image.src = result.imagePath;
-                image.alt = result.prompt;
-                panel.appendChild(image);
-            }
             toastr.success('Картинка по prompt создана');
         } catch (error) {
             const status = panel.querySelector('.iig-prompt-status');
@@ -3242,13 +3236,6 @@ function renderPromptPanel(panel, messageId) {
             button.classList.remove('disabled');
         }
     });
-    if (state.imagePath) {
-        const image = document.createElement('img');
-        image.className = 'iig-prompt-result-image';
-        image.src = state.imagePath;
-        image.alt = state.prompt || 'Generated image';
-        panel.appendChild(image);
-    }
 }
 
 function addPromptPanelsToExistingMessages() {

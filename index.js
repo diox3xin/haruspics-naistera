@@ -13,6 +13,7 @@ const MODULE_NAME = 'inline_image_gen';
 
 const processingMessages = new Set();
 const activeAbortControllers = new Map();
+const activePromptAbortControllers = new Map();
 let iigLibraryPersonaFiles = [];
 let iigLibraryPersonasLoaded = false;
 
@@ -117,6 +118,16 @@ const defaultSettings = Object.freeze({
     // ===== NEW: Style Gallery =====
     styleGalleryItems: [],
     activeStyleIds: [],
+    negativeGalleryItems: [],
+    activeNegativeId: '',
+    // ===== Image prompt generation =====
+    promptInstructionItems: [],
+    activePromptInstructionId: 'builtin-image',
+    promptGenEndpoint: '',
+    promptGenApiKey: '',
+    promptGenModel: '',
+    promptGenMaxTokens: 700,
+    promptGenTemperature: 0.7,
     // ===== NEW: Collapsed sections state =====
     collapsedSections: {},
 });
@@ -275,6 +286,14 @@ function getSettings() {
         ensureStyleGalleryItemDefaults(item);
     }
     s.activeStyleIds = s.activeStyleIds.filter(id => s.styleGalleryItems.some(item => item.id === id));
+    if (!Array.isArray(s.negativeGalleryItems)) s.negativeGalleryItems = [];
+    for (const item of s.negativeGalleryItems) ensureNegativeGalleryItemDefaults(item);
+    if (s.activeNegativeId && !s.negativeGalleryItems.some(item => item.id === s.activeNegativeId)) s.activeNegativeId = '';
+    if (!Array.isArray(s.promptInstructionItems)) s.promptInstructionItems = [];
+    for (const item of s.promptInstructionItems) ensurePromptInstructionDefaults(item);
+    if (!s.promptInstructionItems.some(item => item.id === s.activePromptInstructionId)) s.activePromptInstructionId = 'builtin-image';
+    if (!Number.isFinite(Number(s.promptGenMaxTokens))) s.promptGenMaxTokens = 700;
+    if (!Number.isFinite(Number(s.promptGenTemperature))) s.promptGenTemperature = 0.7;
         for (const npc of (s.npcReferences || [])) {
         ensureNpcDefaults(npc);
 
@@ -564,6 +583,96 @@ async function fetchDescriptionModels() {
     }
 }
 
+async function fetchPromptGenerationModels() {
+    const settings = getSettings();
+    const endpoint = settings.promptGenEndpoint || settings.endpoint;
+    const apiKey = settings.promptGenApiKey || settings.apiKey;
+    if (!endpoint || !apiKey) return [];
+    const response = await fetch(buildOpenAIUrl(endpoint, 'models'), {
+        method: 'GET',
+        headers: buildAuthHeaders(apiKey),
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const data = await response.json();
+    return (data.data || []).filter(model => model?.id && !isImageModel(model.id)).map(model => String(model.id));
+}
+
+function getPromptGenerationContext(message, instruction) {
+    const context = SillyTavern.getContext();
+    const character = context.characters?.[context.characterId];
+    const recentMessages = (context.chat || []).slice(-8).map(item => {
+        const role = item.is_user ? 'User' : item.is_system ? 'System' : (item.name || 'Character');
+        return `${role}: ${String(item.mes || '').trim()}`;
+    }).filter(Boolean).join('\n\n');
+    return [
+        `Character: ${character?.name || 'Unknown'}`,
+        `User: ${context.name1 || 'User'}`,
+        `Current message: ${String(message?.mes || '').trim()}`,
+        `Recent context:\n${recentMessages}`,
+        `Instruction:\n${instruction.prompt}`,
+        'Return only the image-generation prompt.',
+    ].join('\n\n');
+}
+
+async function generateImagePromptForMessage(messageId, signal) {
+    const context = SillyTavern.getContext();
+    const message = context.chat?.[messageId];
+    if (!message) throw new Error('Сообщение не найдено');
+    const settings = getSettings();
+    const instruction = getActivePromptInstruction();
+    const endpoint = settings.promptGenEndpoint || settings.endpoint;
+    const apiKey = settings.promptGenApiKey || settings.apiKey;
+    const model = settings.promptGenModel;
+    if (!endpoint) throw new Error('Не настроен endpoint модели промпта');
+    if (!apiKey) throw new Error('Не настроен API ключ модели промпта');
+    if (!model) throw new Error('Не выбрана модель промпта');
+
+    const response = await fetch(buildOpenAIUrl(endpoint, 'chat/completions'), {
+        method: 'POST',
+        headers: buildAuthHeaders(apiKey, { 'Content-Type': 'application/json' }),
+        body: JSON.stringify({
+            model,
+            temperature: Math.max(0, Math.min(2, Number(settings.promptGenTemperature) || 0.7)),
+            max_tokens: Math.max(64, Math.min(4000, Number(settings.promptGenMaxTokens) || 700)),
+            messages: [{ role: 'user', content: getPromptGenerationContext(message, instruction) }],
+        }),
+        signal,
+    });
+    if (!response.ok) throw new Error(`Prompt API (${response.status}): ${(await response.text().catch(() => '')).slice(0, 500)}`);
+    const result = await response.json();
+    const prompt = result.choices?.[0]?.message?.content?.trim();
+    if (!prompt) throw new Error('Модель промпта вернула пустой ответ');
+
+    if (!message.extra || typeof message.extra !== 'object') message.extra = {};
+    message.extra.iig_prompt_block = {
+        ...(message.extra.iig_prompt_block || {}),
+        instructionId: instruction.id,
+        prompt,
+        style: buildEffectiveStyle(''),
+        negativePrompt: getActiveNegativePrompt(),
+        updatedAt: Date.now(),
+    };
+    await context.saveChat();
+    return message.extra.iig_prompt_block;
+}
+
+async function generateImageFromPromptBlock(messageId, panel, signal) {
+    const context = SillyTavern.getContext();
+    const message = context.chat?.[messageId];
+    const state = message?.extra?.iig_prompt_block;
+    if (!message || !state?.prompt) throw new Error('Сначала сгенерируйте или введите промпт');
+    const status = panel?.querySelector('.iig-prompt-status');
+    const refs = await collectReferenceImages(state.prompt).catch(() => ({ imageRefs: [], textOnlyClothing: [], warnings: [] }));
+    const dataUrl = await generateImageWithRetry(state.prompt, buildEffectiveStyle(''), text => {
+        if (status) status.textContent = text;
+    }, { negativePrompt: getActiveNegativePrompt() || state.negativePrompt, refData: refs, signal });
+    if (status) status.textContent = 'Сохранение...';
+    state.imagePath = await saveImageToFile(dataUrl);
+    state.updatedAt = Date.now();
+    await context.saveChat();
+    return state;
+}
+
 // ============================================================
 // IMAGE UTILITIES
 // ============================================================
@@ -764,6 +873,137 @@ function buildEffectiveStyle(tagStyle = '') {
         .map(part => (part || '').trim())
         .filter(Boolean)
         .join(', ');
+}
+
+function ensureNegativeGalleryItemDefaults(item) {
+    if (!item) return;
+    if (!item.id) item.id = `negative_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    if (!Object.hasOwn(item, 'name')) item.name = 'Negative prompt';
+    if (!Object.hasOwn(item, 'prompt')) item.prompt = '';
+    if (!Object.hasOwn(item, 'createdAt')) item.createdAt = Date.now();
+}
+
+function addNegativeGalleryItem(name, promptText) {
+    const settings = getSettings();
+    const item = {
+        id: `negative_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+        name: String(name || 'Negative prompt').trim() || 'Negative prompt',
+        prompt: String(promptText || '').trim(),
+        createdAt: Date.now(),
+    };
+    settings.negativeGalleryItems.push(item);
+    saveSettings();
+    return item;
+}
+
+function getActiveNegativePrompt() {
+    const settings = getSettings();
+    const item = settings.negativeGalleryItems.find(candidate => candidate.id === settings.activeNegativeId);
+    return String(item?.prompt || '').trim();
+}
+
+function getEffectiveNegativePrompt(tagNegativePrompt = '') {
+    // The gallery is intentionally independent from image/API presets. A tag
+    // value remains a per-image override, while the selected gallery item is
+    // the extension-wide default for all providers that support negatives.
+    return String(tagNegativePrompt || '').trim() || getActiveNegativePrompt();
+}
+
+const BUILTIN_PROMPT_INSTRUCTIONS = Object.freeze([
+    {
+        id: 'builtin-image',
+        name: 'Обычная картинка',
+        kind: 'image',
+        builtin: true,
+        prompt: 'Create one detailed image-generation prompt from the scene. Describe the characters, appearance, clothing, pose, action, environment, lighting, camera angle, composition, and mood. Preserve named character identities and concrete visual facts. Do not add story, dialogue, explanations, or markdown. Return only the final prompt in English.',
+    },
+    {
+        id: 'builtin-comic',
+        name: 'Комикс',
+        kind: 'comic',
+        builtin: true,
+        prompt: 'Create one detailed image-generation prompt for a comic page based on the scene. Specify the number and layout of panels, reading order, continuity of characters and clothing, camera angle in each panel, actions, expressions, environment, lighting, speech bubbles or captions only when explicitly present, and clear separation between panels. Preserve all named character identities. Return only one final prompt in English, with no explanations or markdown.',
+    },
+]);
+
+function ensurePromptInstructionDefaults(item) {
+    if (!item) return;
+    if (!item.id) item.id = `instruction_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    if (!Object.hasOwn(item, 'name')) item.name = 'Image prompt instruction';
+    if (!Object.hasOwn(item, 'kind')) item.kind = 'custom';
+    if (!Object.hasOwn(item, 'prompt')) item.prompt = '';
+    if (!Object.hasOwn(item, 'builtin')) item.builtin = false;
+    if (!Object.hasOwn(item, 'createdAt')) item.createdAt = Date.now();
+}
+
+function getPromptInstructions(settings = getSettings()) {
+    const custom = settings.promptInstructionItems || [];
+    const customById = new Map(custom.map(item => [item.id, item]));
+    const all = BUILTIN_PROMPT_INSTRUCTIONS.map(item => customById.get(item.id) || item);
+    all.push(...custom.filter(item => !BUILTIN_PROMPT_INSTRUCTIONS.some(builtin => builtin.id === item.id)));
+    return all.map(item => ({ ...item }));
+}
+
+function getActivePromptInstruction() {
+    const settings = getSettings();
+    return getPromptInstructions(settings).find(item => item.id === settings.activePromptInstructionId)
+        || BUILTIN_PROMPT_INSTRUCTIONS[0];
+}
+
+function addPromptInstruction(name, promptText, kind = 'custom') {
+    const settings = getSettings();
+    const item = {
+        id: `instruction_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+        name: String(name || 'Моя инструкция').trim() || 'Моя инструкция',
+        kind: kind === 'comic' ? 'comic' : 'custom',
+        prompt: String(promptText || '').trim(),
+        builtin: false,
+        createdAt: Date.now(),
+    };
+    settings.promptInstructionItems.push(item);
+    settings.activePromptInstructionId = item.id;
+    saveSettings();
+    return item;
+}
+
+function updatePromptInstruction(itemId, patch = {}) {
+    const settings = getSettings();
+    const builtin = BUILTIN_PROMPT_INSTRUCTIONS.find(item => item.id === itemId);
+    const item = settings.promptInstructionItems.find(candidate => candidate.id === itemId);
+    if (!item && !builtin) return null;
+    if (builtin) {
+        // Built-ins are editable through a per-user override, preserving the
+        // shipped defaults for the Restore button.
+        const override = {
+            ...builtin,
+            ...patch,
+            id: builtin.id,
+            builtin: true,
+            overridden: true,
+        };
+        settings.promptInstructionItems = settings.promptInstructionItems.filter(candidate => candidate.id !== itemId);
+        settings.promptInstructionItems.push(override);
+        saveSettings();
+        return override;
+    }
+    if (Object.hasOwn(patch, 'name')) item.name = String(patch.name || item.name).trim() || item.name;
+    if (Object.hasOwn(patch, 'prompt')) item.prompt = String(patch.prompt || '').trim();
+    if (Object.hasOwn(patch, 'kind')) item.kind = patch.kind === 'comic' ? 'comic' : 'custom';
+    saveSettings();
+    return item;
+}
+
+function removePromptInstruction(itemId) {
+    const settings = getSettings();
+    settings.promptInstructionItems = settings.promptInstructionItems.filter(item => item.id !== itemId);
+    if (settings.activePromptInstructionId === itemId) settings.activePromptInstructionId = 'builtin-image';
+    saveSettings();
+}
+
+function restorePromptInstruction(itemId) {
+    const settings = getSettings();
+    settings.promptInstructionItems = settings.promptInstructionItems.filter(item => item.id !== itemId);
+    saveSettings();
 }
 
 // ============================================================
@@ -1557,7 +1797,10 @@ async function generateImageNaistera(prompt, style, refData, options = {}) {
         model,
     };
 
-    const negativePrompt = String(options.negativePrompt ?? settings.naisteraNegativePrompt ?? '').trim();
+    const selectedGalleryNegative = options.negativePrompt == null
+        ? String(settings.negativeGalleryItems?.find(item => item.id === settings.activeNegativeId)?.prompt || '').trim()
+        : String(options.negativePrompt || '').trim();
+    const negativePrompt = selectedGalleryNegative || String(settings.naisteraNegativePrompt || '').trim();
     if (negativePrompt && modelInfo?.negativePrompt === true) body.negative_prompt = negativePrompt;
     const preset = String(options.preset ?? settings.naisteraPreset ?? '').trim();
     if (preset) body.preset = preset;
@@ -1675,7 +1918,9 @@ async function generateImageNovelAI(prompt, style, refData = {}, options = {}) {
     const body = {
         prompt: parts.filter(Boolean).join(', '),
         model: settings.novelaiModel,
-        negative_prompt: options.negativePrompt == null ? settings.novelaiNegativePrompt : options.negativePrompt,
+        negative_prompt: (options.negativePrompt == null
+            ? String(settings.negativeGalleryItems?.find(item => item.id === settings.activeNegativeId)?.prompt || '').trim()
+            : String(options.negativePrompt || '').trim()) || String(settings.novelaiNegativePrompt || '').trim(),
         width,
         height,
         steps: Number(settings.novelaiSteps),
@@ -1779,6 +2024,11 @@ async function generateImageOpenAI(prompt, style, refData, options = {}) {
         n: 1,
         response_format: 'b64_json'
     };
+
+    const galleryNegative = options.negativePrompt == null
+        ? String(settings.negativeGalleryItems?.find(item => item.id === settings.activeNegativeId)?.prompt || '').trim()
+        : String(options.negativePrompt || '').trim();
+    if (galleryNegative) body.negative_prompt = galleryNegative;
 
     if (size && size !== 'auto') body.size = size;
 
@@ -1916,6 +2166,10 @@ async function generateImageOpenAIChat(prompt, style, refData, options = {}) {
         if (ref.type === 'hairstyle') promptParts.push(`[HAIRSTYLE REFERENCE for ${ref.name}: copy only the hair, not the face]`);
     }
     promptParts.push(`[SCENE TO GENERATE]\n${prompt}`);
+    const galleryNegative = options.negativePrompt == null
+        ? String(settings.negativeGalleryItems?.find(item => item.id === settings.activeNegativeId)?.prompt || '').trim()
+        : String(options.negativePrompt || '').trim();
+    if (galleryNegative) promptParts.push(`[NEGATIVE PROMPT: ${galleryNegative}]`);
     const fullPrompt = promptParts.join('\n\n');
 
     const content = [{ type: 'text', text: fullPrompt }];
@@ -2062,6 +2316,8 @@ async function generateImageGemini(prompt, style, refData, options = {}) {
     if (style) {
         fullPrompt += `[Art Style: ${style}]\n\n`;
     }
+    const galleryNegative = getEffectiveNegativePrompt(options.negativePrompt);
+    if (galleryNegative) fullPrompt += `[NEGATIVE PROMPT: ${galleryNegative}]\n\n`;
 
     // Main scene prompt
     fullPrompt += `[SCENE TO GENERATE]\n${prompt}\n[END SCENE]`;
@@ -2500,6 +2756,8 @@ function observeImageRegenButtons() {
         clearTimeout(timer);
         timer = setTimeout(() => {
             for (const message of pending) {
+                  const messageId = Number(message.getAttribute('mesid'));
+                  if (Number.isInteger(messageId) && typeof ensurePromptPanelForMessage === 'function') ensurePromptPanelForMessage(message, messageId);
                 restoreImageRegenButtons(message, Number(message.getAttribute('mesid')))
                     .catch(error => iigLog('WARN', 'Cannot restore image buttons:', error.message));
             }
@@ -2689,9 +2947,10 @@ async function processMessageTags(messageId) {
     activeAbortControllers.delete(messageId);
     await context.saveChat();
 
-    if (typeof context.messageFormatting === 'function') {
-        mesTextEl.innerHTML = context.messageFormatting(message.mes, message.name, message.is_system, message.is_user, messageId);
-    }
+    // Do not rebuild .mes_text here. ExtBlocks may expose its generated
+    // content through extra.display_text and Horae mounts panels beside it.
+    // ST owns message formatting; our MutationObserver restores only image
+    // controls after another extension rerenders the message.
     await restoreImageRegenButtons(messageElement, messageId);
 }
 
@@ -2895,12 +3154,118 @@ function addButtonsToExistingMessages() {
     }
 }
 
+function ensurePromptPanelForMessage(messageElement, messageId) {
+    if (!messageElement || messageId == null) return null;
+    const context = SillyTavern.getContext();
+    const message = context.chat?.[messageId];
+    if (!message || message.is_user) return null;
+    let panel = messageElement.querySelector('.iig-prompt-panel');
+    const isNew = !panel;
+    if (!panel) {
+        panel = document.createElement('div');
+        panel.className = 'iig-prompt-panel';
+        const text = messageElement.querySelector('.mes_text');
+        // Keep the panel outside mes_text so formatting by ST, ExtBlocks, or
+        // Horae cannot erase or duplicate it while rebuilding message HTML.
+        (text?.parentElement || messageElement).appendChild(panel);
+    }
+    if (isNew) renderPromptPanel(panel, messageId);
+    return panel;
+}
+
+function renderPromptPanel(panel, messageId) {
+    const context = SillyTavern.getContext();
+    const message = context.chat?.[messageId];
+    if (!panel || !message) return;
+    const state = message.extra?.iig_prompt_block || {};
+    const instruction = getPromptInstructions().find(item => item.id === state.instructionId) || getActivePromptInstruction();
+    panel.innerHTML = `<div class="iig-prompt-panel-head"><strong><i class="fa-solid fa-wand-magic-sparkles"></i> Image prompt</strong><span class="iig-prompt-status"></span></div>
+        <div class="iig-prompt-panel-controls"><span class="iig-prompt-selection">${escapeHtml(instruction.name)}</span><button type="button" class="menu_button iig-prompt-generate"><i class="fa-solid fa-wand-magic-sparkles"></i> Промпт</button><button type="button" class="menu_button iig-image-from-prompt"><i class="fa-solid fa-image"></i> Картинка</button></div>
+        <textarea class="iig-prompt-value" rows="3" placeholder="Здесь появится prompt картинки..."></textarea>
+        <div class="iig-prompt-meta"><span>Стиль: ${escapeHtml(state.style || buildEffectiveStyle('') || 'не выбран')}</span><span>Негатив: ${escapeHtml(state.negativePrompt || getActiveNegativePrompt() || 'не выбран')}</span></div>`;
+    const textarea = panel.querySelector('.iig-prompt-value');
+    textarea.value = state.prompt || '';
+    textarea.addEventListener('change', async () => {
+        if (!message.extra || typeof message.extra !== 'object') message.extra = {};
+        message.extra.iig_prompt_block = {
+            ...(message.extra.iig_prompt_block || {}),
+            prompt: textarea.value.trim(),
+            style: buildEffectiveStyle(''),
+            negativePrompt: getActiveNegativePrompt(),
+            updatedAt: Date.now(),
+        };
+        await context.saveChat();
+    });
+    panel.querySelector('.iig-prompt-generate')?.addEventListener('click', async event => {
+        const button = event.currentTarget;
+        if (activePromptAbortControllers.has(messageId)) return;
+        const controller = new AbortController();
+        activePromptAbortControllers.set(messageId, controller);
+        button.classList.add('disabled');
+        const status = panel.querySelector('.iig-prompt-status');
+        if (status) status.textContent = 'Создание prompt...';
+        try {
+            const result = await generateImagePromptForMessage(messageId, controller.signal);
+            renderPromptPanel(panel, messageId);
+            toastr.success('Промпт картинки создан');
+        } catch (error) {
+            if (status) status.textContent = error.message;
+            toastr.error(`Промпт: ${error.message}`);
+        } finally {
+            activePromptAbortControllers.delete(messageId);
+            button.classList.remove('disabled');
+        }
+    });
+    panel.querySelector('.iig-image-from-prompt')?.addEventListener('click', async event => {
+        const button = event.currentTarget;
+        if (activeAbortControllers.has(messageId)) return;
+        const controller = new AbortController();
+        activeAbortControllers.set(messageId, controller);
+        button.classList.add('disabled');
+        try {
+            const result = await generateImageFromPromptBlock(messageId, panel, controller.signal);
+            renderPromptPanel(panel, messageId);
+            if (result.imagePath) {
+                const image = document.createElement('img');
+                image.className = 'iig-prompt-result-image';
+                image.src = result.imagePath;
+                image.alt = result.prompt;
+                panel.appendChild(image);
+            }
+            toastr.success('Картинка по prompt создана');
+        } catch (error) {
+            const status = panel.querySelector('.iig-prompt-status');
+            if (status) status.textContent = error.message;
+            toastr.error(`Картинка: ${error.message}`);
+        } finally {
+            activeAbortControllers.delete(messageId);
+            button.classList.remove('disabled');
+        }
+    });
+    if (state.imagePath) {
+        const image = document.createElement('img');
+        image.className = 'iig-prompt-result-image';
+        image.src = state.imagePath;
+        image.alt = state.prompt || 'Generated image';
+        panel.appendChild(image);
+    }
+}
+
+function addPromptPanelsToExistingMessages() {
+    const context = SillyTavern.getContext();
+    for (const element of document.querySelectorAll('#chat .mes')) {
+        const id = element.getAttribute('mesid');
+        if (id !== null && context.chat?.[Number(id)] && !context.chat[Number(id)].is_user) ensurePromptPanelForMessage(element, Number(id));
+    }
+}
+
 async function onMessageReceived(messageId) {
     const settings = getSettings();
     if (!settings.enabled) return;
     const el = document.querySelector(`#chat .mes[mesid="${messageId}"]`);
     if (!el) return;
     addRegenerateButton(el, messageId);
+    ensurePromptPanelForMessage(el, messageId);
     await processMessageTags(messageId);
     await restoreImageRegenButtons(el, messageId);
 }
@@ -3853,6 +4218,97 @@ function renderStyleGallery() {
     });
 }
 
+function renderNegativeGallery() {
+    const settings = getSettings();
+    const container = document.getElementById('iig_negative_gallery_grid');
+    const activeInfo = document.getElementById('iig_negative_gallery_active_info');
+    if (!container) return;
+    const items = settings.negativeGalleryItems || [];
+    const active = items.find(item => item.id === settings.activeNegativeId);
+    if (activeInfo) activeInfo.textContent = active ? `Активен: ${active.name}` : 'Негатив не выбран';
+    if (items.length === 0) {
+        container.innerHTML = '<div class="iig-style-empty">Негативных промптов пока нет.</div>';
+        return;
+    }
+    container.innerHTML = items.map(item => {
+        ensureNegativeGalleryItemDefaults(item);
+        const selected = item.id === settings.activeNegativeId;
+        return `<div class="iig-negative-row ${selected ? 'active' : ''}" data-negative-id="${escapeHtml(item.id)}">
+            <div class="iig-negative-row-main"><strong>${escapeHtml(item.name)}</strong><span>${escapeHtml(item.prompt)}</span></div>
+            <div class="iig-negative-actions">
+                <button type="button" class="menu_button iig-negative-edit" title="Редактировать"><i class="fa-solid fa-pen"></i></button>
+                <button type="button" class="menu_button iig-negative-delete" title="Удалить"><i class="fa-solid fa-trash"></i></button>
+            </div>
+        </div>`;
+    }).join('');
+    container.querySelectorAll('.iig-negative-row').forEach(row => {
+        const id = row.dataset.negativeId;
+        row.addEventListener('click', () => {
+            settings.activeNegativeId = settings.activeNegativeId === id ? '' : id;
+            saveSettings();
+            renderNegativeGallery();
+        });
+        row.querySelector('.iig-negative-edit')?.addEventListener('click', event => {
+            event.stopPropagation();
+            const item = settings.negativeGalleryItems.find(candidate => candidate.id === id);
+            if (!item) return;
+            const name = prompt('Название негативного промпта:', item.name);
+            if (name === null) return;
+            const value = prompt('Негативный промпт:', item.prompt);
+            if (value === null) return;
+            item.name = name.trim() || item.name;
+            item.prompt = value.trim();
+            saveSettings();
+            renderNegativeGallery();
+        });
+        row.querySelector('.iig-negative-delete')?.addEventListener('click', event => {
+            event.stopPropagation();
+            if (!confirm('Удалить этот негативный промпт?')) return;
+            settings.negativeGalleryItems = settings.negativeGalleryItems.filter(item => item.id !== id);
+            if (settings.activeNegativeId === id) settings.activeNegativeId = '';
+            saveSettings();
+            renderNegativeGallery();
+        });
+    });
+}
+
+function renderPromptInstructionEditor() {
+    const settings = getSettings();
+    const select = document.getElementById('iig_prompt_instruction_select');
+    const name = document.getElementById('iig_prompt_instruction_name');
+    const kind = document.getElementById('iig_prompt_instruction_kind');
+    const promptText = document.getElementById('iig_prompt_instruction_text');
+    const remove = document.getElementById('iig_prompt_instruction_delete');
+    const restore = document.getElementById('iig_prompt_instruction_restore');
+    if (!select || !promptText) return;
+    const items = getPromptInstructions(settings);
+    select.innerHTML = items.map(item => `<option value="${escapeHtml(item.id)}">${escapeHtml(item.name)}</option>`).join('');
+    select.value = settings.activePromptInstructionId;
+    const item = items.find(candidate => candidate.id === settings.activePromptInstructionId) || items[0];
+    if (!item) return;
+    settings.activePromptInstructionId = item.id;
+    if (name) name.value = item.name;
+    if (kind) kind.value = item.kind || 'custom';
+    promptText.value = item.prompt;
+    if (remove) remove.disabled = item.builtin;
+    if (restore) restore.style.display = item.builtin ? '' : 'none';
+}
+
+function savePromptInstructionEditor() {
+    const settings = getSettings();
+    const id = document.getElementById('iig_prompt_instruction_select')?.value;
+    if (!id) return;
+    const item = updatePromptInstruction(id, {
+        name: document.getElementById('iig_prompt_instruction_name')?.value,
+        kind: document.getElementById('iig_prompt_instruction_kind')?.value,
+        prompt: document.getElementById('iig_prompt_instruction_text')?.value,
+    });
+    settings.activePromptInstructionId = id;
+    saveSettings();
+    renderPromptInstructionEditor();
+    if (item) toastr.success('Инструкция сохранена', 'Генератор image-prompt');
+}
+
 function renderAvatarDropdown(avatars = []) {
     const settings = getSettings();
     const list = document.getElementById('iig_avatar_dropdown_list');
@@ -4436,6 +4892,27 @@ function createSettingsUI() {
                         </div>
                     </div>
 
+                    <!-- ======= SECTION: Image prompt generator ======= -->
+                    <div class="iig-collapsible" data-section-id="prompt_generator">
+                        <div class="iig-collapsible-header">
+                            <i class="fa-solid fa-wand-magic-sparkles iig-collapse-icon"></i>
+                            <span>🪄 Генератор промпта картинки</span>
+                        </div>
+                        <div class="iig-collapsible-content">
+                            <p class="hint">Отдельная текстовая модель создаёт prompt из сообщения. Она не изменяет основной текст чата.</p>
+                            <div class="flex-row"><label>Endpoint</label><input type="text" id="iig_prompt_gen_endpoint" class="text_pole flex1" value="${escapeHtml(settings.promptGenEndpoint || '')}" placeholder="Пусто = основной endpoint"></div>
+                            <div class="flex-row"><label>API ключ</label><input type="password" id="iig_prompt_gen_api_key" class="text_pole flex1" value="${escapeHtml(settings.promptGenApiKey || '')}" placeholder="Пусто = основной ключ"></div>
+                            <div class="flex-row"><label>Модель</label><select id="iig_prompt_gen_model" class="flex1"><option value="">-- Выберите текстовую модель --</option>${settings.promptGenModel ? `<option value="${escapeHtml(settings.promptGenModel)}" selected>${escapeHtml(settings.promptGenModel)}</option>` : ''}</select><button type="button" class="menu_button" id="iig_refresh_prompt_gen_models"><i class="fa-solid fa-arrows-rotate"></i></button></div>
+                            <div class="flex-row"><label>Инструкция</label><select id="iig_prompt_instruction_select" class="flex1"></select></div>
+                            <div class="flex-row"><label>Название</label><input type="text" id="iig_prompt_instruction_name" class="text_pole flex1"></div>
+                            <div class="flex-row"><label>Тип</label><select id="iig_prompt_instruction_kind" class="flex1"><option value="image">Обычная картинка</option><option value="comic">Комикс</option><option value="custom">Своя</option></select></div>
+                            <textarea id="iig_prompt_instruction_text" class="text_pole" rows="7" placeholder="Инструкция для текстовой модели..."></textarea>
+                            <div class="iig-prompt-instruction-actions"><button type="button" class="menu_button" id="iig_prompt_instruction_save"><i class="fa-solid fa-floppy-disk"></i> Сохранить</button><button type="button" class="menu_button" id="iig_prompt_instruction_new"><i class="fa-solid fa-plus"></i> Создать свою</button><button type="button" class="menu_button" id="iig_prompt_instruction_restore"><i class="fa-solid fa-rotate-left"></i> Восстановить</button><button type="button" class="menu_button" id="iig_prompt_instruction_delete"><i class="fa-solid fa-trash"></i> Удалить</button></div>
+                            <div class="flex-row"><label>Max tokens</label><input type="number" id="iig_prompt_gen_max_tokens" class="text_pole" value="${escapeHtml(settings.promptGenMaxTokens)}" min="64" max="4000"></div>
+                            <div class="flex-row"><label>Temperature</label><input type="number" id="iig_prompt_gen_temperature" class="text_pole" value="${escapeHtml(settings.promptGenTemperature)}" min="0" max="2" step="0.1"></div>
+                        </div>
+                    </div>
+
                     <!-- ======= SECTION: Style ======= -->
                     <div class="iig-collapsible" data-section-id="style">
                         <div class="iig-collapsible-header">
@@ -4457,6 +4934,12 @@ function createSettingsUI() {
                                 <div class="menu_button" id="iig_style_clear_active"><i class="fa-solid fa-ban"></i> Снять все</div>
                             </div>
                             <div id="iig_style_gallery_grid" class="iig-style-gallery-grid"></div>
+                            <hr>
+                            <h4>🚫 Галерея негативов</h4>
+                            <div style="display:flex;align-items:center;gap:6px;margin:8px 0;"><input type="text" id="iig_negative_name" class="text_pole" placeholder="Название" style="flex:1"><button type="button" class="menu_button" id="iig_negative_add"><i class="fa-solid fa-plus"></i> Добавить</button></div>
+                            <textarea id="iig_negative_prompt" class="text_pole" rows="3" placeholder="blurry, low quality, bad anatomy..."></textarea>
+                            <div style="display:flex;align-items:center;justify-content:space-between;margin:6px 0;gap:8px;"><span id="iig_negative_gallery_active_info" class="hint">Негатив не выбран</span><button type="button" class="menu_button" id="iig_negative_clear_active"><i class="fa-solid fa-ban"></i> Снять</button></div>
+                            <div id="iig_negative_gallery_grid" class="iig-negative-gallery-grid"></div>
                         </div>
                     </div>
 
@@ -4893,6 +5376,48 @@ function bindSettingsEvents() {
 
     document.getElementById('iig_default_style')?.addEventListener('input', (e) => { settings.defaultStyle = e.target.value; saveSettings(); });
 
+    document.getElementById('iig_prompt_gen_endpoint')?.addEventListener('input', e => { settings.promptGenEndpoint = e.target.value; saveSettings(); });
+    document.getElementById('iig_prompt_gen_api_key')?.addEventListener('input', e => { settings.promptGenApiKey = e.target.value; saveSettings(); });
+    document.getElementById('iig_prompt_gen_model')?.addEventListener('change', e => { settings.promptGenModel = e.target.value; saveSettings(); });
+    document.getElementById('iig_prompt_gen_max_tokens')?.addEventListener('change', e => { settings.promptGenMaxTokens = Math.max(64, Math.min(4000, Number(e.target.value) || 700)); saveSettings(); });
+    document.getElementById('iig_prompt_gen_temperature')?.addEventListener('change', e => { settings.promptGenTemperature = Math.max(0, Math.min(2, Number(e.target.value) || 0.7)); saveSettings(); });
+    document.getElementById('iig_prompt_instruction_select')?.addEventListener('change', e => { settings.activePromptInstructionId = e.target.value; saveSettings(); renderPromptInstructionEditor(); });
+    document.getElementById('iig_prompt_instruction_save')?.addEventListener('click', savePromptInstructionEditor);
+    document.getElementById('iig_prompt_instruction_new')?.addEventListener('click', () => {
+        const item = addPromptInstruction('Моя инструкция', 'Create an image-generation prompt from the scene. Return only the final prompt in English.', 'custom');
+        settings.activePromptInstructionId = item.id;
+        renderPromptInstructionEditor();
+    });
+    document.getElementById('iig_prompt_instruction_restore')?.addEventListener('click', () => {
+        const id = document.getElementById('iig_prompt_instruction_select')?.value;
+        if (!id) return;
+        restorePromptInstruction(id);
+        renderPromptInstructionEditor();
+    });
+    document.getElementById('iig_prompt_instruction_delete')?.addEventListener('click', () => {
+        const id = document.getElementById('iig_prompt_instruction_select')?.value;
+        const item = getPromptInstructions().find(candidate => candidate.id === id);
+        if (!id || item?.builtin || !confirm('Удалить эту инструкцию?')) return;
+        removePromptInstruction(id);
+        renderPromptInstructionEditor();
+    });
+    document.getElementById('iig_refresh_prompt_gen_models')?.addEventListener('click', async event => {
+        const button = event.currentTarget;
+        button.classList.add('loading');
+        try {
+            const models = await fetchPromptGenerationModels();
+            const select = document.getElementById('iig_prompt_gen_model');
+            select.innerHTML = '<option value="">-- Выберите текстовую модель --</option>';
+            models.forEach(model => {
+                const option = document.createElement('option');
+                option.value = model; option.textContent = model; option.selected = model === settings.promptGenModel;
+                select.appendChild(option);
+            });
+            toastr.success(`Найдено текстовых моделей: ${models.length}`);
+        } catch (error) { toastr.error(`Ошибка загрузки моделей: ${error.message}`); }
+        finally { button.classList.remove('loading'); }
+    });
+
     document.getElementById('iig_style_add')?.addEventListener('click', () => {
         const nameInput = document.getElementById('iig_style_name');
         const promptInput = document.getElementById('iig_style_prompt');
@@ -4911,6 +5436,16 @@ function bindSettingsEvents() {
         saveSettings();
         renderStyleGallery();
     });
+
+    document.getElementById('iig_negative_add')?.addEventListener('click', () => {
+        const promptText = document.getElementById('iig_negative_prompt')?.value?.trim();
+        if (!promptText) { toastr.warning('Введите негативный prompt'); return; }
+        addNegativeGalleryItem(document.getElementById('iig_negative_name')?.value, promptText);
+        document.getElementById('iig_negative_name').value = '';
+        document.getElementById('iig_negative_prompt').value = '';
+        renderNegativeGallery();
+    });
+    document.getElementById('iig_negative_clear_active')?.addEventListener('click', () => { settings.activeNegativeId = ''; saveSettings(); renderNegativeGallery(); });
 
     document.getElementById('iig_auto_detect_names')?.addEventListener('change', (e) => { settings.autoDetectNames = e.target.checked; saveSettings(); });
 
@@ -5152,6 +5687,8 @@ function bindSettingsEvents() {
     renderHairstyleGrid('char');
     renderHairstyleGrid('user');
     renderStyleGallery();
+    renderNegativeGallery();
+    renderPromptInstructionEditor();
     renderCharacterLibraryV2();
 }
 
@@ -5167,6 +5704,7 @@ function bindSettingsEvents() {
         createSettingsUI();
         observeImageRegenButtons();
         addButtonsToExistingMessages();
+        addPromptPanelsToExistingMessages();
         updateWardrobeInjection();
         console.log('[IIG] Inline Image Generation v3.0 loaded');
     });
@@ -5175,6 +5713,7 @@ function bindSettingsEvents() {
         setTimeout(() => {
             observeImageRegenButtons();
             addButtonsToExistingMessages();
+            addPromptPanelsToExistingMessages();
             updateWardrobeInjection();
         }, 100);
         setTimeout(updateCharAvatarPreview, 200);

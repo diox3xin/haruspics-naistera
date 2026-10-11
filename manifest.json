@@ -1,12 +1,12 @@
 {
-    "display_name": "harupics",
+    "display_name": "Haruspics Fusion",
     "loading_order": 100,
     "requires": [],
     "optional": [],
     "js": "index.js",
     "css": "style.css",
-    "author": "harubunny",
-    "version": "beta 1.0",
-    "homePage": "https://github.com/diox3xin/haruspics/",
-    "auto_update": true
+    "author": "diox3xin / harubunny",
+    "version": "0.1.0-fusion",
+    "homePage": "https://github.com/diox3xin/haruspics-naistera",
+    "auto_update": false
 }

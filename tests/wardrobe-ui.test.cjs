@@ -16,7 +16,8 @@ function collector(config = {}, outfit = {}, hair = null, refs = []) {
     const context = vm.createContext({
         getSettings: () => ({ apiType: 'naistera', npcReferences: [], ...config }),
         SillyTavern: { getContext: () => ({ characters: [{ name: 'Hero' }], characterId: 0, name1: 'User' }) },
-        collectCharacterLibraryReferences: async kind => ({ descriptions: [], refs: kind === 'char' ? refs : [], hasPrimary: true }),
+        collectCharacterProfileReferences: async kind => ({ descriptions: [], refs: kind === 'char' ? refs : [], hasPrimary: true }),
+        collectRpgCharacterReferences: async () => ({ descriptions: [], refs: [] }),
         getActiveWardrobeItem: () => outfit,
         getActiveHairstyleItem: kind => kind === 'char' ? hair : null,
         detectMimeType: () => 'image/png', iigLog: () => {}, MAX_IMAGE_REFS: 4,

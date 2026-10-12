@@ -14,8 +14,6 @@ const MODULE_NAME = 'inline_image_gen';
 const processingMessages = new Set();
 const activeAbortControllers = new Map();
 const activePromptAbortControllers = new Map();
-let iigLibraryPersonaFiles = [];
-let iigLibraryPersonasLoaded = false;
 
 const logBuffer = [];
 const MAX_LOG_ENTRIES = 200;
@@ -90,6 +88,18 @@ const defaultSettings = Object.freeze({
     aspectRatio: '1:1',
     imageSize: '1K',
     npcReferences: [],
+    // Character profiles v2 (replace characterReferenceLibrary), keyed per bot / per persona.
+    // Profile: { avatarSource: 'card'|'custom', customAvatarData, appearance, rpgMode, rpgCharacters: [{ id, name, avatarData, appearance }] }
+    characterProfiles: {
+        characters: {},
+        users: {},
+    },
+    // Image display mode: 'inline' (plain image tag right in the text) or 'extblocks' (images inside HTML/CSS artifacts)
+    imageDisplayMode: 'inline',
+    // Inject the mode instruction into the chat prompt (off by default: many users keep prompt.md in their preset)
+    injectImageModeInstruction: false,
+    imageModeInjectionDepth: 1,
+    // DEPRECATED: old library, migrated into characterProfiles on load
     characterReferenceLibrary: {
         characters: {},
         users: {},
@@ -101,7 +111,16 @@ const defaultSettings = Object.freeze({
     wardrobeSendMode: 'both', // 'both', 'text', 'none'
     activeWardrobeChar: null,
     activeWardrobeUser: null,
+    // Active outfit per RPG character: { [rpgCharacterId]: wardrobeItemId }
+    activeWardrobeRpg: {},
     injectWardrobeToChat: true,
+    // Hex only: values are bound to <input type="color">
+    wardrobeTheme: {
+        bgColor: '#1a1a1e',
+        textColor: '#e8e0e0',
+        accentColor: '#ffb6c1',
+        borderColor: '#3a3a40',
+    },
     wardrobeInjectionDepth: 1,
     wardrobeDescEndpoint: '',
     wardrobeDescApiKey: '',
@@ -128,6 +147,11 @@ const defaultSettings = Object.freeze({
     promptGenModel: '',
     promptGenMaxTokens: 700,
     promptGenTemperature: 0.7,
+    // ===== Reference Generator =====
+    refGenSource: 'main', // 'main' | 'custom'
+    refGenEndpoint: '',
+    refGenApiKey: '',
+    refGenModel: '',
     // ===== NEW: Collapsed sections state =====
     collapsedSections: {},
 });
@@ -255,6 +279,35 @@ function escapeHtml(value) {
 // SETTINGS
 // ============================================================
 
+const WARDROBE_THEME_DEFAULTS = Object.freeze({
+    bgColor: '#1a1a1e',
+    textColor: '#e8e0e0',
+    accentColor: '#ffb6c1',
+    borderColor: '#3a3a40',
+});
+
+// Keeps only valid #rrggbb values (expands #rgb); anything else falls back to the default.
+function normalizeWardrobeTheme(raw) {
+    const source = raw && typeof raw === 'object' ? raw : {};
+    const result = {};
+    for (const [key, fallback] of Object.entries(WARDROBE_THEME_DEFAULTS)) {
+        let value = String(source[key] || '').trim().toLowerCase();
+        const short = value.match(/^#([0-9a-f])([0-9a-f])([0-9a-f])$/);
+        if (short) value = `#${short[1]}${short[1]}${short[2]}${short[2]}${short[3]}${short[3]}`;
+        result[key] = /^#[0-9a-f]{6}$/.test(value) ? value : fallback;
+    }
+    return result;
+}
+
+function applyWardrobeTheme(theme = getSettings().wardrobeTheme) {
+    const t = normalizeWardrobeTheme(theme);
+    const root = document.documentElement;
+    root.style.setProperty('--iig-wr-bg', t.bgColor);
+    root.style.setProperty('--iig-wr-text', t.textColor);
+    root.style.setProperty('--iig-wr-accent', t.accentColor);
+    root.style.setProperty('--iig-wr-border', t.borderColor);
+}
+
 function getSettings() {
     const context = SillyTavern.getContext();
     if (!context.extensionSettings[MODULE_NAME]) {
@@ -276,10 +329,13 @@ function getSettings() {
     if (!s.characterReferenceLibrary.users || typeof s.characterReferenceLibrary.users !== 'object') {
         s.characterReferenceLibrary.users = {};
     }
-    // Migrate wardrobe items without description
+    s.wardrobeTheme = normalizeWardrobeTheme(s.wardrobeTheme);
+    // Migrate wardrobe items without description or category
     for (const item of (s.wardrobeItems || [])) {
         if (!Object.hasOwn(item, 'description')) item.description = '';
+        if (!Object.hasOwn(item, 'category')) item.category = 'full';
     }
+    if (!s.activeWardrobeRpg || typeof s.activeWardrobeRpg !== 'object' || Array.isArray(s.activeWardrobeRpg)) s.activeWardrobeRpg = {};
     if (!Array.isArray(s.styleGalleryItems)) s.styleGalleryItems = [];
     if (!Array.isArray(s.activeStyleIds)) s.activeStyleIds = [];
     for (const item of s.styleGalleryItems) {
@@ -363,6 +419,220 @@ function formatNaisteraDescription(value) {
     return String(value);
 }
 
+// ============================================================
+// CHARACTER PROFILES V2 (replaces characterReferenceLibrary)
+// ============================================================
+
+function makeCharacterProfile(raw = {}) {
+    const rpgCharacters = Array.isArray(raw.rpgCharacters) ? raw.rpgCharacters : [];
+    return {
+        avatarSource: raw.avatarSource === 'custom' ? 'custom' : 'card',
+        customAvatarData: String(raw.customAvatarData || ''),
+        appearance: String(raw.appearance || '').trim(),
+        rpgMode: Boolean(raw.rpgMode),
+        rpgCharacters: rpgCharacters.map(char => ({
+            id: String(char?.id || `rpg_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`),
+            name: String(char?.name || '').trim(),
+            avatarData: String(char?.avatarData || ''),
+            appearance: String(char?.appearance || '').trim(),
+        })).filter(char => char.name),
+    };
+}
+
+function getCharacterProfile(kind, key, settings = getSettings(), create = false) {
+    if (!settings.characterProfiles || typeof settings.characterProfiles !== 'object') {
+        settings.characterProfiles = { characters: {}, users: {} };
+    }
+    const bucket = kind === 'user' ? settings.characterProfiles.users : settings.characterProfiles.characters;
+    const normalizedKey = String(key || '').trim();
+    if (!normalizedKey) return null;
+    
+    if (!bucket[normalizedKey] && create) {
+        bucket[normalizedKey] = makeCharacterProfile();
+    }
+    if (!bucket[normalizedKey]) return null;
+    bucket[normalizedKey] = makeCharacterProfile(bucket[normalizedKey]);
+    return bucket[normalizedKey];
+}
+
+function migrateOldCharacterLibrary(settings = getSettings()) {
+    if (settings._characterProfilesMigrated) return;
+    
+    const oldLib = settings.characterReferenceLibrary;
+    if (!oldLib || typeof oldLib !== 'object') {
+        settings._characterProfilesMigrated = true;
+        return;
+    }
+    
+    if (!settings.characterProfiles) settings.characterProfiles = { characters: {}, users: {} };
+    
+    // Migrate all user entries
+    for (const [key, entry] of Object.entries(oldLib.users || {})) {
+        if (!settings.characterProfiles.users[key]) {
+            settings.characterProfiles.users[key] = {
+                avatarSource: entry?.primary?.imageData ? 'custom' : 'card',
+                customAvatarData: String(entry?.primary?.imageData || ''),
+                appearance: String(entry?.primary?.description || '').trim(),
+                rpgMode: false,
+                rpgCharacters: [],
+            };
+        }
+    }
+    
+    // Migrate all character entries
+    for (const [key, entry] of Object.entries(oldLib.characters || {})) {
+        if (!settings.characterProfiles.characters[key]) {
+            settings.characterProfiles.characters[key] = {
+                avatarSource: entry?.primary?.imageData ? 'custom' : 'card',
+                customAvatarData: String(entry?.primary?.imageData || ''),
+                appearance: String(entry?.primary?.description || '').trim(),
+                rpgMode: false,
+                rpgCharacters: [],
+            };
+        }
+    }
+    
+    settings._characterProfilesMigrated = true;
+    saveSettings();
+    iigLog('INFO', 'Migrated old character library to profiles v2');
+}
+
+
+function addRpgCharacter(name, avatarData = '', appearance = '') {
+    const settings = getSettings();
+    const context = SillyTavern.getContext();
+    const key = getCurrentCharacterLibraryKey();
+    const profile = getCharacterProfile('char', key, settings, true);
+    
+    const normalized = String(name || '').trim();
+    if (!normalized) throw new Error('Имя персонажа не может быть пустым');
+    
+    const exists = profile.rpgCharacters.some(
+        char => char.name.toLowerCase() === normalized.toLowerCase()
+    );
+    if (exists) throw new Error(`Персонаж "${normalized}" уже существует`);
+    
+    const newChar = {
+        id: `rpg_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`,
+        name: normalized,
+        avatarData: String(avatarData || ''),
+        appearance: String(appearance || '').trim(),
+    };
+    
+    profile.rpgCharacters.push(newChar);
+    saveSettings();
+    return newChar.id;
+}
+
+function removeRpgCharacter(charId) {
+    const settings = getSettings();
+    const key = getCurrentCharacterLibraryKey();
+    const profile = getCharacterProfile('char', key, settings, false);
+    if (!profile) return;
+    
+    profile.rpgCharacters = profile.rpgCharacters.filter(char => char.id !== charId);
+    // Outfits of a removed RPG character are unreachable from any tab, so drop them with it.
+    if (settings.activeWardrobeRpg) delete settings.activeWardrobeRpg[charId];
+    if (Array.isArray(settings.wardrobeItems)) {
+        settings.wardrobeItems = settings.wardrobeItems.filter(item => item.target !== `rpg:${charId}`);
+    }
+    saveSettings();
+    if (typeof updateWardrobeInjection === 'function') updateWardrobeInjection();
+}
+
+function updateRpgCharacter(charId, updates = {}) {
+    const settings = getSettings();
+    const key = getCurrentCharacterLibraryKey();
+    const profile = getCharacterProfile('char', key, settings, false);
+    if (!profile) throw new Error('Профиль не найден');
+    
+    const char = profile.rpgCharacters.find(c => c.id === charId);
+    if (!char) throw new Error('Персонаж не найден');
+    
+    if (updates.name !== undefined) char.name = String(updates.name || '').trim();
+    if (updates.avatarData !== undefined) char.avatarData = String(updates.avatarData || '');
+    if (updates.appearance !== undefined) char.appearance = String(updates.appearance || '').trim();
+    
+    saveSettings();
+}
+
+async function collectCharacterProfileReferences(kind, settings = getSettings()) {
+    migrateOldCharacterLibrary(settings);
+    
+    const entity = getCurrentLibraryEntity(kind, settings);
+    const profile = getCharacterProfile(kind, entity.key, settings, false);
+    
+    if (!profile) return { refs: [], descriptions: [], hasPrimary: false };
+    
+    const refs = [];
+    const descriptions = [];
+    
+    // Add appearance description
+    if (profile.appearance) {
+        const label = kind === 'user' ? 'USER' : `CHARACTER "${entity.title}"`;
+        descriptions.push(`[${label} APPEARANCE]: ${profile.appearance}`);
+    }
+    
+    // Add custom avatar if selected
+    if (profile.avatarSource === 'custom' && profile.customAvatarData) {
+        refs.push({
+            data: profile.customAvatarData,
+            mimeType: detectMimeType(profile.customAvatarData),
+            name: entity.title,
+            description: profile.appearance,
+            type: 'face',
+        });
+    }
+    
+    return {
+        refs,
+        descriptions,
+        hasPrimary: profile.avatarSource === 'custom' && Boolean(profile.customAvatarData),
+    };
+}
+
+async function collectRpgCharacterReferences(prompt, settings = getSettings()) {
+    migrateOldCharacterLibrary(settings);
+    
+    const context = SillyTavern.getContext();
+    const key = getCurrentCharacterLibraryKey();
+    const profile = getCharacterProfile('char', key, settings, false);
+    
+    if (!profile || !profile.rpgMode || profile.rpgCharacters.length === 0) {
+        return { refs: [], descriptions: [], outfits: [] };
+    }
+    
+    const refs = [];
+    const descriptions = [];
+    // Active wardrobe outfits of RPG characters mentioned in the prompt
+    const outfits = [];
+    
+    for (const char of profile.rpgCharacters) {
+        if (!char.name) continue;
+        if (!nameAppearsInPrompt(char.name, prompt)) continue;
+        
+        const outfitId = settings.activeWardrobeRpg?.[char.id];
+        const outfit = outfitId ? (settings.wardrobeItems || []).find(i => i.id === outfitId) : null;
+        if (outfit) outfits.push({ name: char.name, outfit });
+        
+        if (char.appearance) {
+            descriptions.push(`[RPG CHARACTER "${char.name}" APPEARANCE]: ${char.appearance}`);
+        }
+        
+        if (char.avatarData) {
+            refs.push({
+                data: char.avatarData,
+                mimeType: detectMimeType(char.avatarData),
+                name: char.name,
+                description: char.appearance,
+                type: 'face',
+            });
+        }
+    }
+    
+    return { refs, descriptions, outfits };
+}
+
 function getCharacterLibraryKey(character, index = 0) {
     const avatar = String(character?.avatar || '').trim();
     if (avatar) return `avatar:${avatar}`;
@@ -434,49 +704,6 @@ function readLibraryFileAsBase64(file) {
         reader.onerror = reject;
         reader.readAsDataURL(file);
     });
-}
-
-async function collectCharacterLibraryReferences(kind, settings = getSettings()) {
-    if (!settings.characterLibraryEnabled) return { refs: [], descriptions: [], hasPrimary: false };
-    const entity = getCurrentLibraryEntity(kind, settings);
-    const entry = getCharacterLibraryEntry(kind, entity.key, settings, false);
-    if (!entry) return { refs: [], descriptions: [], hasPrimary: false };
-
-    const refs = [];
-    const descriptions = [];
-    const addDescription = (description) => {
-        const value = String(description || '').trim();
-        if (value) descriptions.push(`[CHARACTER APPEARANCE for "${entity.title}"]: ${value}`);
-    };
-    if (entry.primary.enabled !== false) addDescription(entry.primary.description);
-    for (const item of entry.appearanceItems) {
-        if (item.enabled !== false && (item.type === 'text' || ['novelai', 'novelai-direct'].includes(settings.apiType))) addDescription(item.description);
-    }
-
-    if (entry.primary.enabled !== false && entry.primary.imageData) {
-        refs.push({
-            data: entry.primary.imageData,
-            mimeType: detectMimeType(entry.primary.imageData),
-            name: entity.title,
-            description: entry.primary.description,
-            type: 'face',
-        });
-    }
-    for (const item of entry.appearanceItems) {
-        if (item.enabled === false || item.type !== 'image' || !item.imageData) continue;
-        refs.push({
-            data: item.imageData,
-            mimeType: detectMimeType(item.imageData),
-            name: entity.title,
-            description: item.description,
-            type: 'face',
-        });
-    }
-    return {
-        refs,
-        descriptions,
-        hasPrimary: entry.primary.enabled !== false && Boolean(entry.primary.imageData),
-    };
 }
 
 // ============================================================
@@ -1010,7 +1237,16 @@ function restorePromptInstruction(itemId) {
 // WARDROBE SYSTEM
 // ============================================================
 
-function addWardrobeItem(name, imageData, target = 'char') {
+const WARDROBE_CATEGORIES = Object.freeze({
+    full: 'Полный образ',
+    top: 'Верх',
+    bottom: 'Низ',
+    shoes: 'Обувь',
+    accessories: 'Аксессуары',
+    other: 'Другое',
+});
+
+function addWardrobeItem(name, imageData, target = 'char', category = 'full') {
     const settings = getSettings();
     const item = {
         id: 'ward_' + Date.now() + '_' + Math.random().toString(36).substring(2, 8),
@@ -1018,6 +1254,7 @@ function addWardrobeItem(name, imageData, target = 'char') {
         imageData,
         description: '',
         target,
+        category: category in WARDROBE_CATEGORIES ? category : 'full',
         createdAt: Date.now()
     };
     settings.wardrobeItems.push(item);
@@ -1115,10 +1352,23 @@ async function generateHairstyleDescription(itemId) {
     return description;
 }
 
+// Wardrobe targets: 'char', 'user' or 'rpg:<rpgCharacterId>' (RPG characters of the current bot).
+function isRpgWardrobeTarget(target) {
+    return typeof target === 'string' && target.startsWith('rpg:') && target.length > 4;
+}
+
+function getActiveWardrobeId(target, settings = getSettings()) {
+    if (isRpgWardrobeTarget(target)) return settings.activeWardrobeRpg?.[target.slice(4)] || null;
+    return settings[target === 'char' ? 'activeWardrobeChar' : 'activeWardrobeUser'] || null;
+}
+
 function removeWardrobeItem(itemId) {
     const settings = getSettings();
     if (settings.activeWardrobeChar === itemId) settings.activeWardrobeChar = null;
     if (settings.activeWardrobeUser === itemId) settings.activeWardrobeUser = null;
+    for (const [rpgId, activeId] of Object.entries(settings.activeWardrobeRpg || {})) {
+        if (activeId === itemId) delete settings.activeWardrobeRpg[rpgId];
+    }
     settings.wardrobeItems = settings.wardrobeItems.filter(i => i.id !== itemId);
     saveSettings();
     updateWardrobeInjection();
@@ -1126,16 +1376,32 @@ function removeWardrobeItem(itemId) {
 
 function setActiveWardrobe(itemId, target) {
     const settings = getSettings();
-    const key = target === 'char' ? 'activeWardrobeChar' : 'activeWardrobeUser';
-    settings[key] = settings[key] === itemId ? null : itemId;
+    if (isRpgWardrobeTarget(target)) {
+        const rpgId = target.slice(4);
+        if (!settings.activeWardrobeRpg || typeof settings.activeWardrobeRpg !== 'object') settings.activeWardrobeRpg = {};
+        if (settings.activeWardrobeRpg[rpgId] === itemId || !itemId) delete settings.activeWardrobeRpg[rpgId];
+        else settings.activeWardrobeRpg[rpgId] = itemId;
+    } else {
+        const key = target === 'char' ? 'activeWardrobeChar' : 'activeWardrobeUser';
+        settings[key] = settings[key] === itemId ? null : itemId;
+    }
     saveSettings();
     updateWardrobeInjection();
 }
 
 function getActiveWardrobeItem(target) {
     const settings = getSettings();
-    const activeId = settings[target === 'char' ? 'activeWardrobeChar' : 'activeWardrobeUser'];
+    const activeId = getActiveWardrobeId(target, settings);
     return activeId ? (settings.wardrobeItems.find(i => i.id === activeId) || null) : null;
+}
+
+/** RPG characters of the current bot that can wear wardrobe items (RPG mode on, named). */
+function getCurrentRpgWardrobeTargets(settings = getSettings()) {
+    const profile = getCharacterProfile('char', getCurrentCharacterLibraryKey(), settings, false);
+    if (!profile?.rpgMode || !Array.isArray(profile.rpgCharacters)) return [];
+    return profile.rpgCharacters
+        .filter(c => c?.id && String(c.name || '').trim())
+        .map(c => ({ target: `rpg:${c.id}`, id: c.id, name: String(c.name).trim() }));
 }
 
 function updateWardrobeItemDescription(itemId, description) {
@@ -1328,6 +1594,55 @@ async function generateNpcOutfitDescription(npcIndex, outfitId) {
     iigLog('INFO', `Generated NPC outfit for "${npc.name}" / "${outfit.name}": ${description.substring(0, 100)}...`);
     return description;
 }
+const IMAGE_TAG_FORMAT = `<img data-iig-instruction='{"style":"[STYLE]","prompt":"[DESC]","aspect_ratio":"[RATIO]","image_size":"[SIZE]"}' src="[IMG:GEN]">`;
+
+const IMAGE_TAG_RULES = [
+    'Single quotes wrap the attribute, double quotes inside JSON. Never reverse this.',
+    '[DESC]: detailed English prompt (characters, action, environment, lighting, camera). ALWAYS start each character description with the character\'s name, exactly as it is spelled in the character list.',
+    '[RATIO]: one of 1:1, 2:3, 3:2, 3:4, 4:3, 4:5, 5:4, 9:16, 16:9, 21:9. [SIZE]: 1K, 2K or 4K.',
+    'src="[IMG:GEN]" marks a NEW image. Never copy paths of already generated images.',
+].join('\n- ');
+
+function normalizeImageDisplayMode(mode) {
+    return mode === 'extblocks' ? 'extblocks' : 'inline';
+}
+
+function buildImageModeInstruction(mode) {
+    if (normalizeImageDisplayMode(mode) === 'extblocks') {
+        return `[Image generation — external blocks mode]
+Embed a visual HTML/CSS artifact (no JavaScript, no markdown code blocks) into the response, thematically tied to the scene. Use a unique wrapper id, mobile-first sizing. Place 1-5 generated images inside the artifact using this exact tag:
+${IMAGE_TAG_FORMAT}
+- ${IMAGE_TAG_RULES}`;
+    }
+    return `[Image generation — inline mode]
+When a scene deserves an illustration, insert the image tag directly into the narrative text, on its own line, between paragraphs. Do NOT wrap it in HTML blocks, artifacts, tables or code blocks. Use this exact tag:
+${IMAGE_TAG_FORMAT}
+- ${IMAGE_TAG_RULES}`;
+}
+
+function updateImageModeInjection() {
+    try {
+        const context = SillyTavern.getContext();
+        const settings = getSettings();
+        if (typeof context.setExtensionPrompt !== 'function') return;
+        const key = MODULE_NAME + '_image_mode';
+        if (!settings.enabled || !settings.injectImageModeInstruction) {
+            context.setExtensionPrompt(key, '', 0, 0);
+            return;
+        }
+        const depth = Math.max(0, Math.min(100, parseInt(settings.imageModeInjectionDepth, 10) || 1));
+        context.setExtensionPrompt(key, buildImageModeInstruction(settings.imageDisplayMode), 1, depth);
+    } catch (error) {
+        iigLog('ERROR', 'Error updating image mode injection:', error);
+    }
+}
+
+function applyImageDisplayMode(mode = getSettings().imageDisplayMode) {
+    const normalized = normalizeImageDisplayMode(mode);
+    document.body?.classList.toggle('iig-mode-inline', normalized === 'inline');
+    document.body?.classList.toggle('iig-mode-extblocks', normalized === 'extblocks');
+}
+
 function updateWardrobeInjection() {
     try {
         const context = SillyTavern.getContext();
@@ -1355,6 +1670,11 @@ function updateWardrobeInjection() {
             parts.push(`[${userName} is currently wearing: ${userItem.description}]`);
         }
 
+        for (const rpg of getCurrentRpgWardrobeTargets(settings)) {
+            const rpgItem = getActiveWardrobeItem(rpg.target);
+            if (rpgItem?.description) parts.push(`[${rpg.name} is currently wearing: ${rpgItem.description}]`);
+        }
+
         const depth = settings.wardrobeInjectionDepth || 1;
         if (typeof context.setExtensionPrompt === 'function') {
             context.setExtensionPrompt(INJECTION_KEY, parts.join('\n'), 1, depth);
@@ -1362,6 +1682,147 @@ function updateWardrobeInjection() {
     } catch (error) {
         iigLog('ERROR', 'Error updating wardrobe injection:', error);
     }
+}
+
+// ============================================================
+// REFERENCE GENERATOR (body-type / outfit reference sheets)
+// ============================================================
+
+const REF_GEN_FLAG_DEFAULTS = Object.freeze({
+    ignoreTattoos: true,
+    bodyFromDescription: true,
+    noHairTransfer: false,
+    noAccessoriesTransfer: false,
+});
+
+function normalizeRefGenFlags(flags = {}) {
+    const out = {};
+    for (const key of Object.keys(REF_GEN_FLAG_DEFAULTS)) {
+        out[key] = typeof flags?.[key] === 'boolean' ? flags[key] : REF_GEN_FLAG_DEFAULTS[key];
+    }
+    return out;
+}
+
+/** Builds the final editable prompt from the generator state. Pure: no settings or DOM access. */
+function buildReferenceGenPrompt(state = {}) {
+    const flags = normalizeRefGenFlags(state.flags);
+    const name = String(state.name || '').trim() || 'the character';
+    const description = String(state.refinedDescription || state.description || '').trim();
+    const lines = [
+        `Full-body character reference sheet of ${name}: single figure, front view, neutral standing A-pose, plain light-grey background, even studio lighting, no props, no text.`,
+    ];
+    if (state.hasCharacterRef) lines.push('Keep the face and identity from the CHARACTER reference image.');
+    if (state.hasOutfitRef) lines.push('Dress the character in the outfit from the OUTFIT reference image. Copy only the clothing, not the face or body of the person wearing it.');
+    if (description) lines.push(`Appearance and body: ${description}`);
+    if (flags.bodyFromDescription) lines.push('Body type, height and proportions MUST follow the text description, not the reference images.');
+    if (flags.ignoreTattoos) lines.push('Do NOT transfer tattoos, piercings, scars or body markings from any reference image.');
+    if (flags.noHairTransfer) lines.push('Do NOT copy the hairstyle or hair color from the outfit reference.');
+    if (flags.noAccessoriesTransfer) lines.push('Do NOT copy jewelry, bags, hats, glasses or other accessories from the outfit reference.');
+    return lines.join('\n');
+}
+
+async function refineReferenceDescription(text, signal) {
+    const settings = getSettings();
+    const source = String(text || '').trim();
+    if (!source) throw new Error('Сначала введите описание');
+    const endpoint = settings.promptGenEndpoint || settings.endpoint;
+    const apiKey = settings.promptGenApiKey || settings.apiKey;
+    const model = settings.promptGenModel;
+    if (!endpoint || !apiKey || !model) throw new Error('Для AI-уточнения настройте модель промпта (раздел «Генерация промпта»)');
+    const response = await fetch(buildOpenAIUrl(endpoint, 'chat/completions'), {
+        method: 'POST',
+        headers: buildAuthHeaders(apiKey, { 'Content-Type': 'application/json' }),
+        body: JSON.stringify({
+            model,
+            temperature: 0.4,
+            max_tokens: 400,
+            messages: [{
+                role: 'user',
+                content: 'Rewrite the following character appearance notes into a concise English description for an image model. Focus on body type, height, proportions, skin tone, face, hair and clothing details if present. 2-5 sentences, no preamble, no markdown.\n\n' + source,
+            }],
+        }),
+        signal,
+    });
+    if (!response.ok) throw new Error(`Prompt API (${response.status}): ${(await response.text().catch(() => '')).slice(0, 300)}`);
+    const result = await response.json();
+    const refined = result.choices?.[0]?.message?.content?.trim();
+    if (!refined) throw new Error('Модель вернула пустой ответ');
+    return refined;
+}
+
+function buildRefGenImageRefs(state = {}) {
+    const refs = [];
+    const name = String(state.name || '').trim() || 'Character';
+    if (state.characterImage) refs.push({ type: 'face', name, data: state.characterImage, mimeType: detectMimeType(state.characterImage) });
+    if (state.outfitImage) refs.push({ type: 'clothing', name, outfitName: 'outfit', description: 'copy the outfit only, not the face or body', data: state.outfitImage, mimeType: detectMimeType(state.outfitImage) });
+    return refs;
+}
+
+async function imageResultToBase64(result) {
+    let value = String(result || '');
+    if (/^https?:\/\//i.test(value)) {
+        const blob = await (await fetch(value)).blob();
+        value = await new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onloadend = () => resolve(String(reader.result || ''));
+            reader.onerror = reject;
+            reader.readAsDataURL(blob);
+        });
+    }
+    const base64 = value.startsWith('data:') ? value.split(',')[1] : value;
+    if (!base64) throw new Error('Не удалось прочитать картинку из ответа');
+    return base64;
+}
+
+/** Generates the reference via the main image API or the custom one. Returns raw base64. */
+async function generateReferenceImage(state, onStatus, signal) {
+    const settings = getSettings();
+    const prompt = String(state.finalPrompt || '').trim() || buildReferenceGenPrompt(state);
+    const imageRefs = buildRefGenImageRefs(state);
+
+    if (settings.refGenSource === 'custom') {
+        if (!settings.refGenEndpoint || !settings.refGenApiKey || !settings.refGenModel) {
+            throw new Error('Заполните endpoint, ключ и модель генератора референсов');
+        }
+        onStatus?.('Генерация (свой API)...');
+        const content = [{ type: 'text', text: prompt }];
+        for (const ref of imageRefs) content.push({ type: 'image_url', image_url: { url: `data:${ref.mimeType};base64,${ref.data}` } });
+        const response = await fetch(buildOpenAIUrl(settings.refGenEndpoint, 'chat/completions'), {
+            method: 'POST',
+            headers: buildAuthHeaders(settings.refGenApiKey, { 'Content-Type': 'application/json' }),
+            body: JSON.stringify({ model: settings.refGenModel, messages: [{ role: 'user', content }], modalities: ['image', 'text'] }),
+            signal,
+        });
+        if (!response.ok) throw new Error(`API (${response.status}): ${(await response.text().catch(() => '')).slice(0, 300)}`);
+        const image = parseImageFromApiResponse(await response.json());
+        if (!image) throw new Error('В ответе нет картинки');
+        return imageResultToBase64(image);
+    }
+
+    if (['novelai', 'novelai-direct'].includes(settings.apiType) && imageRefs.length) {
+        toastr.warning('NovelAI не принимает картинки-референсы: будет использован только текст', 'Генератор');
+    }
+    const refData = { imageRefs, textOnlyClothing: [], textDirectives: [], warnings: [] };
+    const result = await generateImageWithRetry(prompt, '', onStatus, { refData, negativePrompt: '', aspectRatio: '2:3', signal });
+    return imageResultToBase64(result);
+}
+
+/** Saves the generated reference as a wardrobe item, keeping description and prompt for later edits. */
+function saveGeneratedReference(state, resizedImage) {
+    if (!resizedImage) throw new Error('Сначала сгенерируйте картинку');
+    const target = state.target === 'user' || isRpgWardrobeTarget(state.target) ? state.target : 'char';
+    const name = String(state.itemName || '').trim() || `Референс ${String(state.name || '').trim() || ''}`.trim();
+    const item = addWardrobeItem(name, resizedImage, target, state.category || 'full');
+    item.description = String(state.refinedDescription || state.description || '').trim();
+    item.refGen = {
+        sourceDescription: String(state.description || ''),
+        refinedDescription: String(state.refinedDescription || ''),
+        finalPrompt: String(state.finalPrompt || ''),
+        flags: normalizeRefGenFlags(state.flags),
+        createdAt: Date.now(),
+    };
+    saveSettings();
+    return item;
 }
 
 // ============================================================
@@ -1443,6 +1904,163 @@ function renderPresetSelect() {
 }
 
 // ============================================================
+// FAQ / HELP HINTS
+// ============================================================
+
+const FAQ_HINTS = Object.freeze({
+    display_mode: {
+        '#iig_image_display_mode': 'Инлайн: картинка между абзацами. Внешние блоки: картинки внутри HTML-артефактов.',
+        '#iig_inject_image_mode': 'Если prompt.md уже в пресете — выключите, чтобы не дублировать инструкцию.',
+        '#iig_image_mode_depth': 'На сколько сообщений от конца чата вставлять инструкцию (0 = после последнего).',
+    },
+    api: {
+        '#iig_api_type': 'OpenAI-совместимые, Gemini (через nano-banana), Naistera, NovelAI.',
+        '#iig_endpoint': 'URL API (например, https://api.openai.com/v1 или локальный прокси).',
+        '#iig_model': 'Имя модели (dall-e-3, flux-1.1-pro и т.д.).',
+        '#iig_aspect_ratio': 'Соотношение сторон. Тег в промпте имеет приоритет.',
+        '#iig_image_size': 'Разрешение. 1K, 2K или 4K (поддержка зависит от модели).',
+    },
+    prompt_generator: {
+        '#iig_prompt_gen_endpoint': 'Endpoint модели, которая генерирует prompt картинки из сообщения.',
+        '#iig_prompt_instruction_select': 'Шаблон инструкции (обычная картинка, комикс и т.д.).',
+        '#iig_prompt_gen_max_tokens': 'Максимальная длина prompt (64–4000).',
+    },
+    style: {
+        '#iig_default_style': 'Стиль по умолчанию (например, "anime", "3d render"). Можно оставить пустым.',
+        '#iig_style_prompt': 'Текст, который добавится к prompt при выборе этого стиля.',
+    },
+    avatars: {
+        '#iig_auto_detect_names': 'Авто-поиск имён в промпте и отправка их лиц как референсов.',
+        '#iig_send_char_avatar': 'Отправлять лицо персонажа как референс во все промпты (даже если имя не упомянуто).',
+        '#iig_send_user_avatar': 'Отправлять лицо юзера как референс во все промпты.',
+    },
+    wardrobe_char: {
+        '#iig_wardrobe_char_name': 'Название outfit (пальто, летнее платье и т.д.).',
+        '#iig_wardrobe_char_file': 'Загрузить картинку outfit. Система опишет её через vision API.',
+    },
+    wardrobe_inject: {
+        '#iig_inject_wardrobe': 'Вставлять описание активной одежды в промпт чата.',
+        '#iig_wardrobe_send_mode': 'Что отправлять в генерацию картинок: фото одежды с текстом или только текст.',
+        '#iig_wardrobe_injection_depth': 'На сколько сообщений от конца чата вставлять описание одежды.',
+    },
+    wardrobe_theme: {
+        _section: 'Цвета модального окна гардероба (фон, текст, акцент, рамки). Работает через CSS-переменные.',
+    },
+    vision: {
+        '#iig_wardrobe_desc_endpoint': 'API для vision-описаний (GPT-4o, Claude 3.5 Sonnet и т.д.).',
+        '#iig_wardrobe_desc_prompt': 'Инструкция для vision модели: что описывать на картинке outfit.',
+    },
+    refgen: {
+        _section: 'Отдельный API для вкладки «Генератор» в гардеробе. Если поля пустые, используется основной API. В самой вкладке источник переключается между «основной» и «этот».',
+        '#iig_refgen_endpoint': 'URL OpenAI-совместимого API для референсов (например, https://api.example.com/v1).',
+        '#iig_refgen_api_key': 'Ключ этого API. Хранится в настройках SillyTavern, кнопка с глазом показывает его.',
+        '#iig_refgen_model': 'Модель для картинок-референсов. AI-уточнение описания идёт через модель из «Генерации промпта».',
+    },
+    wardrobe_user: {
+        _section: 'Одежда юзера. Для RPG-персонажей наряды добавляются кнопкой «+» прямо в гардеробе, на их вкладке.',
+    },
+    hairstyle_mode: {
+        _section: 'Что отправлять в генерацию для причёсок: картинку с текстом, только текст или ничего.',
+    },
+    npc: {
+        _section: 'Дополнительные персонажи (NPC). Если их имя упомянуто в промпте, система отправит их лица как референсы.',
+    },
+    character_library: {
+        _section: 'Профили персонажей и юзера. Включают лицо, описание внешности и RPG-режим с несколькими телами.',
+    },
+    errors: {
+        '#iig_max_retries': 'Сколько раз повторять запрос при ошибке сети (0 = не повторять).',
+        '#iig_retry_delay': 'Задержка между попытками (мс).',
+        '#iig_request_timeout': 'Таймаут запроса (сек). Увеличьте для медленных моделей.',
+    },
+});
+
+let activeFaqSection = null;
+
+function clearFaqHints() {
+    document.querySelectorAll('.iig-faq-hint').forEach(hint => hint.remove());
+    document.querySelectorAll('.iig-faq-highlight').forEach(el => el.classList.remove('iig-faq-highlight'));
+    document.querySelectorAll('.iig-faq-btn.iig-faq-active').forEach(btn => {
+        btn.classList.remove('iig-faq-active');
+        btn.setAttribute('aria-pressed', 'false');
+    });
+}
+
+function toggleFaqHints(sectionId, button) {
+    const section = button?.closest('.iig-collapsible');
+    const wasActive = activeFaqSection === sectionId;
+    clearFaqHints();
+    activeFaqSection = null;
+    if (wasActive || !section) return;
+
+    const hints = FAQ_HINTS[sectionId];
+    if (!hints) return;
+    activeFaqSection = sectionId;
+    button.classList.add('iig-faq-active');
+    button.setAttribute('aria-pressed', 'true');
+
+    // Hints are only visible inside an expanded section.
+    if (section.classList.contains('collapsed')) section.classList.remove('collapsed');
+
+    const content = section.querySelector('.iig-collapsible-content');
+    if (hints._section && content) {
+        const badge = document.createElement('div');
+        badge.className = 'iig-faq-hint iig-faq-section-hint';
+        badge.setAttribute('role', 'note');
+        badge.textContent = hints._section;
+        content.insertBefore(badge, content.firstChild);
+    }
+
+    for (const [selector, text] of Object.entries(hints)) {
+        if (selector === '_section') continue;
+        const target = section.querySelector(selector);
+        if (!target) continue;
+        target.classList.add('iig-faq-highlight');
+        const badge = document.createElement('div');
+        badge.className = 'iig-faq-hint';
+        badge.setAttribute('role', 'note');
+        badge.textContent = text;
+        const row = target.closest('.flex-row, .checkbox_label') || target;
+        row.insertAdjacentElement('afterend', badge);
+    }
+}
+
+function closeFaqHints() {
+    if (!activeFaqSection) return false;
+    clearFaqHints();
+    activeFaqSection = null;
+    return true;
+}
+
+let faqEscBound = false;
+
+function initFaqButtons() {
+    document.querySelectorAll('#extensions_settings .iig-collapsible-header').forEach(header => {
+        const sectionId = header.closest('.iig-collapsible')?.dataset.sectionId;
+        if (!sectionId || !FAQ_HINTS[sectionId] || header.querySelector('.iig-faq-btn')) return;
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'iig-faq-btn';
+        button.dataset.sectionId = sectionId;
+        button.title = 'Подсказки по разделу';
+        button.setAttribute('aria-label', button.title);
+        button.setAttribute('aria-pressed', 'false');
+        button.innerHTML = '<i class="fa-solid fa-circle-question" aria-hidden="true"></i>';
+        // Do not let the click (or Enter/Space) toggle the section collapse.
+        button.addEventListener('click', event => {
+            event.stopPropagation();
+            toggleFaqHints(sectionId, button);
+        });
+        header.appendChild(button);
+    });
+    if (faqEscBound) return;
+    faqEscBound = true;
+    document.addEventListener('keydown', event => {
+        if (event.key === 'Escape' && closeFaqHints()) event.stopPropagation();
+    });
+}
+
+// ============================================================
 // COLLAPSIBLE SECTIONS
 // ============================================================
 
@@ -1506,9 +2124,13 @@ async function collectReferenceImages(prompt) {
     const charName = context.characters?.[context.characterId]?.name || null;
     const userName = context.name1 || null;
 
-    const characterLibrary = await collectCharacterLibraryReferences('char', settings);
-    const userLibrary = await collectCharacterLibraryReferences('user', settings);
+    const characterLibrary = await collectCharacterProfileReferences('char', settings);
+    const userLibrary = await collectCharacterProfileReferences('user', settings);
     textDirectives.push(...characterLibrary.descriptions, ...userLibrary.descriptions);
+
+    // RPG characters (multi-character bots)
+    const rpgRefs = await collectRpgCharacterReferences(prompt, settings);
+    textDirectives.push(...rpgRefs.descriptions);
 
     // ===== STEP 1: Collect face references (HIGHEST PRIORITY) =====
 
@@ -1534,6 +2156,12 @@ async function collectReferenceImages(prompt) {
     const needUserAvatar = !['novelai', 'novelai-direct'].includes(settings.apiType) && !userLibrary.hasPrimary && ((useNaisteraRefs ? settings.naisteraSendUserAvatar : settings.sendUserAvatar) ||
         (settings.autoDetectNames && userName && nameAppearsInPrompt(userName, prompt)));
     if (userLibrary.refs.length > 0) faceRefs.push(...userLibrary.refs);
+
+    // RPG character face refs (NovelAI receives text descriptions only)
+    if (!['novelai', 'novelai-direct'].includes(settings.apiType) && rpgRefs.refs.length > 0) {
+        faceRefs.push(...rpgRefs.refs);
+        iigLog('INFO', `Face refs: ${rpgRefs.refs.length} RPG character(s) added`);
+    }
 
     if (needUserAvatar) {
         const userAvatar = await getUserAvatarBase64();
@@ -1591,22 +2219,26 @@ async function collectReferenceImages(prompt) {
     // ===== STEP 2: Collect clothing references =====
 
     const textOnlyProvider = ['novelai', 'novelai-direct'].includes(settings.apiType);
+    const wardrobeMode = settings.wardrobeSendMode || 'both';
+    const pushOutfit = (name, outfit) => {
+        if (!outfit || wardrobeMode === 'none') return;
+        if (outfit.imageData && wardrobeMode === 'both' && !textOnlyProvider) {
+            clothingRefs.push({
+                data: outfit.imageData, mimeType: detectMimeType(outfit.imageData),
+                name, outfitName: outfit.name, description: outfit.description || '', type: 'clothing'
+            });
+        } else if (outfit.description?.trim()) {
+            textOnlyClothing.push({ charName: name, outfitName: outfit.name, description: outfit.description });
+        } else {
+            warnings.push(`Одежда "${outfit.name}" для ${name} не отправлена: добавьте текстовое описание.`);
+        }
+    };
+    // RPG characters mentioned in the prompt wear their own active outfits
+    for (const { name, outfit } of (rpgRefs.outfits || [])) pushOutfit(name, outfit);
+
     for (const target of ['char', 'user']) {
         const name = target === 'char' ? (charName || 'Character') : (userName || 'User');
-        const outfit = getActiveWardrobeItem(target);
-        const wardrobeMode = settings.wardrobeSendMode || 'both';
-        if (outfit && wardrobeMode !== 'none') {
-            if (outfit.imageData && wardrobeMode === 'both' && !textOnlyProvider) {
-                clothingRefs.push({
-                    data: outfit.imageData, mimeType: detectMimeType(outfit.imageData),
-                    name, outfitName: outfit.name, description: outfit.description || '', type: 'clothing'
-                });
-            } else if (outfit.description?.trim()) {
-                textOnlyClothing.push({ charName: name, outfitName: outfit.name, description: outfit.description });
-            } else {
-                warnings.push(`Одежда "${outfit.name}" для ${name} не отправлена: добавьте текстовое описание.`);
-            }
-        }
+        pushOutfit(name, getActiveWardrobeItem(target));
 
         const hairstyle = getActiveHairstyleItem(target);
         const hairMode = settings.hairstyleSendMode || 'both';
@@ -2012,10 +2644,13 @@ async function generateImageOpenAI(prompt, style, refData, options = {}) {
 
     let size = settings.size;
     if (options.aspectRatio) {
-        if (options.aspectRatio === '16:9' || options.aspectRatio === '3:2') size = '1536x1024';
-        else if (options.aspectRatio === '9:16' || options.aspectRatio === '2:3') size = '1024x1536';
-        else if (options.aspectRatio === '1:1') size = '1024x1024';
-        else size = 'auto';
+        // Map any "W:H" ratio to the closest size supported by the Images API
+        const [w, h] = String(options.aspectRatio).split(':').map(Number);
+        if (w > 0 && h > 0) {
+            if (w > h) size = '1536x1024';
+            else if (w < h) size = '1024x1536';
+            else size = '1024x1024';
+        }
     }
 
     const body = {
@@ -2155,8 +2790,18 @@ async function generateImageOpenAIChat(prompt, style, refData, options = {}) {
     const url = buildOpenAIUrl(settings.endpoint, 'chat/completions');
     const { imageRefs = [], textOnlyClothing = [], textDirectives = [] } = refData;
 
+    // Get aspect ratio and image size from options or settings
+    let aspectRatio = options.aspectRatio || settings.aspectRatio || '1:1';
+    if (!VALID_ASPECT_RATIOS.includes(aspectRatio)) aspectRatio = '1:1';
+    let imageSize = options.imageSize || settings.imageSize || '1K';
+    if (!VALID_IMAGE_SIZES.includes(imageSize)) imageSize = '1K';
+
     const promptParts = [];
     promptParts.push('Generate an image from the following instruction. Return the generated image in the response.');
+    
+    // Add aspect ratio instruction to prevent reference image aspect from being copied
+    promptParts.push(`[IMAGE SPECIFICATIONS: aspect ratio ${aspectRatio}, do NOT copy the aspect ratio from reference images, use ${aspectRatio} for the final output]`);
+    
     if (style) promptParts.push(`[Art Style: ${style}]`);
     for (const directive of textDirectives) promptParts.push(directive);
     for (const c of textOnlyClothing) promptParts.push(`[CLOTHING: ${c.charName} is wearing: ${c.description}]`);
@@ -2186,7 +2831,15 @@ async function generateImageOpenAIChat(prompt, style, refData, options = {}) {
         modalities: ['image', 'text']
     };
 
-    iigLog('INFO', `OpenAI Chat/Router Request: model=${body.model}, refs=${imageRefs.length}, prompt=${fullPrompt.length} chars`);
+    // Add image_config for Gemini models via Router (OpenRouter, CloseRouter, rout.my)
+    if (isRouterEndpoint(settings.endpoint)) {
+        body.image_config = {
+            aspect_ratio: aspectRatio,
+            image_size: imageSize
+        };
+    }
+
+    iigLog('INFO', `OpenAI Chat/Router Request: model=${body.model}, refs=${imageRefs.length}, aspect=${aspectRatio}, size=${imageSize}, prompt=${fullPrompt.length} chars`);
 
     const response = await fetch(url, {
         method: 'POST',
@@ -3686,7 +4339,13 @@ function openReferenceImageEditor(imageData, title = 'Просмотр и обр
         });
         img.onload = () => { save.disabled = false; reset(); };
         img.onerror = () => { status.textContent = 'Не удалось открыть изображение. Выберите другой файл.'; };
-        document.body.appendChild(dialog);
+        // Mount inside the wardrobe modal when it is open, so the editor belongs to that window.
+        // Overlay click handler checks e.target === overlay, and keydown is stopped above,
+        // so interacting with the editor never closes the wardrobe.
+        const host = (typeof iigWardrobeModal !== 'undefined' && iigWardrobeModal?.isConnected)
+            ? (iigWardrobeModal.querySelector('#iig-wardrobe-modal') || iigWardrobeModal)
+            : document.body;
+        host.appendChild(dialog);
         dialog.showModal();
         img.src = `data:${detectMimeType(imageData)};base64,${imageData}`;
     });
@@ -3863,6 +4522,12 @@ function renderWardrobeDescriptionPanel(target) {
             <i class="fa-solid fa-shirt" style="margin-right:4px;"></i>
             Описание: <b>${escapeHtml(activeItem.name)}</b>
         </div>
+        <div class="flex-row" style="margin-bottom:4px;">
+            <label for="iig_ward_category_${target}" style="font-size:11px;">Категория</label>
+            <select id="iig_ward_category_${target}" class="flex1 iig-ward-category" data-wardrobe-id="${escapeHtml(activeItem.id)}">
+                ${Object.entries(WARDROBE_CATEGORIES).map(([key, label]) => `<option value="${key}" ${(activeItem.category || 'full') === key ? 'selected' : ''}>${escapeHtml(label)}</option>`).join('')}
+            </select>
+        </div>
         <textarea class="text_pole" rows="3" style="width:100%;font-size:11px;resize:vertical;"
             placeholder="Введите описание одежды вручную или сгенерируйте через AI..."
             data-wardrobe-id="${activeItem.id}">${escapeHtml(activeItem.description)}</textarea>
@@ -3881,6 +4546,15 @@ function renderWardrobeDescriptionPanel(target) {
     `;
 
     const textarea = panel.querySelector('textarea');
+
+    panel.querySelector('.iig-ward-category')?.addEventListener('change', event => {
+        const settings = getSettings();
+        const item = settings.wardrobeItems.find(i => i.id === event.target.dataset.wardrobeId);
+        if (!item) return;
+        item.category = event.target.value in WARDROBE_CATEGORIES ? event.target.value : 'full';
+        saveSettings();
+        renderQuickWardrobeList();
+    });
 
     textarea?.addEventListener('blur', () => {
         updateWardrobeItemDescription(textarea.dataset.wardrobeId, textarea.value);
@@ -4393,200 +5067,9 @@ function updateCharAvatarPreview() {
     }
 }
 
-function getCharacterLibraryEntities(settings = getSettings()) {
-    const context = SillyTavern.getContext();
-    const entities = [];
-    (context.characters || []).forEach((character, index) => {
-        const key = getCharacterLibraryKey(character, index);
-        entities.push({ key, title: character?.name || character?.avatar || `Character ${index + 1}` });
-    });
-    return entities;
-}
-
-function renderCharacterLibrary() {
-    const settings = getSettings();
-    const container = document.getElementById('iig_character_library');
-    if (!container) return;
-    const kind = settings.characterLibrarySelectedKind === 'user' ? 'user' : 'char';
-    const entities = kind === 'user'
-        ? [{ key: getCurrentUserLibraryKey(settings), title: settings.userAvatarFile || 'User' }]
-        : getCharacterLibraryEntities(settings);
-    let selectedKey = settings.characterLibrarySelectedKey;
-    if (!entities.some(entity => entity.key === selectedKey)) selectedKey = entities[0]?.key || '';
-    settings.characterLibrarySelectedKey = selectedKey;
-    const selected = entities.find(entity => entity.key === selectedKey);
-    const entry = selectedKey ? getCharacterLibraryEntry(kind, selectedKey, settings, false) : null;
-
-    const entityOptions = entities.map(entity =>
-        `<option value="${escapeHtml(entity.key)}" ${entity.key === selectedKey ? 'selected' : ''}>${escapeHtml(entity.title)}</option>`
-    ).join('');
-    const appearanceHtml = (entry?.appearanceItems || []).map(item => `
-        <div class="iig-library-item" data-library-item-id="${escapeHtml(item.id)}" style="border:1px solid rgba(255,255,255,.1);border-radius:6px;padding:6px;margin:6px 0;">
-            <label class="checkbox_label"><input type="checkbox" class="iig-library-item-enabled" ${item.enabled !== false ? 'checked' : ''}><span>Использовать</span></label>
-            <div class="flex-row">
-                <span style="font-size:11px;">${item.type === 'image' ? 'Изображение' : 'Текст'}</span>
-                <button type="button" class="menu_button iig-library-item-remove">Удалить</button>
-            </div>
-            ${item.type === 'image'
-                ? `<img src="data:image/png;base64,${item.imageData}" style="width:80px;height:80px;object-fit:cover;border-radius:5px;display:block;margin:5px 0;">`
-                : ''}
-            <textarea class="text_pole iig-library-item-description" rows="2" placeholder="Описание внешности...">${escapeHtml(item.description)}</textarea>
-        </div>
-    `).join('');
-
-    container.innerHTML = `
-        <div style="display:flex;gap:6px;margin-bottom:8px;">
-            <button type="button" class="menu_button iig-library-kind ${kind === 'char' ? 'selected' : ''}" data-library-kind="char">Персонажи</button>
-            <button type="button" class="menu_button iig-library-kind ${kind === 'user' ? 'selected' : ''}" data-library-kind="user">Юзер</button>
-        </div>
-        <div class="flex-row">
-            <label>Запись</label>
-            <select id="iig_library_entity" class="flex1">${entityOptions || '<option value="">Нет персонажей</option>'}</select>
-        </div>
-        ${selectedKey ? `
-            <div style="margin-top:8px;">
-                <label class="checkbox_label"><input type="checkbox" id="iig_library_enabled" ${settings.characterLibraryEnabled !== false ? 'checked' : ''}><span>Включить библиотеку</span></label>
-                <div class="flex-row"><strong>${escapeHtml(selected?.title || selectedKey)}</strong><button type="button" class="menu_button" id="iig_library_create">Создать/изменить запись</button></div>
-                ${entry ? `
-                    <label class="checkbox_label"><input type="checkbox" id="iig_library_primary_enabled" ${entry.primary.enabled !== false ? 'checked' : ''}><span>Использовать основной reference</span></label>
-                    ${entry.primary.imageData ? `<img src="data:image/png;base64,${entry.primary.imageData}" style="width:100px;height:100px;object-fit:cover;border-radius:6px;display:block;margin:5px 0;">` : '<p class="hint">Основной reference ещё не загружен.</p>'}
-                    <input type="file" id="iig_library_primary_file" accept="image/*" style="display:none">
-                    <button type="button" class="menu_button" id="iig_library_primary_upload">Загрузить основной reference</button>
-                    <textarea id="iig_library_primary_description" class="text_pole" rows="2" placeholder="Общее описание персонажа...">${escapeHtml(entry.primary.description)}</textarea>
-                    <div style="display:flex;gap:6px;margin-top:6px;">
-                        <button type="button" class="menu_button" id="iig_library_add_text">Добавить текстовое описание</button>
-                        <button type="button" class="menu_button" id="iig_library_add_image">Добавить image reference</button>
-                    </div>
-                    <input type="file" id="iig_library_item_file" accept="image/*" style="display:none">
-                    <div>${appearanceHtml || '<p class="hint">Дополнительных элементов нет.</p>'}</div>
-                ` : '<p class="hint">Нажмите «Создать/изменить запись», чтобы начать.</p>'}
-            </div>
-        ` : '<p class="hint">Сначала выберите персонажа в SillyTavern.</p>'}
-        <p class="hint">Активная запись автоматически используется как reference для Naistera/NovelAI.</p>
-    `;
-
-    container.querySelectorAll('.iig-library-kind').forEach(button => button.addEventListener('click', () => {
-        settings.characterLibrarySelectedKind = button.dataset.libraryKind;
-        settings.characterLibrarySelectedKey = '';
-        saveSettings();
-        renderCharacterLibrary();
-    }));
-    container.querySelector('#iig_library_entity')?.addEventListener('change', event => {
-        settings.characterLibrarySelectedKey = event.target.value;
-        saveSettings();
-        renderCharacterLibrary();
-    });
-    container.querySelector('#iig_library_enabled')?.addEventListener('change', event => { settings.characterLibraryEnabled = event.target.checked; saveSettings(); });
-    container.querySelector('#iig_library_create')?.addEventListener('click', () => {
-        getCharacterLibraryEntry(kind, selectedKey, settings, true);
-        saveSettings();
-        renderCharacterLibrary();
-    });
-    container.querySelector('#iig_library_primary_enabled')?.addEventListener('change', event => {
-        const current = getCharacterLibraryEntry(kind, selectedKey, settings, true);
-        current.primary.enabled = event.target.checked;
-        saveSettings();
-    });
-    container.querySelector('#iig_library_primary_description')?.addEventListener('input', event => {
-        const current = getCharacterLibraryEntry(kind, selectedKey, settings, true);
-        current.primary.description = event.target.value;
-        saveSettings();
-    });
-    container.querySelector('#iig_library_primary_upload')?.addEventListener('click', () => container.querySelector('#iig_library_primary_file')?.click());
-    container.querySelector('#iig_library_primary_file')?.addEventListener('change', async event => {
-        const file = event.target.files?.[0];
-        if (!file) return;
-        const current = getCharacterLibraryEntry(kind, selectedKey, settings, true);
-        current.primary.imageData = await readLibraryFileAsBase64(file);
-        saveSettings();
-        renderCharacterLibrary();
-    });
-    container.querySelector('#iig_library_add_text')?.addEventListener('click', () => {
-        const current = getCharacterLibraryEntry(kind, selectedKey, settings, true);
-        current.appearanceItems.push({ id: `appearance_${Date.now()}`, type: 'text', enabled: true, imageData: '', description: '' });
-        saveSettings();
-        renderCharacterLibrary();
-    });
-    container.querySelector('#iig_library_add_image')?.addEventListener('click', () => container.querySelector('#iig_library_item_file')?.click());
-    container.querySelector('#iig_library_item_file')?.addEventListener('change', async event => {
-        const file = event.target.files?.[0];
-        if (!file) return;
-        const current = getCharacterLibraryEntry(kind, selectedKey, settings, true);
-        current.appearanceItems.push({ id: `appearance_${Date.now()}`, type: 'image', enabled: true, imageData: await readLibraryFileAsBase64(file), description: '' });
-        saveSettings();
-        renderCharacterLibrary();
-    });
-    container.querySelectorAll('.iig-library-item').forEach(row => {
-        const item = getCharacterLibraryEntry(kind, selectedKey, settings, true).appearanceItems.find(candidate => candidate.id === row.dataset.libraryItemId);
-        if (!item) return;
-        row.querySelector('.iig-library-item-enabled')?.addEventListener('change', event => { item.enabled = event.target.checked; saveSettings(); });
-        row.querySelector('.iig-library-item-description')?.addEventListener('input', event => { item.description = event.target.value; saveSettings(); });
-        row.querySelector('.iig-library-item-remove')?.addEventListener('click', () => {
-            const current = getCharacterLibraryEntry(kind, selectedKey, settings, true);
-            current.appearanceItems = current.appearanceItems.filter(candidate => candidate.id !== item.id);
-            saveSettings();
-            renderCharacterLibrary();
-        });
-    });
-}
-
 // ============================================================
 // SETTINGS UI
 // ============================================================
-
-function getLibraryCatalogEntities(kind, settings = getSettings()) {
-    const context = SillyTavern.getContext();
-    const entities = new Map();
-    const library = kind === 'user'
-        ? settings.characterReferenceLibrary.users
-        : settings.characterReferenceLibrary.characters;
-    if (kind === 'char') {
-        (Array.isArray(context.characters) ? context.characters : []).forEach((character, index) => {
-            const key = getCharacterLibraryKey(character, index);
-            const entry = getCharacterLibraryEntry(kind, key, settings, false);
-            entities.set(key, {
-                kind, key,
-                title: entry?.displayName || character?.name || character?.avatar || `Character ${index + 1}`,
-                fallbackTitle: character?.name || character?.avatar || `Character ${index + 1}`,
-                preview: character?.avatar ? `/thumbnail?type=avatar&file=${encodeURIComponent(character.avatar)}` : '',
-                active: Number(context.characterId) === index,
-                configured: Boolean(entry),
-            });
-        });
-    } else {
-        const personaFiles = new Set(iigLibraryPersonaFiles);
-        const personas = context.powerUserSettings?.personas && typeof context.powerUserSettings.personas === 'object'
-            ? context.powerUserSettings.personas : {};
-        Object.keys(personas).forEach(file => personaFiles.add(file));
-        Object.keys(library || {}).forEach(key => personaFiles.add(key.replace(/^avatar:/, '')));
-        [...personaFiles].forEach(avatarFile => {
-            const key = `avatar:${avatarFile}`;
-            const entry = getCharacterLibraryEntry(kind, key, settings, false);
-            entities.set(key, {
-                kind, key,
-                title: entry?.displayName || personas[avatarFile] || avatarFile.replace(/\.[^.]+$/, ''),
-                fallbackTitle: personas[avatarFile] || avatarFile,
-                preview: `/thumbnail?type=persona&file=${encodeURIComponent(avatarFile)}`,
-                active: settings.userAvatarFile === avatarFile,
-                configured: Boolean(entry),
-            });
-        });
-        Object.keys(library || {}).forEach(key => {
-            if (entities.has(key)) return;
-            const avatarFile = key.replace(/^avatar:/, '');
-            const entry = getCharacterLibraryEntry(kind, key, settings, false);
-            entities.set(key, {
-                kind, key,
-                title: entry?.displayName || avatarFile || 'Persona',
-                fallbackTitle: avatarFile || 'Persona',
-                preview: avatarFile ? `/thumbnail?type=persona&file=${encodeURIComponent(avatarFile)}` : '',
-                active: settings.userAvatarFile === avatarFile,
-                configured: true,
-            });
-        });
-    }
-    return [...entities.values()].sort((a, b) => String(a.title).localeCompare(String(b.title)));
-}
 
 function libraryPreviewHtml(src, fallback = 'fa-user') {
     return src
@@ -4594,74 +5077,158 @@ function libraryPreviewHtml(src, fallback = 'fa-user') {
         : `<span><i class="fa-solid ${fallback}"></i></span>`;
 }
 
-async function renderCharacterLibraryV2() {
+function profileCardHtml(kind, entity, profile, cardPreview) {
+    const customPreview = profile.customAvatarData ? `data:${detectMimeType(profile.customAvatarData)};base64,${profile.customAvatarData}` : '';
+    const preview = profile.avatarSource === 'custom' ? customPreview : cardPreview;
+    const label = kind === 'user' ? 'Персона' : 'Бот';
+    return `
+        <div class="iig-profile-card" data-profile-kind="${kind}">
+            <div class="iig-profile-head">
+                <div class="iig-library-editor-avatar">${libraryPreviewHtml(preview, kind === 'user' ? 'fa-user' : 'fa-user-pen')}</div>
+                <div><h4>${escapeHtml(entity.title)}</h4><small>${label}</small></div>
+            </div>
+            <div class="flex-row">
+                <label>Референс</label>
+                <select class="flex1 iig-profile-source">
+                    <option value="card" ${profile.avatarSource === 'card' ? 'selected' : ''}>Обложка карточки</option>
+                    <option value="custom" ${profile.avatarSource === 'custom' ? 'selected' : ''}>Загруженный реф</option>
+                </select>
+            </div>
+            <div class="flex-row ${profile.avatarSource === 'custom' ? '' : 'hidden'}">
+                <input type="file" class="iig-profile-file" accept="image/*" hidden>
+                <button type="button" class="menu_button iig-profile-upload"><i class="fa-solid fa-upload"></i> ${profile.customAvatarData ? 'Заменить реф' : 'Загрузить реф'}</button>
+                ${profile.customAvatarData ? '<button type="button" class="menu_button iig-profile-clear"><i class="fa-solid fa-trash"></i> Убрать</button>' : ''}
+            </div>
+            <textarea class="text_pole iig-profile-appearance" rows="3" placeholder="Описание внешности: волосы, глаза, телосложение, приметы...">${escapeHtml(profile.appearance)}</textarea>
+        </div>`;
+}
+
+function rpgCharactersHtml(profile) {
+    const rows = profile.rpgCharacters.map(char => `
+        <div class="iig-rpg-row" data-rpg-id="${escapeHtml(char.id)}">
+            <div class="iig-library-editor-avatar">${libraryPreviewHtml(char.avatarData ? `data:${detectMimeType(char.avatarData)};base64,${char.avatarData}` : '', 'fa-user')}</div>
+            <div class="flex1">
+                <input type="text" class="text_pole iig-rpg-name" value="${escapeHtml(char.name)}" placeholder="Имя как в промпте">
+                <textarea class="text_pole iig-rpg-appearance" rows="2" placeholder="Описание внешности...">${escapeHtml(char.appearance)}</textarea>
+            </div>
+            <div class="iig-rpg-actions">
+                <input type="file" class="iig-rpg-file" accept="image/*" hidden>
+                <button type="button" class="menu_button iig-rpg-upload" title="Загрузить реф"><i class="fa-solid fa-image"></i></button>
+                <button type="button" class="menu_button iig-rpg-remove" title="Удалить"><i class="fa-solid fa-trash"></i></button>
+            </div>
+        </div>`).join('');
+    return `
+        <div class="iig-profile-card">
+            <label class="checkbox_label"><input type="checkbox" id="iig_rpg_mode" ${profile.rpgMode ? 'checked' : ''}><span>RPG-режим: несколько персонажей в одной карточке</span></label>
+            <p class="hint">Реф и описание персонажа отправляются, только если его имя встречается в промпте картинки (без учёта регистра, целым словом). Имя должно совпадать с тем, как модель пишет его в промпте.</p>
+            <div class="${profile.rpgMode ? '' : 'hidden'}">
+                ${rows || '<div class="iig-library-empty">Персонажей пока нет</div>'}
+                <div class="flex-row">
+                    <input type="text" id="iig_rpg_new_name" class="text_pole flex1" placeholder="Имя нового персонажа">
+                    <button type="button" class="menu_button" id="iig_rpg_add"><i class="fa-solid fa-plus"></i> Добавить</button>
+                </div>
+            </div>
+        </div>`;
+}
+
+async function readProfileImage(file) {
+    const raw = await readLibraryFileAsBase64(file);
+    return await resizeImageBase64(raw, 768);
+}
+
+function renderCharacterProfiles() {
     const settings = getSettings();
     const container = document.getElementById('iig_character_library');
     if (!container) return;
-    const kind = settings.characterLibrarySelectedKind === 'user' ? 'user' : 'char';
-    if (kind === 'user' && !iigLibraryPersonasLoaded) {
-        iigLibraryPersonaFiles = await fetchUserAvatars();
-        iigLibraryPersonasLoaded = true;
-    }
-    const entities = getLibraryCatalogEntities(kind, settings);
-    let selectedKey = settings.characterLibrarySelectedKey;
-    if (!entities.some(entity => entity.key === selectedKey)) selectedKey = entities.find(entity => entity.active)?.key || entities[0]?.key || '';
-    settings.characterLibrarySelectedKey = selectedKey;
-    const selected = entities.find(entity => entity.key === selectedKey);
-    const entry = selectedKey ? getCharacterLibraryEntry(kind, selectedKey, settings, false) : null;
-    const primaryPreview = entry?.primary?.imageData
-        ? `data:image/png;base64,${entry.primary.imageData}`
-        : selected?.preview || '';
-    const cards = entities.map(entity => `
-        <button type="button" class="iig-library-card ${entity.key === selectedKey ? 'selected' : ''} ${entity.active ? 'active' : ''}" data-library-card-key="${escapeHtml(entity.key)}">
-            <div class="iig-library-card-preview">${libraryPreviewHtml(entity.preview, kind === 'char' ? 'fa-user-pen' : 'fa-user')}</div>
-            <strong>${escapeHtml(entity.title)}</strong>
-            <small>${entity.active ? 'Активная' : entity.configured ? 'Настроена' : ''}</small>
-        </button>`).join('');
-    const items = entry?.appearanceItems || [];
-    const itemHtml = items.map(item => `
-        <div class="iig-library-detail-row ${item.enabled === false ? 'disabled' : ''}" data-library-item-id="${escapeHtml(item.id)}">
-            <label class="checkbox_label"><input type="checkbox" class="iig-library-item-enabled" ${item.enabled !== false ? 'checked' : ''}><span></span></label>
-            <div class="iig-library-detail-preview">${item.type === 'image' ? libraryPreviewHtml(`data:image/png;base64,${item.imageData}`, 'fa-image') : '<i class="fa-solid fa-align-left"></i>'}</div>
-            <textarea class="text_pole iig-library-item-description" rows="2" placeholder="Описание...">${escapeHtml(item.description)}</textarea>
-            <button type="button" class="menu_button iig-library-item-remove" title="Удалить"><i class="fa-solid fa-trash"></i></button>
-        </div>`).join('');
+    migrateOldCharacterLibrary(settings);
+
+    const context = SillyTavern.getContext();
+    const character = context.characters?.[context.characterId];
+    const charEntity = getCurrentLibraryEntity('char', settings);
+    const userEntity = getCurrentLibraryEntity('user', settings);
+    const charProfile = character ? getCharacterProfile('char', charEntity.key, settings, true) : null;
+    const userProfile = getCharacterProfile('user', userEntity.key, settings, true);
+    userEntity.title = context.name1 || userEntity.title;
+
+    const charPreview = character?.avatar ? `/thumbnail?type=avatar&file=${encodeURIComponent(character.avatar)}` : '';
+    const userPreview = settings.userAvatarFile ? `/thumbnail?type=persona&file=${encodeURIComponent(settings.userAvatarFile)}` : '';
+
     container.innerHTML = `
-        <div class="iig-library-v2-toolbar">
-            <div class="iig-library-v2-tabs">
-                <button type="button" class="menu_button ${kind === 'char' ? 'selected' : ''}" data-library-kind="char"><i class="fa-solid fa-address-card"></i> Персонажи (${kind === 'char' ? entities.length : getLibraryCatalogEntities('char', settings).length})</button>
-                <button type="button" class="menu_button ${kind === 'user' ? 'selected' : ''}" data-library-kind="user"><i class="fa-solid fa-user"></i> Персоны (${kind === 'user' ? entities.length : getLibraryCatalogEntities('user', settings).length})</button>
-            </div>
-            <input id="iig_library_search_v2" class="text_pole" type="search" placeholder="Поиск персонажа или персоны..." value="${escapeHtml(settings.characterLibrarySearch || '')}">
-        </div>
-        <div class="iig-library-v2-layout">
-            <div class="iig-library-v2-cards">${cards || '<div class="iig-library-empty">Сущности не найдены</div>'}</div>
-            <div class="iig-library-v2-editor">
-                ${selected ? `<div class="iig-library-editor-title"><div class="iig-library-editor-avatar">${libraryPreviewHtml(primaryPreview, kind === 'char' ? 'fa-user-pen' : 'fa-user')}</div><div><h3>${escapeHtml(selected.title)}</h3><small>${kind === 'char' ? 'Персонаж' : 'Персона'}</small></div><button type="button" class="menu_button" id="iig_library_create_v2">${entry ? 'Изменить запись' : 'Создать запись'}</button></div>
-                    ${entry ? `<div class="iig-library-editor-section"><h4>Основной reference</h4><div class="iig-library-primary-v2"><div class="iig-library-primary-preview">${libraryPreviewHtml(primaryPreview, 'fa-image')}</div><div class="iig-library-primary-controls"><label class="checkbox_label"><input type="checkbox" id="iig_library_primary_enabled_v2" ${entry.primary.enabled !== false ? 'checked' : ''}><span>Использовать</span></label><textarea id="iig_library_primary_description_v2" class="text_pole" rows="3" placeholder="Описание основного reference...">${escapeHtml(entry.primary.description)}</textarea><input type="file" id="iig_library_primary_file_v2" accept="image/*" hidden><button type="button" class="menu_button" id="iig_library_primary_upload_v2"><i class="fa-solid fa-upload"></i> Загрузить/заменить</button></div></div></div><div class="iig-library-editor-section"><div class="iig-library-section-head-v2"><h4>Дополнительные appearance details</h4><div><button type="button" class="menu_button" id="iig_library_add_text_v2"><i class="fa-solid fa-align-left"></i> Текст</button><button type="button" class="menu_button" id="iig_library_add_image_v2"><i class="fa-solid fa-image"></i> Фото</button><input type="file" id="iig_library_item_file_v2" accept="image/*" hidden></div></div>${itemHtml || '<div class="iig-library-empty">Дополнительных элементов нет</div>'}</div>` : '<div class="iig-library-empty">Нажми «Создать запись», чтобы добавить reference и описания.</div>'}` : '<div class="iig-library-empty">Выбери карточку слева.</div>'}
-            </div>
+        <div class="iig-profiles">
+            ${charProfile ? profileCardHtml('char', charEntity, charProfile, charPreview) : '<div class="iig-library-empty">Откройте чат с персонажем, чтобы настроить бота.</div>'}
+            ${profileCardHtml('user', userEntity, userProfile, userPreview)}
+            ${charProfile ? rpgCharactersHtml(charProfile) : ''}
         </div>`;
-    container.querySelectorAll('[data-library-kind]').forEach(button => button.addEventListener('click', () => { settings.characterLibrarySelectedKind = button.dataset.libraryKind; settings.characterLibrarySelectedKey = ''; saveSettings(); renderCharacterLibraryV2(); }));
-    container.querySelectorAll('.iig-library-card').forEach(card => card.addEventListener('click', () => {
-        settings.characterLibrarySelectedKey = card.dataset.libraryCardKey;
-        if (kind === 'user' && settings.characterLibrarySelectedKey.startsWith('avatar:')) {
-            settings.userAvatarFile = settings.characterLibrarySelectedKey.slice('avatar:'.length);
-        }
+
+    bindCharacterProfileEvents(container, { char: charProfile, user: userProfile });
+}
+
+function bindCharacterProfileEvents(container, profiles) {
+    container.querySelectorAll('.iig-profile-card[data-profile-kind]').forEach(card => {
+        const profile = profiles[card.dataset.profileKind];
+        if (!profile) return;
+        card.querySelector('.iig-profile-source')?.addEventListener('change', event => {
+            profile.avatarSource = event.target.value === 'custom' ? 'custom' : 'card';
+            saveSettings();
+            renderCharacterProfiles();
+        });
+        card.querySelector('.iig-profile-upload')?.addEventListener('click', () => card.querySelector('.iig-profile-file')?.click());
+        card.querySelector('.iig-profile-file')?.addEventListener('change', async event => {
+            const file = event.target.files?.[0];
+            if (!file) return;
+            profile.customAvatarData = await readProfileImage(file);
+            saveSettings();
+            renderCharacterProfiles();
+        });
+        card.querySelector('.iig-profile-clear')?.addEventListener('click', () => {
+            profile.customAvatarData = '';
+            saveSettings();
+            renderCharacterProfiles();
+        });
+        card.querySelector('.iig-profile-appearance')?.addEventListener('input', event => {
+            profile.appearance = event.target.value;
+            saveSettings();
+        });
+    });
+    bindRpgCharacterEvents(container, profiles.char);
+}
+
+function bindRpgCharacterEvents(container, charProfile) {
+    if (!charProfile) return;
+    container.querySelector('#iig_rpg_mode')?.addEventListener('change', event => {
+        charProfile.rpgMode = event.target.checked;
         saveSettings();
-        renderCharacterLibraryV2();
-    }));
-    container.querySelector('#iig_library_search_v2')?.addEventListener('input', event => { settings.characterLibrarySearch = event.target.value; const query = settings.characterLibrarySearch.toLowerCase(); container.querySelectorAll('.iig-library-card').forEach(card => { card.style.display = card.textContent.toLowerCase().includes(query) ? '' : 'none'; }); });
-    if (!selectedKey) return;
-    container.querySelector('#iig_library_create_v2')?.addEventListener('click', () => { getCharacterLibraryEntry(kind, selectedKey, settings, true); saveSettings(); renderCharacterLibraryV2(); });
-    if (!entry) return;
-    container.querySelector('#iig_library_primary_enabled_v2')?.addEventListener('change', event => { entry.primary.enabled = event.target.checked; saveSettings(); });
-    container.querySelector('#iig_library_primary_description_v2')?.addEventListener('input', event => { entry.primary.description = event.target.value; saveSettings(); });
-    container.querySelector('#iig_library_primary_upload_v2')?.addEventListener('click', () => container.querySelector('#iig_library_primary_file_v2')?.click());
-    container.querySelector('#iig_library_primary_file_v2')?.addEventListener('change', async event => { const file = event.target.files?.[0]; if (!file) return; entry.primary.imageData = await readLibraryFileAsBase64(file); saveSettings(); renderCharacterLibraryV2(); });
-    container.querySelector('#iig_library_add_text_v2')?.addEventListener('click', () => { entry.appearanceItems.push({ id: `appearance_${Date.now()}`, type: 'text', enabled: true, imageData: '', description: '' }); saveSettings(); renderCharacterLibraryV2(); });
-    container.querySelector('#iig_library_add_image_v2')?.addEventListener('click', () => container.querySelector('#iig_library_item_file_v2')?.click());
-    container.querySelector('#iig_library_item_file_v2')?.addEventListener('change', async event => { const file = event.target.files?.[0]; if (!file) return; entry.appearanceItems.push({ id: `appearance_${Date.now()}`, type: 'image', enabled: true, imageData: await readLibraryFileAsBase64(file), description: '' }); saveSettings(); renderCharacterLibraryV2(); });
-    container.querySelectorAll('.iig-library-detail-row').forEach(row => { const item = entry.appearanceItems.find(candidate => candidate.id === row.dataset.libraryItemId); if (!item) return; row.querySelector('.iig-library-item-enabled')?.addEventListener('change', event => { item.enabled = event.target.checked; saveSettings(); row.classList.toggle('disabled', !item.enabled); }); row.querySelector('.iig-library-item-description')?.addEventListener('input', event => { item.description = event.target.value; saveSettings(); }); row.querySelector('.iig-library-item-remove')?.addEventListener('click', () => { entry.appearanceItems = entry.appearanceItems.filter(candidate => candidate.id !== item.id); saveSettings(); renderCharacterLibraryV2(); }); });
+        renderCharacterProfiles();
+    });
+    container.querySelector('#iig_rpg_add')?.addEventListener('click', () => {
+        try {
+            addRpgCharacter(container.querySelector('#iig_rpg_new_name')?.value);
+            renderCharacterProfiles();
+        } catch (error) {
+            toastr.warning(error.message);
+        }
+    });
+    container.querySelectorAll('.iig-rpg-row').forEach(row => {
+        const id = row.dataset.rpgId;
+        row.querySelector('.iig-rpg-name')?.addEventListener('change', event => {
+            const name = event.target.value.trim();
+            if (!name) { toastr.warning('Имя не может быть пустым'); renderCharacterProfiles(); return; }
+            updateRpgCharacter(id, { name });
+        });
+        row.querySelector('.iig-rpg-appearance')?.addEventListener('input', event => updateRpgCharacter(id, { appearance: event.target.value }));
+        row.querySelector('.iig-rpg-upload')?.addEventListener('click', () => row.querySelector('.iig-rpg-file')?.click());
+        row.querySelector('.iig-rpg-file')?.addEventListener('change', async event => {
+            const file = event.target.files?.[0];
+            if (!file) return;
+            updateRpgCharacter(id, { avatarData: await readProfileImage(file) });
+            renderCharacterProfiles();
+        });
+        row.querySelector('.iig-rpg-remove')?.addEventListener('click', () => {
+            if (!confirm('Удалить персонажа?')) return;
+            removeRpgCharacter(id);
+            renderCharacterProfiles();
+        });
+    });
 }
 
 function createSettingsUI() {
@@ -4683,6 +5250,33 @@ function createSettingsUI() {
                         <input type="checkbox" id="iig_enabled" ${settings.enabled ? 'checked' : ''}>
                         <span>Включить генерацию картинок</span>
                     </label>
+
+                    <!-- ======= SECTION: Display mode ======= -->
+                    <div class="iig-collapsible" data-section-id="display_mode">
+                        <div class="iig-collapsible-header">
+                            <i class="fa-solid fa-chevron-down iig-collapse-icon"></i>
+                            <span>🖼️ Режим отображения</span>
+                        </div>
+                        <div class="iig-collapsible-content">
+                            <div class="flex-row">
+                                <label for="iig_image_display_mode">Режим</label>
+                                <select id="iig_image_display_mode" class="flex1">
+                                    <option value="inline" ${normalizeImageDisplayMode(settings.imageDisplayMode) === 'inline' ? 'selected' : ''}>Инлайн (картинка прямо в тексте)</option>
+                                    <option value="extblocks" ${normalizeImageDisplayMode(settings.imageDisplayMode) === 'extblocks' ? 'selected' : ''}>Внешние блоки (HTML-артефакты)</option>
+                                </select>
+                            </div>
+                            <p class="hint">Инлайн: модель ставит тег картинки между абзацами, без HTML-обёрток. Внешние блоки: модель встраивает картинки в HTML/CSS-артефакты (для ExtBlocks).</p>
+                            <label class="checkbox_label">
+                                <input type="checkbox" id="iig_inject_image_mode" ${settings.injectImageModeInstruction ? 'checked' : ''}>
+                                <span>Добавлять инструкцию режима в промпт</span>
+                            </label>
+                            <p class="hint">Выключите, если инструкция (prompt.md) уже есть в вашем пресете, чтобы не дублировать её.</p>
+                            <div class="flex-row">
+                                <label for="iig_image_mode_depth">Глубина вставки</label>
+                                <input type="number" id="iig_image_mode_depth" class="text_pole" value="${settings.imageModeInjectionDepth || 1}" min="0" max="100" style="width:70px;">
+                            </div>
+                        </div>
+                    </div>
 
                     <!-- ======= SECTION: API ======= -->
                     <div class="iig-collapsible" data-section-id="api">
@@ -4838,18 +5432,21 @@ function createSettingsUI() {
                                 </div>
                             </div>
 
-                            <div class="flex-row">
+                            <h5>Разрешение изображений</h5>
+                            <p class="hint">Настройки ниже применяются в зависимости от выбранного API. Значения из тегов [IMG:GEN:{json}] имеют приоритет.</p>
+
+                            <div class="flex-row ${settings.apiType === 'openai' ? '' : 'hidden'}" id="iig_openai_size_row">
                                 <label>Размер (OpenAI)</label>
                                 <select id="iig_size" class="flex1">
                                     <option value="1024x1024" ${settings.size === '1024x1024' ? 'selected' : ''}>1024×1024</option>
-                                    <option value="1536x1024" ${settings.size === '1536x1024' ? 'selected' : ''}>1536×1024</option>
-                                    <option value="1024x1536" ${settings.size === '1024x1536' ? 'selected' : ''}>1024×1536</option>
+                                    <option value="1536x1024" ${settings.size === '1536x1024' ? 'selected' : ''}>1536×1024 (широко)</option>
+                                    <option value="1024x1536" ${settings.size === '1024x1536' ? 'selected' : ''}>1024×1536 (высоко)</option>
                                     <option value="auto" ${settings.size === 'auto' ? 'selected' : ''}>auto</option>
                                 </select>
                             </div>
 
-                            <div class="flex-row">
-                                <label>Качество</label>
+                            <div class="flex-row ${settings.apiType === 'openai' ? '' : 'hidden'}" id="iig_quality_row">
+                                <label>Качество (OpenAI)</label>
                                 <select id="iig_quality" class="flex1">
                                     <option value="standard" ${settings.quality === 'standard' ? 'selected' : ''}>standard</option>
                                     <option value="hd" ${settings.quality === 'hd' ? 'selected' : ''}>hd</option>
@@ -4857,7 +5454,7 @@ function createSettingsUI() {
                                 </select>
                             </div>
 
-                            <div id="iig_gemini_section" class="${settings.apiType !== 'gemini' ? 'hidden' : ''}">
+                            <div class="${['gemini', 'openai-chat'].includes(settings.apiType) ? '' : 'hidden'}" id="iig_aspect_size_section">
                                 <div class="flex-row">
                                     <label>Aspect Ratio</label>
                                     <select id="iig_aspect_ratio" class="flex1">
@@ -4874,6 +5471,7 @@ function createSettingsUI() {
                                         ).join('')}
                                     </select>
                                 </div>
+                                <p class="hint">Для Gemini и Router (OpenRouter/CloseRouter). 1K ≈ 1024px, 2K ≈ 2048px, 4K ≈ 4096px по длинной стороне.</p>
                             </div>
 
                         </div>
@@ -5039,6 +5637,31 @@ function createSettingsUI() {
                         </div>
                     </div>
 
+                    <!-- ======= SECTION: Wardrobe Theme ======= -->
+                    <div class="iig-collapsible" data-section-id="wardrobe_theme">
+                        <div class="iig-collapsible-header">
+                            <i class="fa-solid fa-chevron-down iig-collapse-icon"></i>
+                            <span>🎨 Оформление гардероба</span>
+                        </div>
+                        <div class="iig-collapsible-content">
+                            <p class="hint">Цвета окна гардероба и кнопки в поле ввода. Изменения применяются сразу.</p>
+                            ${[
+                                ['bgColor', 'Фон'],
+                                ['textColor', 'Текст'],
+                                ['accentColor', 'Акценты и детали'],
+                                ['borderColor', 'Границы'],
+                            ].map(([key, label]) => `
+                            <div class="flex-row">
+                                <label for="iig_wardrobe_theme_${key}">${label}</label>
+                                <input type="color" id="iig_wardrobe_theme_${key}" class="iig-wardrobe-theme-input" data-theme-key="${key}" value="${escapeHtml(settings.wardrobeTheme[key])}">
+                            </div>`).join('')}
+                            <div class="flex-row">
+                                <button type="button" class="menu_button" id="iig_wardrobe_theme_reset"><i class="fa-solid fa-rotate-left"></i> Сбросить цвета</button>
+                                <button type="button" class="menu_button" id="iig_wardrobe_theme_preview"><i class="fa-solid fa-eye"></i> Открыть гардероб</button>
+                            </div>
+                        </div>
+                    </div>
+
                     <!-- ======= SECTION: Hairstyle Char ======= -->
                     <div class="iig-collapsible" data-section-id="hairstyle_char">
                         <div class="iig-collapsible-header">
@@ -5121,6 +5744,30 @@ function createSettingsUI() {
                         </div>
                     </div>
 
+                    <!-- ======= SECTION: Reference Generator API ======= -->
+                    <div class="iig-collapsible" data-section-id="refgen">
+                        <div class="iig-collapsible-header">
+                            <i class="fa-solid fa-chevron-down iig-collapse-icon"></i>
+                            <span>🧬 API для генератора референсов</span>
+                        </div>
+                        <div class="iig-collapsible-content">
+                            <p class="hint">Альтернативный API для генерации референсов тел и образов. В гардеробе можно переключаться между основным API и этим. Для AI-уточнения описаний используется модель промптов (раздел «Генерация промпта»).</p>
+                            <div class="flex-row">
+                                <label>Эндпоинт</label>
+                                <input type="text" id="iig_refgen_endpoint" class="text_pole flex1" value="${settings.refGenEndpoint || ''}" placeholder="https://api.example.com/v1">
+                            </div>
+                            <div class="flex-row">
+                                <label>API ключ</label>
+                                <input type="password" id="iig_refgen_api_key" class="text_pole flex1" value="${settings.refGenApiKey || ''}">
+                                <div class="menu_button iig-key-toggle" id="iig_refgen_key_toggle"><i class="fa-solid fa-eye"></i></div>
+                            </div>
+                            <div class="flex-row">
+                                <label>Модель</label>
+                                <input type="text" id="iig_refgen_model" class="text_pole flex1" value="${settings.refGenModel || ''}" placeholder="gpt-4o">
+                            </div>
+                        </div>
+                    </div>
+
                     <!-- ======= SECTION: NPC ======= -->
                     <div class="iig-collapsible" data-section-id="npc">
                         <div class="iig-collapsible-header">
@@ -5137,14 +5784,14 @@ function createSettingsUI() {
                         </div>
                     </div>
 
-                    <!-- ======= SECTION: Character Library ======= -->
+                    <!-- ======= SECTION: Character Profiles ======= -->
                     <div class="iig-collapsible" data-section-id="character_library">
                         <div class="iig-collapsible-header">
                             <i class="fa-solid fa-chevron-down iig-collapse-icon"></i>
-                            <span>📚 Библиотека персонажей</span>
+                            <span>👤 Профили персонажей</span>
                         </div>
                         <div class="iig-collapsible-content">
-                            <p class="hint">Хранит основной reference, дополнительные изображения и текстовые описания. Naistera получает изображения и текст; официальный NovelAI через стандартный сервер SillyTavern получает только текст.</p>
+                            <p class="hint">Выбор источника аватара (обложка карточки или загруженный реф) и описание внешности для бота и персоны. RPG-режим позволяет добавить несколько персонажей в одну карточку бота — их рефы и описания отправляются, только если имя встречается в промпте.</p>
                             <div id="iig_character_library"></div>
                         </div>
                     </div>
@@ -5183,6 +5830,7 @@ function createSettingsUI() {
 
     bindSettingsEvents();
     initCollapsibleSections();
+    initFaqButtons();
     updateCharAvatarPreview();
     renderPresetSelect();
 }
@@ -5194,13 +5842,52 @@ function bindSettingsEvents() {
         document.getElementById('iig_endpoint_row')?.classList.toggle('hidden', ['novelai', 'novelai-direct'].includes(type));
         document.getElementById('iig_api_key_row')?.classList.toggle('hidden', ['novelai', 'novelai-direct'].includes(type));
         document.getElementById('iig_standard_model_row')?.classList.toggle('hidden', ['naistera', 'novelai', 'novelai-direct'].includes(type));
-        document.getElementById('iig_gemini_section')?.classList.toggle('hidden', type !== 'gemini');
+        // Images API uses pixel size/quality; Chat/Router and Gemini use aspect ratio + image size
+        document.getElementById('iig_openai_size_row')?.classList.toggle('hidden', type !== 'openai');
+        document.getElementById('iig_quality_row')?.classList.toggle('hidden', type !== 'openai');
+        document.getElementById('iig_aspect_size_section')?.classList.toggle('hidden', !['gemini', 'openai-chat'].includes(type));
         document.getElementById('iig_naistera_section')?.classList.toggle('hidden', type !== 'naistera');
         document.getElementById('iig_novelai_section')?.classList.toggle('hidden', !['novelai', 'novelai-direct'].includes(type));
         document.getElementById('iig_novelai_token_row')?.classList.toggle('hidden', type !== 'novelai-direct');
     };
 
-    document.getElementById('iig_enabled')?.addEventListener('change', (e) => { settings.enabled = e.target.checked; saveSettings(); });
+    document.getElementById('iig_enabled')?.addEventListener('change', (e) => { settings.enabled = e.target.checked; saveSettings(); updateImageModeInjection(); });
+
+    // Image display mode
+    document.getElementById('iig_image_display_mode')?.addEventListener('change', (e) => {
+        settings.imageDisplayMode = normalizeImageDisplayMode(e.target.value);
+        saveSettings();
+        applyImageDisplayMode(settings.imageDisplayMode);
+        updateImageModeInjection();
+    });
+    document.getElementById('iig_inject_image_mode')?.addEventListener('change', (e) => {
+        settings.injectImageModeInstruction = e.target.checked;
+        saveSettings();
+        updateImageModeInjection();
+    });
+    document.getElementById('iig_image_mode_depth')?.addEventListener('input', (e) => {
+        settings.imageModeInjectionDepth = Math.max(0, Math.min(100, parseInt(e.target.value, 10) || 1));
+        saveSettings();
+        updateImageModeInjection();
+    });
+
+    // Wardrobe theme colors
+    document.querySelectorAll('.iig-wardrobe-theme-input').forEach(input => {
+        input.addEventListener('input', (e) => {
+            settings.wardrobeTheme = normalizeWardrobeTheme({ ...settings.wardrobeTheme, [e.target.dataset.themeKey]: e.target.value });
+            applyWardrobeTheme(settings.wardrobeTheme);
+            saveSettings();
+        });
+    });
+    document.getElementById('iig_wardrobe_theme_reset')?.addEventListener('click', () => {
+        settings.wardrobeTheme = { ...WARDROBE_THEME_DEFAULTS };
+        document.querySelectorAll('.iig-wardrobe-theme-input').forEach(input => {
+            input.value = settings.wardrobeTheme[input.dataset.themeKey];
+        });
+        applyWardrobeTheme(settings.wardrobeTheme);
+        saveSettings();
+    });
+    document.getElementById('iig_wardrobe_theme_preview')?.addEventListener('click', () => openWardrobeModal());
 
     document.getElementById('iig_api_type')?.addEventListener('change', (e) => {
         settings.apiType = e.target.value;
@@ -5502,6 +6189,17 @@ function bindSettingsEvents() {
         else { input.type = 'password'; icon.classList.replace('fa-eye-slash', 'fa-eye'); }
     });
 
+    // Reference generator API settings
+    document.getElementById('iig_refgen_endpoint')?.addEventListener('input', e => { settings.refGenEndpoint = e.target.value; saveSettings(); });
+    document.getElementById('iig_refgen_api_key')?.addEventListener('input', e => { settings.refGenApiKey = e.target.value; saveSettings(); });
+    document.getElementById('iig_refgen_model')?.addEventListener('input', e => { settings.refGenModel = e.target.value; saveSettings(); });
+    document.getElementById('iig_refgen_key_toggle')?.addEventListener('click', () => {
+        const input = document.getElementById('iig_refgen_api_key');
+        const icon = document.querySelector('#iig_refgen_key_toggle i');
+        if (input?.type === 'password') { input.type = 'text'; icon?.classList.replace('fa-eye', 'fa-eye-slash'); }
+        else if (input) { input.type = 'password'; icon?.classList.replace('fa-eye-slash', 'fa-eye'); }
+    });
+
     document.getElementById('iig_wardrobe_desc_model')?.addEventListener('change', (e) => { settings.wardrobeDescModel = e.target.value; saveSettings(); });
 
     document.getElementById('iig_refresh_desc_models')?.addEventListener('click', async (e) => {
@@ -5676,7 +6374,7 @@ function bindSettingsEvents() {
     renderStyleGallery();
     renderNegativeGallery();
     renderPromptInstructionEditor();
-    renderCharacterLibraryV2();
+    renderCharacterProfiles();
 }
 
 // ============================================================
@@ -5692,7 +6390,9 @@ function bindSettingsEvents() {
         observeImageRegenButtons();
         addButtonsToExistingMessages();
         addPromptPanelsToExistingMessages();
+        applyImageDisplayMode();
         updateWardrobeInjection();
+        updateImageModeInjection();
         console.log('[IIG] Inline Image Generation v3.0 loaded');
     });
 
@@ -5702,6 +6402,7 @@ function bindSettingsEvents() {
             addButtonsToExistingMessages();
             addPromptPanelsToExistingMessages();
             updateWardrobeInjection();
+            updateImageModeInjection();
         }, 100);
         setTimeout(updateCharAvatarPreview, 200);
     });
@@ -5710,7 +6411,8 @@ function bindSettingsEvents() {
         await onMessageReceived(messageId);
     });
 
-    // Floating wardrobe button
+    // Wardrobe button in the input bar + theme colors
+    applyWardrobeTheme();
     createFloatingWardrobeButton();
     
     console.log('[IIG] Inline Image Generation v3.0 initialized');
@@ -5723,25 +6425,56 @@ function bindSettingsEvents() {
 let iigFloatingBtn = null;
 let iigWardrobeModal = null;
 let iigCurrentWardrobeTab = 'char';
+let iigWardrobeFilter = { category: 'all', search: '' };
+let iigRefGenState = {
+    target: 'char',
+    name: '',
+    characterImage: null,
+    outfitImage: null,
+    description: '',
+    refinedDescription: '',
+    finalPrompt: '',
+    flags: { ...REF_GEN_FLAG_DEFAULTS },
+    resultImage: null,
+    itemName: '',
+    category: 'full',
+    busy: false,
+    status: '',
+};
 
 function createFloatingWardrobeButton() {
     // Remove existing button if any
     iigFloatingBtn?.remove();
     iigWardrobeModal?.remove();
     
-    // Create floating button
+    // Left part of the chat input bar (hamburger / extensions wand live here)
+    const leftSendForm = document.getElementById('leftSendForm');
+
     iigFloatingBtn = document.createElement('div');
-    iigFloatingBtn.id = 'iig-float-btn';
-    iigFloatingBtn.innerHTML = '<i class="fa-solid fa-shirt"></i>';
     iigFloatingBtn.title = 'Гардероб';
-    
-    // Update badge with active outfits count
-    updateFloatingButtonBadge();
-    
+    iigFloatingBtn.setAttribute('role', 'button');
+    iigFloatingBtn.setAttribute('tabindex', '0');
+    iigFloatingBtn.setAttribute('aria-label', 'Гардероб');
     iigFloatingBtn.addEventListener('click', toggleWardrobeModal);
-    document.body.appendChild(iigFloatingBtn);
-    
-    iigLog('INFO', 'Floating wardrobe button created');
+    iigFloatingBtn.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleWardrobeModal(); }
+    });
+
+    if (leftSendForm) {
+        // Same pattern as SillyTavern's own #options_button
+        iigFloatingBtn.id = 'iig-wardrobe-btn';
+        iigFloatingBtn.className = 'fa-solid fa-shirt interactable';
+        leftSendForm.appendChild(iigFloatingBtn);
+        iigLog('INFO', 'Wardrobe button added to input bar');
+    } else {
+        // Fallback for themes without #leftSendForm
+        iigFloatingBtn.id = 'iig-float-btn';
+        iigFloatingBtn.innerHTML = '<i class="fa-solid fa-shirt"></i>';
+        document.body.appendChild(iigFloatingBtn);
+        iigLog('WARN', '#leftSendForm not found, using floating wardrobe button');
+    }
+
+    updateFloatingButtonBadge();
 }
 
 function updateFloatingButtonBadge() {
@@ -5750,9 +6483,12 @@ function updateFloatingButtonBadge() {
     const settings = getSettings();
     let activeCount = 0;
     
-    // Count active outfits
+    // Count active outfits (bot, user and RPG characters of the current bot)
     if (settings.activeWardrobeChar) activeCount++;
     if (settings.activeWardrobeUser) activeCount++;
+    for (const rpg of getCurrentRpgWardrobeTargets(settings)) {
+        if (getActiveWardrobeId(rpg.target, settings)) activeCount++;
+    }
     
     // Remove existing badge
     const existingBadge = iigFloatingBtn.querySelector('.iig-bar-count');
@@ -5763,6 +6499,7 @@ function updateFloatingButtonBadge() {
         const badge = document.createElement('span');
         badge.className = 'iig-bar-count';
         badge.textContent = activeCount;
+        badge.setAttribute('aria-label', `${activeCount} активных нарядов`);
         iigFloatingBtn.appendChild(badge);
     }
     
@@ -5801,12 +6538,10 @@ function openWardrobeModal() {
             </div>
         </div>
         <div class="iig-wardrobe-tabs">
-            <div class="iig-wardrobe-tab iig-tab-active" data-tab="char">
-                <i class="fa-solid fa-user"></i> Персонаж
-            </div>
-            <div class="iig-wardrobe-tab" data-tab="user">
-                <i class="fa-solid fa-user-pen"></i> Юзер
-            </div>
+            ${buildWardrobeTabs().map(tab => `
+            <div class="iig-wardrobe-tab ${tab.id === iigCurrentWardrobeTab ? 'iig-tab-active' : ''}" data-tab="${escapeHtml(tab.id)}" role="tab" tabindex="0" aria-selected="${tab.id === iigCurrentWardrobeTab}">
+                <i class="fa-solid ${tab.icon}" aria-hidden="true"></i> ${escapeHtml(tab.label)}
+            </div>`).join('')}
         </div>
         <div class="iig-wardrobe-content" id="iig-wardrobe-content"></div>
     `;
@@ -5822,18 +6557,24 @@ function openWardrobeModal() {
     });
     
     modal.querySelectorAll('.iig-wardrobe-tab').forEach(tab => {
-        tab.addEventListener('click', () => {
+        const select = () => {
             iigCurrentWardrobeTab = tab.dataset.tab;
             modal.querySelectorAll('.iig-wardrobe-tab').forEach(t => {
-                t.classList.toggle('iig-tab-active', t.dataset.tab === iigCurrentWardrobeTab);
+                const active = t.dataset.tab === iigCurrentWardrobeTab;
+                t.classList.toggle('iig-tab-active', active);
+                t.setAttribute('aria-selected', String(active));
             });
             renderQuickWardrobeList();
+        };
+        tab.addEventListener('click', select);
+        tab.addEventListener('keydown', e => {
+            if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); select(); }
         });
     });
     
-    // Close on Escape
+    // Close on Escape (but not if a native modal dialog is currently open)
     const escHandler = (e) => {
-        if (e.key === 'Escape') {
+        if (e.key === 'Escape' && !document.querySelector('dialog[open]')) {
             closeWardrobeModal();
             document.removeEventListener('keydown', escHandler);
         }
@@ -5849,69 +6590,372 @@ function closeWardrobeModal() {
     iigWardrobeModal = null;
 }
 
+/** Tabs: bot, user, one per RPG character of the current bot, generator. Resets a stale RPG tab. */
+function buildWardrobeTabs(settings = getSettings()) {
+    const tabs = [
+        { id: 'char', label: 'Персонаж', icon: 'fa-user' },
+        { id: 'user', label: 'Юзер', icon: 'fa-user-pen' },
+        ...getCurrentRpgWardrobeTargets(settings).map(rpg => ({ id: rpg.target, label: rpg.name, icon: 'fa-dice-d20' })),
+        { id: 'gen', label: 'Генератор', icon: 'fa-wand-magic-sparkles' },
+    ];
+    if (!tabs.some(tab => tab.id === iigCurrentWardrobeTab)) iigCurrentWardrobeTab = 'char';
+    return tabs;
+}
+
 function renderQuickWardrobeList() {
     const content = document.getElementById('iig-wardrobe-content');
     if (!content) return;
     
-    const settings = getSettings();
-    const target = iigCurrentWardrobeTab;
-    const items = settings.wardrobeItems?.filter(i => i.target === target) || [];
-    const activeId = target === 'char' ? settings.activeWardrobeChar : settings.activeWardrobeUser;
-    
-    if (items.length === 0) {
-        content.innerHTML = `
-            <div class="iig-no-outfits">
-                <i class="fa-solid fa-shirt"></i>
-                <p>Нет нарядов в гардеробе</p>
-                <small>Добавьте одежду в настройках расширения</small>
-            </div>
-        `;
+    if (iigCurrentWardrobeTab === 'gen') {
+        renderReferenceGenerator(content);
         return;
     }
-    
-    const html = `
-        <div class="iig-quick-outfit-list">
-            ${items.map(item => `
-                <div class="iig-quick-outfit-item ${item.id === activeId ? 'iig-outfit-active' : ''}" data-id="${item.id}">
-                    ${item.imageData 
-                        ? `<img class="iig-quick-outfit-thumb" src="data:${detectMimeType(item.imageData)};base64,${item.imageData}" alt="${escapeHtml(item.name)}" title="Открыть изображение / обрезать" role="button" tabindex="0">`
-                        : `<div class="iig-quick-outfit-thumb" style="display:flex;align-items:center;justify-content:center;">
-                            <i class="fa-solid fa-shirt" style="color:#5a5252;"></i>
-                           </div>`
-                    }
-                    <div class="iig-quick-outfit-info">
-                        <div class="iig-quick-outfit-name">${escapeHtml(item.name)}</div>
-                        <div class="iig-quick-outfit-desc">${escapeHtml(item.description || 'Без описания')}</div>
-                    </div>
-                    ${item.id === activeId ? '<div class="iig-quick-outfit-badge"><i class="fa-solid fa-check"></i></div>' : ''}
+
+    const settings = getSettings();
+    const target = iigCurrentWardrobeTab;
+    const allItems = settings.wardrobeItems?.filter(i => i.target === target) || [];
+    const activeId = getActiveWardrobeId(target, settings);
+    const activeItem = allItems.find(i => i.id === activeId) || null;
+    const items = filterWardrobeItems(allItems, iigWardrobeFilter);
+    const imgSrc = item => `data:${detectMimeType(item.imageData)};base64,${item.imageData}`;
+
+    const toolbar = `
+        <div class="iig-wardrobe-toolbar">
+            <input type="search" class="text_pole iig-wardrobe-search" placeholder="Поиск по названию и описанию" aria-label="Поиск одежды" value="${escapeHtml(iigWardrobeFilter.search)}">
+            <details class="iig-wardrobe-filter">
+                <summary title="Категория"><i class="fa-solid fa-filter" aria-hidden="true"></i><span>${escapeHtml(iigWardrobeFilter.category === 'all' ? 'Все' : (WARDROBE_CATEGORIES[iigWardrobeFilter.category] || 'Все'))}</span></summary>
+                <div class="iig-wardrobe-filter-menu" role="radiogroup" aria-label="Категория">
+                    ${[['all', 'Все категории'], ...Object.entries(WARDROBE_CATEGORIES)].map(([key, label]) => `
+                        <label><input type="radio" name="iig_wardrobe_cat" value="${key}" ${iigWardrobeFilter.category === key ? 'checked' : ''}> ${escapeHtml(label)}</label>`).join('')}
                 </div>
-            `).join('')}
+            </details>
+            <button type="button" class="menu_button iig-wardrobe-add" title="Добавить одежду" aria-label="Добавить одежду"><i class="fa-solid fa-plus" aria-hidden="true"></i></button>
+            <input type="file" class="iig-wardrobe-add-file" accept="image/*" hidden>
+        </div>`;
+
+    const body = items.length === 0
+        ? `<div class="iig-no-outfits">
+                <i class="fa-solid fa-shirt" aria-hidden="true"></i>
+                <p>${allItems.length === 0 ? 'Нет нарядов в гардеробе' : 'Ничего не найдено'}</p>
+                ${allItems.length === 0 ? '<small>Нажмите «+», чтобы добавить картинку одежды</small>' : ''}
+           </div>`
+        : `<div class="iig-wardrobe-grid">${items.map(item => `
+            <div class="iig-wardrobe-card ${item.id === activeId ? 'iig-card-active' : ''}" data-id="${escapeHtml(item.id)}" role="button" tabindex="0" aria-pressed="${item.id === activeId}" title="${item.id === activeId ? 'Снять' : 'Надеть'}">
+                ${item.imageData
+                    ? `<img class="iig-wardrobe-card-img" src="${imgSrc(item)}" alt="${escapeHtml(item.name)}" title="Открыть / обрезать" tabindex="0">`
+                    : '<div class="iig-wardrobe-card-img iig-card-placeholder"><i class="fa-solid fa-shirt" aria-hidden="true"></i></div>'}
+                <div class="iig-wardrobe-card-body">
+                    <div class="iig-wardrobe-card-title">${escapeHtml(item.name)}</div>
+                    <div class="iig-wardrobe-card-category">${escapeHtml(WARDROBE_CATEGORIES[item.category] || WARDROBE_CATEGORIES.full)}</div>
+                </div>
+                ${item.id === activeId ? '<div class="iig-card-check" aria-hidden="true"><i class="fa-solid fa-check"></i></div>' : ''}
+                <button type="button" class="iig-card-delete" title="Удалить" aria-label="Удалить ${escapeHtml(item.name)}"><i class="fa-solid fa-trash" aria-hidden="true"></i></button>
+            </div>`).join('')}
+           </div>`;
+
+    const footer = `
+        <div class="iig-wardrobe-footer">
+            <span class="iig-footer-label">Сейчас надето:</span>
+            ${activeItem
+                ? `${activeItem.imageData ? `<img src="${imgSrc(activeItem)}" alt="">` : ''}
+                   <span class="iig-footer-name">${escapeHtml(activeItem.name)}</span>
+                   <button type="button" class="menu_button iig-footer-clear" title="Снять" aria-label="Снять одежду"><i class="fa-solid fa-xmark"></i></button>`
+                : '<span class="iig-footer-name iig-footer-empty">ничего</span>'}
         </div>
-    `;
-    
-    content.innerHTML = html;
-    
-    // Add click handlers
-    content.querySelectorAll('.iig-quick-outfit-item').forEach(itemEl => {
-        const thumb = itemEl.querySelector('img');
-        thumb?.addEventListener('click', event => {
-            event.stopPropagation();
-            const item = settings.wardrobeItems.find(entry => entry.id === itemEl.dataset.id);
-            if (item) editSavedReferenceImage(item, () => renderWardrobeGrid(target));
-        });
-        thumb?.addEventListener('keydown', event => {
-            if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); thumb.click(); }
-        });
-        itemEl.addEventListener('click', () => {
-            const itemId = itemEl.dataset.id;
-            setActiveWardrobe(itemId, target);
-            updateFloatingButtonBadge();
+        ${activeItem ? `
+        <div class="iig-wardrobe-description">
+            <label for="iig_wardrobe_desc_${escapeHtml(activeItem.id)}"><i class="fa-solid fa-align-left"></i> Описание для промпта:</label>
+            <textarea id="iig_wardrobe_desc_${escapeHtml(activeItem.id)}" class="text_pole" rows="3" placeholder="Описание одежды, которое будет передано в промпт">${escapeHtml(activeItem.description || '')}</textarea>
+        </div>` : ''}`;
+
+    content.innerHTML = toolbar + body + footer;
+    bindWardrobeToolbar(content);
+    bindWardrobeCards(content, target, activeItem);
+    bindWardrobeAdd(content, target);
+}
+
+/** "+" in the wardrobe: upload an outfit image for the current target (bot, user or RPG character). */
+function bindWardrobeAdd(container, target) {
+    const button = container.querySelector('.iig-wardrobe-add');
+    const input = container.querySelector('.iig-wardrobe-add-file');
+    button?.addEventListener('click', () => input?.click());
+    input?.addEventListener('change', async () => {
+        const file = input.files?.[0];
+        if (!file) return;
+        try {
+            const resized = await resizeImageBase64(await readLibraryFileAsBase64(file), 512);
+            const name = file.name.replace(/\.[^.]+$/, '').trim() || 'Outfit';
+            const category = iigWardrobeFilter.category in WARDROBE_CATEGORIES ? iigWardrobeFilter.category : 'full';
+            const item = addWardrobeItem(name, resized, target, category);
+            toastr.success(`Добавлено: ${item.name}. Описание можно задать в настройках или через генератор.`, 'Гардероб');
             renderQuickWardrobeList();
-            
-            const item = settings.wardrobeItems.find(i => i.id === itemId);
-            if (item) {
-                toastr.success(`Надет: ${item.name}`, 'Гардероб');
-            }
+        } catch (error) {
+            toastr.error(`Не удалось добавить: ${error.message}`, 'Гардероб');
+        } finally {
+            input.value = '';
+        }
+    });
+}
+
+function filterWardrobeItems(items, filter) {
+    const category = filter?.category || 'all';
+    const needle = String(filter?.search || '').trim().toLowerCase();
+    return items.filter(item => {
+        if (category !== 'all' && (item.category || 'full') !== category) return false;
+        if (!needle) return true;
+        return String(item.name || '').toLowerCase().includes(needle)
+            || String(item.description || '').toLowerCase().includes(needle);
+    });
+}
+
+function bindWardrobeToolbar(container) {
+    const search = container.querySelector('.iig-wardrobe-search');
+    search?.addEventListener('input', event => {
+        iigWardrobeFilter.search = event.target.value;
+        const caret = event.target.selectionStart;
+        renderQuickWardrobeList();
+        // Re-render replaces the input; restore focus and caret so typing is not interrupted.
+        const fresh = document.querySelector('#iig-wardrobe-content .iig-wardrobe-search');
+        if (fresh) {
+            fresh.focus();
+            try { fresh.setSelectionRange(caret, caret); } catch (_) { /* type=search may not support it */ }
+        }
+    });
+    container.querySelectorAll('input[name="iig_wardrobe_cat"]').forEach(radio => {
+        radio.addEventListener('change', () => {
+            iigWardrobeFilter.category = radio.value;
+            renderQuickWardrobeList();
         });
     });
+}
+
+function bindWardrobeCards(container, target, activeItem) {
+    const settings = getSettings();
+    const toggleItem = itemId => {
+        const wasActive = activeItem?.id === itemId;
+        // setActiveWardrobe toggles: same id → null.
+        setActiveWardrobe(itemId, target);
+        updateFloatingButtonBadge();
+        renderQuickWardrobeList();
+        const item = settings.wardrobeItems.find(i => i.id === itemId);
+        if (item) toastr[wasActive ? 'info' : 'success'](`${wasActive ? 'Снят' : 'Надет'}: ${item.name}`, 'Гардероб');
+    };
+
+    container.querySelectorAll('.iig-wardrobe-card').forEach(card => {
+        const itemId = card.dataset.id;
+        const img = card.querySelector('img.iig-wardrobe-card-img');
+        img?.addEventListener('click', event => {
+            event.stopPropagation();
+            const item = settings.wardrobeItems.find(i => i.id === itemId);
+            if (item) editSavedReferenceImage(item, renderQuickWardrobeList);
+        });
+        img?.addEventListener('keydown', event => {
+            if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); event.stopPropagation(); img.click(); }
+        });
+        card.querySelector('.iig-card-delete')?.addEventListener('click', event => {
+            event.stopPropagation();
+            const item = settings.wardrobeItems.find(i => i.id === itemId);
+            if (!item || !confirm(`Удалить «${item.name}» из гардероба?`)) return;
+            removeWardrobeItem(itemId);
+            updateFloatingButtonBadge();
+            renderQuickWardrobeList();
+            toastr.info(`Удалено: ${item.name}`, 'Гардероб');
+        });
+        card.addEventListener('click', () => toggleItem(itemId));
+        card.addEventListener('keydown', event => {
+            if (event.target !== card) return;
+            if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); toggleItem(itemId); }
+        });
+    });
+
+    container.querySelector('.iig-footer-clear')?.addEventListener('click', () => {
+        if (activeItem) toggleItem(activeItem.id);
+    });
+
+    const descArea = container.querySelector(`#iig_wardrobe_desc_${CSS.escape(activeItem?.id || '')}`);
+    if (descArea && activeItem) {
+        descArea.addEventListener('blur', () => {
+            updateWardrobeItemDescription(activeItem.id, descArea.value);
+            toastr.info('Описание сохранено', 'Гардероб');
+        });
+    }
+}
+
+function renderReferenceGenerator(content) {
+    const settings = getSettings();
+    const s = iigRefGenState;
+    s.flags = normalizeRefGenFlags(s.flags);
+    const src = data => `data:${detectMimeType(data)};base64,${data}`;
+    const slot = (key, label) => `
+        <div class="iig-refgen-slot">
+            <div class="iig-refgen-slot-label">${label}</div>
+            ${s[key] ? `<img src="${src(s[key])}" alt="${label}">` : '<div class="iig-refgen-slot-empty"><i class="fa-solid fa-image" aria-hidden="true"></i></div>'}
+            <div class="iig-refgen-slot-actions">
+                <button type="button" class="menu_button iig-refgen-upload" data-slot="${key}">Загрузить</button>
+                ${s[key] ? `<button type="button" class="menu_button iig-refgen-clear" data-slot="${key}" aria-label="Убрать">✕</button>` : ''}
+            </div>
+        </div>`;
+    const flag = (key, label) => `<label class="checkbox_label"><input type="checkbox" class="iig-refgen-flag" data-flag="${key}" ${s.flags[key] ? 'checked' : ''}> <span>${label}</span></label>`;
+    const outfits = (settings.wardrobeItems || []).filter(i => i.imageData);
+    const disabled = s.busy ? 'disabled' : '';
+
+    content.innerHTML = `
+        <div class="iig-refgen">
+            <details class="iig-refgen-help">
+                <summary title="Как пользоваться генератором"><i class="fa-solid fa-circle-question" aria-hidden="true"></i> Как это работает?</summary>
+                <ol>
+                    <li><b>API</b>: основной API картинок или свой (раздел «API для генератора референсов» в настройках).</li>
+                    <li><b>Персонаж / Одежда</b>: загрузите фото лица и одежды или выберите одежду из гардероба.</li>
+                    <li><b>Описание</b>: тип тела и внешность. «AI-уточнение» перепишет его через модель промптов, результат можно править.</li>
+                    <li><b>Флажки</b>: что не переносить с картинок (тату, волосы, аксессуары).</li>
+                    <li><b>Собрать промпт</b>, при необходимости поправьте текст, затем <b>Сгенерировать</b>.</li>
+                    <li>Выберите, чей это гардероб (персонаж, юзер или RPG-персонаж), и <b>сохраните</b>. Описание и промпт сохранятся вместе с картинкой.</li>
+                </ol>
+            </details>
+            <div class="flex-row">
+                <label for="iig_refgen_source">API</label>
+                <select id="iig_refgen_source" class="flex1">
+                    <option value="main" ${settings.refGenSource !== 'custom' ? 'selected' : ''}>Основной API картинок</option>
+                    <option value="custom" ${settings.refGenSource === 'custom' ? 'selected' : ''}>Свой API (настройки расширения)</option>
+                </select>
+            </div>
+            <div class="flex-row">
+                <label for="iig_refgen_name">Имя</label>
+                <input id="iig_refgen_name" class="text_pole flex1" value="${escapeHtml(s.name)}" placeholder="Имя персонажа">
+            </div>
+            <div class="iig-refgen-slots">${slot('characterImage', 'Персонаж')}${slot('outfitImage', 'Одежда')}</div>
+            ${outfits.length ? `<select id="iig_refgen_pick_outfit" class="text_pole" aria-label="Взять одежду из гардероба">
+                <option value="">— одежда из гардероба —</option>
+                ${outfits.map(i => `<option value="${escapeHtml(i.id)}">${escapeHtml(i.name)}</option>`).join('')}
+            </select>` : ''}
+            <input type="file" id="iig_refgen_file" accept="image/*" hidden>
+            <label for="iig_refgen_desc">Описание (тело, внешность)</label>
+            <textarea id="iig_refgen_desc" class="text_pole" rows="3" placeholder="Например: высокая, атлетичная, широкие плечи...">${escapeHtml(s.description)}</textarea>
+            <button type="button" class="menu_button iig-refgen-refine" ${disabled}><i class="fa-solid fa-robot"></i> AI-уточнение</button>
+            <label for="iig_refgen_refined">Уточнённое описание</label>
+            <textarea id="iig_refgen_refined" class="text_pole" rows="3" placeholder="Появится после AI-уточнения, можно править">${escapeHtml(s.refinedDescription)}</textarea>
+            <div class="iig-refgen-flags">
+                ${flag('ignoreTattoos', 'Игнорировать тату и пирсинг')}
+                ${flag('bodyFromDescription', 'Тип тела из описания')}
+                ${flag('noHairTransfer', 'Не переносить волосы')}
+                ${flag('noAccessoriesTransfer', 'Не переносить аксессуары')}
+            </div>
+            <button type="button" class="menu_button iig-refgen-build" ${disabled}><i class="fa-solid fa-hammer"></i> Собрать промпт</button>
+            <label for="iig_refgen_prompt">Итоговый промпт</label>
+            <textarea id="iig_refgen_prompt" class="text_pole" rows="5">${escapeHtml(s.finalPrompt)}</textarea>
+            <button type="button" class="menu_button iig-refgen-generate" ${disabled}><i class="fa-solid fa-image"></i> Сгенерировать</button>
+            <div class="iig-refgen-status" role="status" aria-live="polite">${escapeHtml(s.status)}</div>
+            ${s.resultImage ? `
+            <img class="iig-refgen-result" src="${src(s.resultImage)}" alt="Сгенерированный референс">
+            <div class="flex-row">
+                <input id="iig_refgen_item_name" class="text_pole flex1" value="${escapeHtml(s.itemName)}" placeholder="Название в гардеробе" aria-label="Название в гардеробе">
+                <select id="iig_refgen_target" aria-label="Чей гардероб">
+                    <option value="char" ${s.target === 'char' ? 'selected' : ''}>Персонаж</option>
+                    <option value="user" ${s.target === 'user' ? 'selected' : ''}>Юзер</option>
+                    ${getCurrentRpgWardrobeTargets(settings).map(rpg => `<option value="${escapeHtml(rpg.target)}" ${s.target === rpg.target ? 'selected' : ''}>RPG: ${escapeHtml(rpg.name)}</option>`).join('')}
+                </select>
+            </div>
+            <button type="button" class="menu_button iig-refgen-save" ${disabled}><i class="fa-solid fa-floppy-disk"></i> Сохранить в гардероб</button>` : ''}
+        </div>`;
+    bindReferenceGenerator(content);
+}
+
+function getRefGenPromptState(s = iigRefGenState) {
+    return { ...s, hasCharacterRef: Boolean(s.characterImage), hasOutfitRef: Boolean(s.outfitImage) };
+}
+
+function bindReferenceGenerator(content) {
+    const settings = getSettings();
+    const s = iigRefGenState;
+    const $ = selector => content.querySelector(selector);
+    // Re-render only if the generator tab is still on screen (the modal may be closed mid-request).
+    const rerender = () => {
+        if (iigCurrentWardrobeTab === 'gen' && document.getElementById('iig-wardrobe-content')) renderQuickWardrobeList();
+    };
+    const runBusy = async (status, task) => {
+        if (s.busy) return;
+        s.busy = true;
+        s.status = status;
+        rerender();
+        try {
+            await task(text => { s.status = text; const el = document.querySelector('.iig-refgen-status'); if (el) el.textContent = text; });
+            s.status = '';
+        } catch (error) {
+            s.status = `Ошибка: ${error.message}`;
+            toastr.error(error.message, 'Генератор референсов');
+        } finally {
+            s.busy = false;
+            rerender();
+        }
+    };
+
+    if (!s.name) {
+        const context = SillyTavern.getContext();
+        const name = context.characters?.[context.characterId]?.name || '';
+        if (name) { s.name = name; const input = $('#iig_refgen_name'); if (input) input.value = name; }
+    }
+
+    $('#iig_refgen_source')?.addEventListener('change', event => {
+        settings.refGenSource = event.target.value === 'custom' ? 'custom' : 'main';
+        saveSettings();
+    });
+
+    // Text fields update state only; no re-render, so typing is not interrupted.
+    const bindText = (selector, key) => $(selector)?.addEventListener('input', event => { s[key] = event.target.value; });
+    bindText('#iig_refgen_name', 'name');
+    bindText('#iig_refgen_desc', 'description');
+    bindText('#iig_refgen_refined', 'refinedDescription');
+    bindText('#iig_refgen_prompt', 'finalPrompt');
+    bindText('#iig_refgen_item_name', 'itemName');
+    $('#iig_refgen_target')?.addEventListener('change', event => { s.target = event.target.value; });
+
+    content.querySelectorAll('.iig-refgen-flag').forEach(box => {
+        box.addEventListener('change', () => { s.flags = { ...normalizeRefGenFlags(s.flags), [box.dataset.flag]: box.checked }; });
+    });
+
+    const fileInput = $('#iig_refgen_file');
+    let pendingSlot = null;
+    content.querySelectorAll('.iig-refgen-upload').forEach(button => {
+        button.addEventListener('click', () => { pendingSlot = button.dataset.slot; fileInput?.click(); });
+    });
+    fileInput?.addEventListener('change', async () => {
+        const file = fileInput.files?.[0];
+        if (!file || !pendingSlot) return;
+        try {
+            s[pendingSlot] = await resizeImageBase64(await readLibraryFileAsBase64(file), 1024);
+            rerender();
+        } catch (error) {
+            toastr.error(`Не удалось загрузить картинку: ${error.message}`);
+        } finally {
+            fileInput.value = '';
+        }
+    });
+    content.querySelectorAll('.iig-refgen-clear').forEach(button => {
+        button.addEventListener('click', () => { s[button.dataset.slot] = null; rerender(); });
+    });
+    $('#iig_refgen_pick_outfit')?.addEventListener('change', event => {
+        const item = (settings.wardrobeItems || []).find(i => i.id === event.target.value);
+        if (!item?.imageData) return;
+        s.outfitImage = item.imageData;
+        rerender();
+    });
+
+    $('.iig-refgen-refine')?.addEventListener('click', () => runBusy('AI-уточнение...', async () => {
+        s.refinedDescription = await refineReferenceDescription(s.description);
+    }));
+    $('.iig-refgen-build')?.addEventListener('click', () => {
+        s.finalPrompt = buildReferenceGenPrompt(getRefGenPromptState());
+        rerender();
+    });
+    $('.iig-refgen-generate')?.addEventListener('click', () => runBusy('Генерация...', async onStatus => {
+        if (!String(s.finalPrompt || '').trim()) s.finalPrompt = buildReferenceGenPrompt(getRefGenPromptState());
+        s.resultImage = await generateReferenceImage(getRefGenPromptState(), onStatus);
+        if (!s.itemName) s.itemName = `Референс ${s.name || ''}`.trim();
+    }));
+    $('.iig-refgen-save')?.addEventListener('click', () => runBusy('Сохранение...', async () => {
+        const resized = await resizeImageBase64(s.resultImage, 512);
+        const item = saveGeneratedReference(s, resized);
+        updateWardrobeInjection();
+        toastr.success(`Сохранено в гардероб: ${item.name}`, 'Генератор референсов');
+    }));
 }

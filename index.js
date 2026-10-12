@@ -2012,10 +2012,13 @@ async function generateImageOpenAI(prompt, style, refData, options = {}) {
 
     let size = settings.size;
     if (options.aspectRatio) {
-        if (options.aspectRatio === '16:9' || options.aspectRatio === '3:2') size = '1536x1024';
-        else if (options.aspectRatio === '9:16' || options.aspectRatio === '2:3') size = '1024x1536';
-        else if (options.aspectRatio === '1:1') size = '1024x1024';
-        else size = 'auto';
+        // Map any "W:H" ratio to the closest size supported by the Images API
+        const [w, h] = String(options.aspectRatio).split(':').map(Number);
+        if (w > 0 && h > 0) {
+            if (w > h) size = '1536x1024';
+            else if (w < h) size = '1024x1536';
+            else size = '1024x1024';
+        }
     }
 
     const body = {
@@ -2155,8 +2158,18 @@ async function generateImageOpenAIChat(prompt, style, refData, options = {}) {
     const url = buildOpenAIUrl(settings.endpoint, 'chat/completions');
     const { imageRefs = [], textOnlyClothing = [], textDirectives = [] } = refData;
 
+    // Get aspect ratio and image size from options or settings
+    let aspectRatio = options.aspectRatio || settings.aspectRatio || '1:1';
+    if (!VALID_ASPECT_RATIOS.includes(aspectRatio)) aspectRatio = '1:1';
+    let imageSize = options.imageSize || settings.imageSize || '1K';
+    if (!VALID_IMAGE_SIZES.includes(imageSize)) imageSize = '1K';
+
     const promptParts = [];
     promptParts.push('Generate an image from the following instruction. Return the generated image in the response.');
+    
+    // Add aspect ratio instruction to prevent reference image aspect from being copied
+    promptParts.push(`[IMAGE SPECIFICATIONS: aspect ratio ${aspectRatio}, do NOT copy the aspect ratio from reference images, use ${aspectRatio} for the final output]`);
+    
     if (style) promptParts.push(`[Art Style: ${style}]`);
     for (const directive of textDirectives) promptParts.push(directive);
     for (const c of textOnlyClothing) promptParts.push(`[CLOTHING: ${c.charName} is wearing: ${c.description}]`);
@@ -2186,7 +2199,15 @@ async function generateImageOpenAIChat(prompt, style, refData, options = {}) {
         modalities: ['image', 'text']
     };
 
-    iigLog('INFO', `OpenAI Chat/Router Request: model=${body.model}, refs=${imageRefs.length}, prompt=${fullPrompt.length} chars`);
+    // Add image_config for Gemini models via Router (OpenRouter, CloseRouter, rout.my)
+    if (isRouterEndpoint(settings.endpoint)) {
+        body.image_config = {
+            aspect_ratio: aspectRatio,
+            image_size: imageSize
+        };
+    }
+
+    iigLog('INFO', `OpenAI Chat/Router Request: model=${body.model}, refs=${imageRefs.length}, aspect=${aspectRatio}, size=${imageSize}, prompt=${fullPrompt.length} chars`);
 
     const response = await fetch(url, {
         method: 'POST',
@@ -4838,18 +4859,21 @@ function createSettingsUI() {
                                 </div>
                             </div>
 
-                            <div class="flex-row">
+                            <h5>Разрешение изображений</h5>
+                            <p class="hint">Настройки ниже применяются в зависимости от выбранного API. Значения из тегов [IMG:GEN:{json}] имеют приоритет.</p>
+
+                            <div class="flex-row ${settings.apiType === 'openai' ? '' : 'hidden'}" id="iig_openai_size_row">
                                 <label>Размер (OpenAI)</label>
                                 <select id="iig_size" class="flex1">
                                     <option value="1024x1024" ${settings.size === '1024x1024' ? 'selected' : ''}>1024×1024</option>
-                                    <option value="1536x1024" ${settings.size === '1536x1024' ? 'selected' : ''}>1536×1024</option>
-                                    <option value="1024x1536" ${settings.size === '1024x1536' ? 'selected' : ''}>1024×1536</option>
+                                    <option value="1536x1024" ${settings.size === '1536x1024' ? 'selected' : ''}>1536×1024 (широко)</option>
+                                    <option value="1024x1536" ${settings.size === '1024x1536' ? 'selected' : ''}>1024×1536 (высоко)</option>
                                     <option value="auto" ${settings.size === 'auto' ? 'selected' : ''}>auto</option>
                                 </select>
                             </div>
 
-                            <div class="flex-row">
-                                <label>Качество</label>
+                            <div class="flex-row ${settings.apiType === 'openai' ? '' : 'hidden'}" id="iig_quality_row">
+                                <label>Качество (OpenAI)</label>
                                 <select id="iig_quality" class="flex1">
                                     <option value="standard" ${settings.quality === 'standard' ? 'selected' : ''}>standard</option>
                                     <option value="hd" ${settings.quality === 'hd' ? 'selected' : ''}>hd</option>
@@ -4857,7 +4881,7 @@ function createSettingsUI() {
                                 </select>
                             </div>
 
-                            <div id="iig_gemini_section" class="${settings.apiType !== 'gemini' ? 'hidden' : ''}">
+                            <div class="${['gemini', 'openai-chat'].includes(settings.apiType) ? '' : 'hidden'}" id="iig_aspect_size_section">
                                 <div class="flex-row">
                                     <label>Aspect Ratio</label>
                                     <select id="iig_aspect_ratio" class="flex1">
@@ -4874,6 +4898,7 @@ function createSettingsUI() {
                                         ).join('')}
                                     </select>
                                 </div>
+                                <p class="hint">Для Gemini и Router (OpenRouter/CloseRouter). 1K ≈ 1024px, 2K ≈ 2048px, 4K ≈ 4096px по длинной стороне.</p>
                             </div>
 
                         </div>
@@ -5194,7 +5219,10 @@ function bindSettingsEvents() {
         document.getElementById('iig_endpoint_row')?.classList.toggle('hidden', ['novelai', 'novelai-direct'].includes(type));
         document.getElementById('iig_api_key_row')?.classList.toggle('hidden', ['novelai', 'novelai-direct'].includes(type));
         document.getElementById('iig_standard_model_row')?.classList.toggle('hidden', ['naistera', 'novelai', 'novelai-direct'].includes(type));
-        document.getElementById('iig_gemini_section')?.classList.toggle('hidden', type !== 'gemini');
+        // Images API uses pixel size/quality; Chat/Router and Gemini use aspect ratio + image size
+        document.getElementById('iig_openai_size_row')?.classList.toggle('hidden', type !== 'openai');
+        document.getElementById('iig_quality_row')?.classList.toggle('hidden', type !== 'openai');
+        document.getElementById('iig_aspect_size_section')?.classList.toggle('hidden', !['gemini', 'openai-chat'].includes(type));
         document.getElementById('iig_naistera_section')?.classList.toggle('hidden', type !== 'naistera');
         document.getElementById('iig_novelai_section')?.classList.toggle('hidden', !['novelai', 'novelai-direct'].includes(type));
         document.getElementById('iig_novelai_token_row')?.classList.toggle('hidden', type !== 'novelai-direct');

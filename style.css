@@ -59,18 +59,87 @@
 .iig-crop-selection[hidden] { display: none; }
 .iig-image-editor-actions { display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; }
 .iig-image-editor button:disabled { opacity: .4; cursor: not-allowed; }
-.iig-reference-select {
-    position: absolute;
-    left: 2px;
-    top: 24px;
-    background: rgba(0, 0, 0, .75);
-    color: #fff;
-    border: 1px solid var(--iig-accent);
-    border-radius: 4px;
-    padding: 2px;
-    font-size: 10px;
+/* ---- Settings grid cards (wardrobe / hairstyles) ---- */
+.iig-ref-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(92px, 1fr));
+    gap: 8px;
+    margin: 6px 0;
+}
+.iig-ref-card {
+    display: flex;
+    flex-direction: column;
+    border: 1px solid color-mix(in srgb, var(--iig-text) 12%, transparent);
+    border-radius: 8px;
+    overflow: hidden;
+    background: color-mix(in srgb, var(--iig-text) 3%, transparent);
+    transition: border-color 0.15s;
+}
+.iig-ref-card:hover { border-color: color-mix(in srgb, var(--iig-accent) 50%, transparent); }
+.iig-ref-card-active { border-color: var(--iig-accent); }
+.iig-ref-card-img {
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 100%;
+    aspect-ratio: 3 / 4;
+    padding: 0;
+    border: 0;
+    background: color-mix(in srgb, var(--iig-text) 5%, transparent);
+    color: var(--iig-text-muted);
+    font-size: 20px;
     cursor: pointer;
 }
+.iig-ref-card-img img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.iig-ref-card-img:focus-visible { outline: 2px solid var(--iig-accent); outline-offset: -2px; }
+.iig-ref-card-check {
+    position: absolute;
+    top: 5px;
+    right: 5px;
+    width: 20px;
+    height: 20px;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: var(--iig-accent);
+    color: #1a1418;
+    font-size: 11px;
+}
+.iig-ref-card-name {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 4px 6px 0;
+    font-size: 11px;
+    color: var(--iig-text);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.iig-ref-card-name i { font-size: 9px; color: var(--iig-text-muted); flex-shrink: 0; }
+.iig-ref-card-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 4px;
+    padding: 4px 6px 6px;
+}
+.iig-ref-card-btn {
+    width: 26px;
+    height: 26px;
+    padding: 0;
+    border: 1px solid color-mix(in srgb, var(--iig-text) 15%, transparent);
+    border-radius: 6px;
+    background: transparent;
+    color: var(--iig-text-soft);
+    font-size: 11px;
+    cursor: pointer;
+}
+.iig-ref-card-btn:hover,
+.iig-ref-card-btn:focus-visible { color: var(--iig-accent); border-color: var(--iig-accent); outline: none; }
+.iig-ref-card-btn-danger:hover,
+.iig-ref-card-btn-danger:focus-visible { color: #fff; background: #dc3545; border-color: #dc3545; }
 
 .iig-settings .hidden {
     display: none !important;
@@ -1131,8 +1200,8 @@ body.iig-mode-inline .mes_text .iig-image-wrapper {
 
 .iig-card-delete {
     position: absolute;
-    bottom: 6px;
-    right: 6px;
+    top: 6px;
+    left: 6px;
     width: 28px;
     height: 28px;
     padding: 0;

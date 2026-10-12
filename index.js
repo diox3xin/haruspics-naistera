@@ -114,13 +114,6 @@ const defaultSettings = Object.freeze({
     // Active outfit per RPG character: { [rpgCharacterId]: wardrobeItemId }
     activeWardrobeRpg: {},
     injectWardrobeToChat: true,
-    // Hex only: values are bound to <input type="color">
-    wardrobeTheme: {
-        bgColor: '#1a1a1e',
-        textColor: '#e8e0e0',
-        accentColor: '#ffb6c1',
-        borderColor: '#3a3a40',
-    },
     wardrobeInjectionDepth: 1,
     wardrobeDescEndpoint: '',
     wardrobeDescApiKey: '',
@@ -279,35 +272,6 @@ function escapeHtml(value) {
 // SETTINGS
 // ============================================================
 
-const WARDROBE_THEME_DEFAULTS = Object.freeze({
-    bgColor: '#1a1a1e',
-    textColor: '#e8e0e0',
-    accentColor: '#ffb6c1',
-    borderColor: '#3a3a40',
-});
-
-// Keeps only valid #rrggbb values (expands #rgb); anything else falls back to the default.
-function normalizeWardrobeTheme(raw) {
-    const source = raw && typeof raw === 'object' ? raw : {};
-    const result = {};
-    for (const [key, fallback] of Object.entries(WARDROBE_THEME_DEFAULTS)) {
-        let value = String(source[key] || '').trim().toLowerCase();
-        const short = value.match(/^#([0-9a-f])([0-9a-f])([0-9a-f])$/);
-        if (short) value = `#${short[1]}${short[1]}${short[2]}${short[2]}${short[3]}${short[3]}`;
-        result[key] = /^#[0-9a-f]{6}$/.test(value) ? value : fallback;
-    }
-    return result;
-}
-
-function applyWardrobeTheme(theme = getSettings().wardrobeTheme) {
-    const t = normalizeWardrobeTheme(theme);
-    const root = document.documentElement;
-    root.style.setProperty('--iig-wr-bg', t.bgColor);
-    root.style.setProperty('--iig-wr-text', t.textColor);
-    root.style.setProperty('--iig-wr-accent', t.accentColor);
-    root.style.setProperty('--iig-wr-border', t.borderColor);
-}
-
 function getSettings() {
     const context = SillyTavern.getContext();
     if (!context.extensionSettings[MODULE_NAME]) {
@@ -329,7 +293,6 @@ function getSettings() {
     if (!s.characterReferenceLibrary.users || typeof s.characterReferenceLibrary.users !== 'object') {
         s.characterReferenceLibrary.users = {};
     }
-    s.wardrobeTheme = normalizeWardrobeTheme(s.wardrobeTheme);
     // Migrate wardrobe items without description or category
     for (const item of (s.wardrobeItems || [])) {
         if (!Object.hasOwn(item, 'description')) item.description = '';
@@ -1942,9 +1905,6 @@ const FAQ_HINTS = Object.freeze({
         '#iig_inject_wardrobe': 'Вставлять описание активной одежды в промпт чата.',
         '#iig_wardrobe_send_mode': 'Что отправлять в генерацию картинок: фото одежды с текстом или только текст.',
         '#iig_wardrobe_injection_depth': 'На сколько сообщений от конца чата вставлять описание одежды.',
-    },
-    wardrobe_theme: {
-        _section: 'Цвета модального окна гардероба (фон, текст, акцент, рамки). Работает через CSS-переменные.',
     },
     vision: {
         '#iig_wardrobe_desc_endpoint': 'API для vision-описаний (GPT-4o, Claude 3.5 Sonnet и т.д.).',
@@ -4362,21 +4322,77 @@ function editSavedReferenceImage(item, render) {
     });
 }
 
-function addReferenceCardControls(card, item, isActive, onSelect, render) {
-    const img = card.querySelector('img');
-    if (item.imageData && img) {
+/**
+ * Settings-grid card for wardrobe / hairstyle items.
+ * Layout: image (click = select/take off) → name → action row (crop, delete).
+ * Nothing is overlaid on the image except the "active" check mark.
+ */
+function buildReferenceCard({ item, isActive, onSelect, onDelete, rerender }) {
+    const card = document.createElement('div');
+    card.className = `iig-ref-card${isActive ? ' iig-ref-card-active' : ''}`;
+
+    const media = document.createElement('button');
+    media.type = 'button';
+    media.className = 'iig-ref-card-img';
+    const actionLabel = isActive ? 'Снять' : 'Выбрать';
+    media.title = actionLabel;
+    media.setAttribute('aria-pressed', String(isActive));
+    media.setAttribute('aria-label', `${actionLabel}: ${item.name}`);
+    if (item.imageData) {
+        const img = document.createElement('img');
         img.src = `data:${detectMimeType(item.imageData)};base64,${item.imageData}`;
-        img.title = 'Открыть изображение / обрезать';
-        img.addEventListener('click', event => { event.stopPropagation(); editSavedReferenceImage(item, render); });
-    } else if (img) {
-        img.remove();
+        img.alt = '';
+        media.appendChild(img);
+    } else {
+        media.innerHTML = '<i class="fa-solid fa-font" aria-hidden="true"></i>';
     }
-    const select = document.createElement('button');
-    select.type = 'button';
-    select.className = 'iig-reference-select';
-    select.textContent = isActive ? '✓ Снять' : 'Выбрать';
-    select.addEventListener('click', event => { event.stopPropagation(); onSelect(); });
-    card.appendChild(select);
+    if (isActive) {
+        const check = document.createElement('span');
+        check.className = 'iig-ref-card-check';
+        check.setAttribute('aria-hidden', 'true');
+        check.innerHTML = '<i class="fa-solid fa-check"></i>';
+        media.appendChild(check);
+    }
+    media.addEventListener('click', onSelect);
+    card.appendChild(media);
+
+    const name = document.createElement('div');
+    name.className = 'iig-ref-card-name';
+    name.title = item.name;
+    if (item.description) {
+        const descIcon = document.createElement('i');
+        descIcon.className = 'fa-solid fa-file-lines';
+        descIcon.title = 'Есть описание';
+        name.appendChild(descIcon);
+    }
+    name.appendChild(document.createTextNode(item.name));
+    card.appendChild(name);
+
+    const actions = document.createElement('div');
+    actions.className = 'iig-ref-card-actions';
+    if (item.imageData) {
+        const crop = document.createElement('button');
+        crop.type = 'button';
+        crop.className = 'iig-ref-card-btn';
+        crop.title = 'Открыть / обрезать';
+        crop.setAttribute('aria-label', `Открыть или обрезать: ${item.name}`);
+        crop.innerHTML = '<i class="fa-solid fa-crop-simple" aria-hidden="true"></i>';
+        crop.addEventListener('click', () => editSavedReferenceImage(item, rerender));
+        actions.appendChild(crop);
+    }
+    const del = document.createElement('button');
+    del.type = 'button';
+    del.className = 'iig-ref-card-btn iig-ref-card-btn-danger';
+    del.title = 'Удалить';
+    del.setAttribute('aria-label', `Удалить: ${item.name}`);
+    del.innerHTML = '<i class="fa-solid fa-trash" aria-hidden="true"></i>';
+    del.addEventListener('click', () => {
+        if (confirm(`Удалить «${item.name}»?`)) onDelete();
+    });
+    actions.appendChild(del);
+    card.appendChild(actions);
+
+    return card;
 }
 
 function bindReferenceUpload(kind, target) {
@@ -4426,71 +4442,17 @@ function renderWardrobeGrid(target) {
     }
 
     container.innerHTML = '';
-    container.style.cssText = 'display:flex;flex-wrap:wrap;gap:8px;margin:6px 0;';
+    container.style.cssText = '';
+    container.classList.add('iig-ref-grid');
 
     for (const item of items) {
-        const isActive = item.id === activeId;
-
-        const card = document.createElement('div');
-        card.style.cssText = `position:relative;width:80px;height:100px;border-radius:8px;overflow:hidden;cursor:pointer;border:2px solid ${isActive ? '#ffb6c1' : 'rgba(255,255,255,0.08)'};transition:border-color 0.2s;`;
-
-        const img = document.createElement('img');
-        img.src = item.imageData ? `data:${detectMimeType(item.imageData)};base64,${item.imageData}` : '';
-        img.style.cssText = 'width:100%;height:100%;object-fit:cover;';
-        card.appendChild(img);
-
-        const overlay = document.createElement('div');
-        overlay.style.cssText = 'position:absolute;bottom:0;left:0;right:0;background:linear-gradient(transparent,rgba(0,0,0,0.8));padding:3px 5px;';
-
-        const nameEl = document.createElement('span');
-        nameEl.textContent = item.name;
-        nameEl.style.cssText = 'font-size:9px;color:#fff;display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;';
-        nameEl.title = item.name;
-        overlay.appendChild(nameEl);
-
-        if (item.description) {
-            const descIcon = document.createElement('i');
-            descIcon.className = 'fa-solid fa-file-lines';
-            descIcon.style.cssText = 'font-size:8px;color:#aaf;position:absolute;top:3px;left:3px;';
-            descIcon.title = 'Есть описание';
-            card.appendChild(descIcon);
-        }
-
-        card.appendChild(overlay);
-
-        if (isActive) {
-            const check = document.createElement('div');
-            check.style.cssText = 'position:absolute;top:3px;right:3px;width:18px;height:18px;border-radius:50%;background:#ffb6c1;display:flex;align-items:center;justify-content:center;';
-            check.innerHTML = '<i class="fa-solid fa-check" style="font-size:10px;color:#000;"></i>';
-            card.appendChild(check);
-        }
-
-        const deleteBtn = document.createElement('div');
-        deleteBtn.style.cssText = 'position:absolute;bottom:18px;right:3px;width:18px;height:18px;border-radius:50%;background:rgba(200,50,50,0.8);display:none;align-items:center;justify-content:center;cursor:pointer;';
-        deleteBtn.innerHTML = '<i class="fa-solid fa-trash" style="font-size:8px;color:#fff;"></i>';
-        deleteBtn.title = 'Удалить';
-        deleteBtn.addEventListener('click', (e) => {
-            e.stopPropagation();
-            removeWardrobeItem(item.id);
-            renderWardrobeGrid(target);
-            toastr.info('Одежда удалена');
-        });
-        card.appendChild(deleteBtn);
-
-        card.addEventListener('mouseenter', () => { deleteBtn.style.display = 'flex'; });
-        card.addEventListener('mouseleave', () => { deleteBtn.style.display = 'none'; });
-
-        card.addEventListener('click', () => {
-            setActiveWardrobe(item.id, target);
-            renderWardrobeGrid(target);
-        });
-
-        addReferenceCardControls(card, item, isActive, () => {
-            setActiveWardrobe(item.id, target);
-            renderWardrobeGrid(target);
-        }, () => renderWardrobeGrid(target));
-
-        container.appendChild(card);
+        container.appendChild(buildReferenceCard({
+            item,
+            isActive: item.id === activeId,
+            onSelect: () => { setActiveWardrobe(item.id, target); renderWardrobeGrid(target); updateFloatingButtonBadge(); },
+            onDelete: () => { removeWardrobeItem(item.id); renderWardrobeGrid(target); updateFloatingButtonBadge(); toastr.info('Одежда удалена'); },
+            rerender: () => renderWardrobeGrid(target),
+        }));
     }
 
     renderWardrobeDescriptionPanel(target);
@@ -4621,71 +4583,17 @@ function renderHairstyleGrid(target) {
     }
 
     container.innerHTML = '';
-    container.style.cssText = 'display:flex;flex-wrap:wrap;gap:8px;margin:6px 0;';
+    container.style.cssText = '';
+    container.classList.add('iig-ref-grid');
 
     for (const item of items) {
-        const isActive = item.id === activeId;
-
-        const card = document.createElement('div');
-        card.style.cssText = `position:relative;width:80px;height:100px;border-radius:8px;overflow:hidden;cursor:pointer;border:2px solid ${isActive ? '#ffb6c1' : 'rgba(255,255,255,0.08)'};transition:border-color 0.2s;`;
-
-        const img = document.createElement('img');
-        img.src = item.imageData ? `data:${detectMimeType(item.imageData)};base64,${item.imageData}` : '';
-        img.style.cssText = 'width:100%;height:100%;object-fit:cover;';
-        card.appendChild(img);
-
-        const overlay = document.createElement('div');
-        overlay.style.cssText = 'position:absolute;bottom:0;left:0;right:0;background:linear-gradient(transparent,rgba(0,0,0,0.8));padding:3px 5px;';
-
-        const nameEl = document.createElement('span');
-        nameEl.textContent = item.name;
-        nameEl.style.cssText = 'font-size:9px;color:#fff;display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;';
-        nameEl.title = item.name;
-        overlay.appendChild(nameEl);
-
-        if (item.description) {
-            const descIcon = document.createElement('i');
-            descIcon.className = 'fa-solid fa-file-lines';
-            descIcon.style.cssText = 'font-size:8px;color:#aaf;position:absolute;top:3px;left:3px;';
-            descIcon.title = 'Есть описание';
-            card.appendChild(descIcon);
-        }
-
-        card.appendChild(overlay);
-
-        if (isActive) {
-            const check = document.createElement('div');
-            check.style.cssText = 'position:absolute;top:3px;right:3px;width:18px;height:18px;border-radius:50%;background:#ffb6c1;display:flex;align-items:center;justify-content:center;';
-            check.innerHTML = '<i class="fa-solid fa-check" style="font-size:10px;color:#000;"></i>';
-            card.appendChild(check);
-        }
-
-        const deleteBtn = document.createElement('div');
-        deleteBtn.style.cssText = 'position:absolute;bottom:18px;right:3px;width:18px;height:18px;border-radius:50%;background:rgba(200,50,50,0.8);display:none;align-items:center;justify-content:center;cursor:pointer;';
-        deleteBtn.innerHTML = '<i class="fa-solid fa-trash" style="font-size:8px;color:#fff;"></i>';
-        deleteBtn.title = 'Удалить';
-        deleteBtn.addEventListener('click', (e) => {
-            e.stopPropagation();
-            removeHairstyleItem(item.id);
-            renderHairstyleGrid(target);
-            toastr.info('Причёска удалена');
-        });
-        card.appendChild(deleteBtn);
-
-        card.addEventListener('mouseenter', () => { deleteBtn.style.display = 'flex'; });
-        card.addEventListener('mouseleave', () => { deleteBtn.style.display = 'none'; });
-
-        card.addEventListener('click', () => {
-            setActiveHairstyle(item.id, target);
-            renderHairstyleGrid(target);
-        });
-
-        addReferenceCardControls(card, item, isActive, () => {
-            setActiveHairstyle(item.id, target);
-            renderHairstyleGrid(target);
-        }, () => renderHairstyleGrid(target));
-
-        container.appendChild(card);
+        container.appendChild(buildReferenceCard({
+            item,
+            isActive: item.id === activeId,
+            onSelect: () => { setActiveHairstyle(item.id, target); renderHairstyleGrid(target); },
+            onDelete: () => { removeHairstyleItem(item.id); renderHairstyleGrid(target); toastr.info('Причёска удалена'); },
+            rerender: () => renderHairstyleGrid(target),
+        }));
     }
 
     renderHairstyleDescriptionPanel(target);
@@ -5637,31 +5545,6 @@ function createSettingsUI() {
                         </div>
                     </div>
 
-                    <!-- ======= SECTION: Wardrobe Theme ======= -->
-                    <div class="iig-collapsible" data-section-id="wardrobe_theme">
-                        <div class="iig-collapsible-header">
-                            <i class="fa-solid fa-chevron-down iig-collapse-icon"></i>
-                            <span>🎨 Оформление гардероба</span>
-                        </div>
-                        <div class="iig-collapsible-content">
-                            <p class="hint">Цвета окна гардероба и кнопки в поле ввода. Изменения применяются сразу.</p>
-                            ${[
-                                ['bgColor', 'Фон'],
-                                ['textColor', 'Текст'],
-                                ['accentColor', 'Акценты и детали'],
-                                ['borderColor', 'Границы'],
-                            ].map(([key, label]) => `
-                            <div class="flex-row">
-                                <label for="iig_wardrobe_theme_${key}">${label}</label>
-                                <input type="color" id="iig_wardrobe_theme_${key}" class="iig-wardrobe-theme-input" data-theme-key="${key}" value="${escapeHtml(settings.wardrobeTheme[key])}">
-                            </div>`).join('')}
-                            <div class="flex-row">
-                                <button type="button" class="menu_button" id="iig_wardrobe_theme_reset"><i class="fa-solid fa-rotate-left"></i> Сбросить цвета</button>
-                                <button type="button" class="menu_button" id="iig_wardrobe_theme_preview"><i class="fa-solid fa-eye"></i> Открыть гардероб</button>
-                            </div>
-                        </div>
-                    </div>
-
                     <!-- ======= SECTION: Hairstyle Char ======= -->
                     <div class="iig-collapsible" data-section-id="hairstyle_char">
                         <div class="iig-collapsible-header">
@@ -5870,24 +5753,6 @@ function bindSettingsEvents() {
         saveSettings();
         updateImageModeInjection();
     });
-
-    // Wardrobe theme colors
-    document.querySelectorAll('.iig-wardrobe-theme-input').forEach(input => {
-        input.addEventListener('input', (e) => {
-            settings.wardrobeTheme = normalizeWardrobeTheme({ ...settings.wardrobeTheme, [e.target.dataset.themeKey]: e.target.value });
-            applyWardrobeTheme(settings.wardrobeTheme);
-            saveSettings();
-        });
-    });
-    document.getElementById('iig_wardrobe_theme_reset')?.addEventListener('click', () => {
-        settings.wardrobeTheme = { ...WARDROBE_THEME_DEFAULTS };
-        document.querySelectorAll('.iig-wardrobe-theme-input').forEach(input => {
-            input.value = settings.wardrobeTheme[input.dataset.themeKey];
-        });
-        applyWardrobeTheme(settings.wardrobeTheme);
-        saveSettings();
-    });
-    document.getElementById('iig_wardrobe_theme_preview')?.addEventListener('click', () => openWardrobeModal());
 
     document.getElementById('iig_api_type')?.addEventListener('change', (e) => {
         settings.apiType = e.target.value;
@@ -6376,47 +6241,6 @@ function bindSettingsEvents() {
     renderPromptInstructionEditor();
     renderCharacterProfiles();
 }
-
-// ============================================================
-// INIT
-// ============================================================
-
-(function init() {
-    const context = SillyTavern.getContext();
-    getSettings();
-
-    context.eventSource.on(context.event_types.APP_READY, () => {
-        createSettingsUI();
-        observeImageRegenButtons();
-        addButtonsToExistingMessages();
-        addPromptPanelsToExistingMessages();
-        applyImageDisplayMode();
-        updateWardrobeInjection();
-        updateImageModeInjection();
-        console.log('[IIG] Inline Image Generation v3.0 loaded');
-    });
-
-    context.eventSource.on(context.event_types.CHAT_CHANGED, () => {
-        setTimeout(() => {
-            observeImageRegenButtons();
-            addButtonsToExistingMessages();
-            addPromptPanelsToExistingMessages();
-            updateWardrobeInjection();
-            updateImageModeInjection();
-        }, 100);
-        setTimeout(updateCharAvatarPreview, 200);
-    });
-
-    context.eventSource.makeLast(context.event_types.CHARACTER_MESSAGE_RENDERED, async (messageId) => {
-        await onMessageReceived(messageId);
-    });
-
-    // Wardrobe button in the input bar + theme colors
-    applyWardrobeTheme();
-    createFloatingWardrobeButton();
-    
-    console.log('[IIG] Inline Image Generation v3.0 initialized');
-})();
 
 // ============================================================
 // FLOATING WARDROBE BUTTON
@@ -6959,3 +6783,50 @@ function bindReferenceGenerator(content) {
         toastr.success(`Сохранено в гардероб: ${item.name}`, 'Генератор референсов');
     }));
 }
+
+// ============================================================
+// INIT
+// Must stay at the very end of the file: it runs immediately and
+// touches module-level `let` state declared above (TDZ otherwise).
+// ============================================================
+
+(function init() {
+    const context = SillyTavern.getContext();
+    getSettings();
+
+    context.eventSource.on(context.event_types.APP_READY, () => {
+        createSettingsUI();
+        observeImageRegenButtons();
+        addButtonsToExistingMessages();
+        addPromptPanelsToExistingMessages();
+        applyImageDisplayMode();
+        updateWardrobeInjection();
+        updateImageModeInjection();
+        console.log('[IIG] Inline Image Generation v3.0 loaded');
+    });
+
+    context.eventSource.on(context.event_types.CHAT_CHANGED, () => {
+        setTimeout(() => {
+            observeImageRegenButtons();
+            addButtonsToExistingMessages();
+            addPromptPanelsToExistingMessages();
+            updateWardrobeInjection();
+            updateImageModeInjection();
+            // Bot profile / RPG mode depend on the open character
+            renderCharacterProfiles();
+            updateFloatingButtonBadge();
+            if (iigWardrobeModal) openWardrobeModal();
+        }, 100);
+        setTimeout(updateCharAvatarPreview, 200);
+    });
+
+    context.eventSource.makeLast(context.event_types.CHARACTER_MESSAGE_RENDERED, async (messageId) => {
+        await onMessageReceived(messageId);
+    });
+
+    // Wardrobe button in the input bar
+    createFloatingWardrobeButton();
+
+    console.log('[IIG] Inline Image Generation v3.0 initialized');
+})();
+

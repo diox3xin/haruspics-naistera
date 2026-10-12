@@ -141,7 +141,7 @@ test('saved image is changed only after confirmation, preserving name and descri
             resizeImageBase64: async image => image,
             saveSettings: () => saved++, renderQuickWardrobeList() {}, toastr: { success() {} },
         });
-        vm.runInContext(section('function editSavedReferenceImage(', 'function addReferenceCardControls('), context);
+        vm.runInContext(section('function editSavedReferenceImage(', 'function buildReferenceCard('), context);
         const item = { imageData: 'ORIGINAL', name: 'Coat', description: 'red coat' };
         await context.editSavedReferenceImage(item, () => {});
         assert.equal(item.imageData, edited === 'CROPPED' ? edited : 'ORIGINAL');
@@ -151,7 +151,7 @@ test('saved image is changed only after confirmation, preserving name and descri
 });
 
 test('new helpers and text buttons are declared once', () => {
-    for (const name of ['editSavedReferenceImage', 'addReferenceCardControls', 'bindReferenceUpload', 'openReferenceImageEditor']) {
+    for (const name of ['editSavedReferenceImage', 'buildReferenceCard', 'bindReferenceUpload', 'openReferenceImageEditor']) {
         assert.equal(source.match(new RegExp(`function ${name}\\(`, 'g')).length, 1, name);
     }
     for (const target of ['char', 'user']) {

@@ -30,14 +30,16 @@ test('real browser: sanitized/rerendered images, cloned buttons and single regen
         const buildEffectiveStyle = style => style;
         const collectReferenceImages = async () => ({});
         let fail = false, calls = 0, saves = 0;
-        const generateImageWithRetry = async prompt => { calls++; if (fail) throw new Error('test failure'); return prompt; };
+        let generateImageWithRetry = async prompt => { calls++; if (fail) throw new Error('test failure'); return prompt; };
         const saveImageToFile = async () => '/images/new-' + calls + '.png';
         const context = { chat: [], saveChat: async () => { saves++; } };
         const SillyTavern = { getContext: () => context };
+        ${section('function createFusionMessageGuard(', '// IMAGE UTILITIES')}
         ${section('function escapeHtml(', '// SETTINGS')}
         ${section('const ERROR_IMAGE_PATH', '// DOM HELPERS')}
         ${section('function createLoadingPlaceholder(', '// MESSAGE PROCESSING')}
         ${section('async function regenerateSingleImage(', '// MESSAGE REGENERATION (ALL IMAGES)')}
+        ${section('async function regenerateMessageImages(', '// REGEN BUTTONS ON MESSAGES')}
         const check = (condition, message) => { if (!condition) throw new Error(message); };
         const pause = () => new Promise(resolve => setTimeout(resolve, 150));
         (async () => {
@@ -85,6 +87,28 @@ test('real browser: sanitized/rerendered images, cloned buttons and single regen
             await pause();
             check(calls === 2 && notices.some(text => text.includes('уже идёт')), 'busy click silently ignored');
             processingMessages.clear();
+            // Exercise real guards with a provider that ignores cancellation.
+            for (const change of ['swipe', 'chat', 'text']) {
+                fail = false;
+                const oldChat = context.chat, originalMessage = oldChat[0], previous = originalMessage.mes;
+                let finish;
+                generateImageWithRetry = async () => { calls++; return await new Promise(resolve => { finish = resolve; }); };
+                const beforeSaves = saves;
+                const pending = regenerateSingleImage(0, 1);
+                await pause();
+                if (change === 'swipe') originalMessage.swipe_id = 1;
+                if (change === 'chat') context.chat = [{mes: 'another chat'}];
+                if (change === 'text') originalMessage.mes = 'edited message';
+                finish('late result'); await pending;
+                check(saves === beforeSaves, 'stale request saved chat: ' + change);
+                check(originalMessage.mes === (change === 'text' ? 'edited message' : previous), 'stale request changed message');
+                check(!processingMessages.size && !activeAbortControllers.size, 'stale lock leaked');
+                context.chat = oldChat; originalMessage.swipe_id = undefined; originalMessage.mes = previous;
+            }
+            generateImageWithRetry = async () => { throw new Error('batch failure'); };
+            await regenerateMessageImages(0);
+            check(!text.querySelector('.iig-loading-placeholder'), 'batch failure left loading UI');
+            check(text.querySelector('img[src="/images/new-1.png"]'), 'batch failure removed old image');
             document.getElementById('result').textContent = 'PASS';
         })().catch(error => { document.getElementById('result').textContent = 'FAIL: ' + error.stack; });
     `;

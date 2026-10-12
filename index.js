@@ -325,9 +325,10 @@ function getSettings() {
         s.characterReferenceLibrary.users = {};
     }
     s.wardrobeTheme = normalizeWardrobeTheme(s.wardrobeTheme);
-    // Migrate wardrobe items without description
+    // Migrate wardrobe items without description or category
     for (const item of (s.wardrobeItems || [])) {
         if (!Object.hasOwn(item, 'description')) item.description = '';
+        if (!Object.hasOwn(item, 'category')) item.category = 'full';
     }
     if (!Array.isArray(s.styleGalleryItems)) s.styleGalleryItems = [];
     if (!Array.isArray(s.activeStyleIds)) s.activeStyleIds = [];
@@ -1261,7 +1262,16 @@ function restorePromptInstruction(itemId) {
 // WARDROBE SYSTEM
 // ============================================================
 
-function addWardrobeItem(name, imageData, target = 'char') {
+const WARDROBE_CATEGORIES = Object.freeze({
+    full: 'Полный образ',
+    top: 'Верх',
+    bottom: 'Низ',
+    shoes: 'Обувь',
+    accessories: 'Аксессуары',
+    other: 'Другое',
+});
+
+function addWardrobeItem(name, imageData, target = 'char', category = 'full') {
     const settings = getSettings();
     const item = {
         id: 'ward_' + Date.now() + '_' + Math.random().toString(36).substring(2, 8),
@@ -1269,6 +1279,7 @@ function addWardrobeItem(name, imageData, target = 'char') {
         imageData,
         description: '',
         target,
+        category: category in WARDROBE_CATEGORIES ? category : 'full',
         createdAt: Date.now()
     };
     settings.wardrobeItems.push(item);
@@ -4345,6 +4356,12 @@ function renderWardrobeDescriptionPanel(target) {
             <i class="fa-solid fa-shirt" style="margin-right:4px;"></i>
             Описание: <b>${escapeHtml(activeItem.name)}</b>
         </div>
+        <div class="flex-row" style="margin-bottom:4px;">
+            <label for="iig_ward_category_${target}" style="font-size:11px;">Категория</label>
+            <select id="iig_ward_category_${target}" class="flex1 iig-ward-category" data-wardrobe-id="${escapeHtml(activeItem.id)}">
+                ${Object.entries(WARDROBE_CATEGORIES).map(([key, label]) => `<option value="${key}" ${(activeItem.category || 'full') === key ? 'selected' : ''}>${escapeHtml(label)}</option>`).join('')}
+            </select>
+        </div>
         <textarea class="text_pole" rows="3" style="width:100%;font-size:11px;resize:vertical;"
             placeholder="Введите описание одежды вручную или сгенерируйте через AI..."
             data-wardrobe-id="${activeItem.id}">${escapeHtml(activeItem.description)}</textarea>
@@ -4363,6 +4380,15 @@ function renderWardrobeDescriptionPanel(target) {
     `;
 
     const textarea = panel.querySelector('textarea');
+
+    panel.querySelector('.iig-ward-category')?.addEventListener('change', event => {
+        const settings = getSettings();
+        const item = settings.wardrobeItems.find(i => i.id === event.target.dataset.wardrobeId);
+        if (!item) return;
+        item.category = event.target.value in WARDROBE_CATEGORIES ? event.target.value : 'full';
+        saveSettings();
+        renderQuickWardrobeList();
+    });
 
     textarea?.addEventListener('blur', () => {
         updateWardrobeItemDescription(textarea.dataset.wardrobeId, textarea.value);
@@ -6459,6 +6485,7 @@ function bindSettingsEvents() {
 let iigFloatingBtn = null;
 let iigWardrobeModal = null;
 let iigCurrentWardrobeTab = 'char';
+let iigWardrobeFilter = { category: 'all', search: '' };
 
 function createFloatingWardrobeButton() {
     // Remove existing button if any
@@ -6607,63 +6634,121 @@ function renderQuickWardrobeList() {
     
     const settings = getSettings();
     const target = iigCurrentWardrobeTab;
-    const items = settings.wardrobeItems?.filter(i => i.target === target) || [];
+    const allItems = settings.wardrobeItems?.filter(i => i.target === target) || [];
     const activeId = target === 'char' ? settings.activeWardrobeChar : settings.activeWardrobeUser;
-    
-    if (items.length === 0) {
-        content.innerHTML = `
-            <div class="iig-no-outfits">
-                <i class="fa-solid fa-shirt"></i>
-                <p>Нет нарядов в гардеробе</p>
-                <small>Добавьте одежду в настройках расширения</small>
-            </div>
-        `;
-        return;
-    }
-    
-    const html = `
-        <div class="iig-quick-outfit-list">
-            ${items.map(item => `
-                <div class="iig-quick-outfit-item ${item.id === activeId ? 'iig-outfit-active' : ''}" data-id="${item.id}">
-                    ${item.imageData 
-                        ? `<img class="iig-quick-outfit-thumb" src="data:${detectMimeType(item.imageData)};base64,${item.imageData}" alt="${escapeHtml(item.name)}" title="Открыть изображение / обрезать" role="button" tabindex="0">`
-                        : `<div class="iig-quick-outfit-thumb" style="display:flex;align-items:center;justify-content:center;">
-                            <i class="fa-solid fa-shirt" style="color:#5a5252;"></i>
-                           </div>`
-                    }
-                    <div class="iig-quick-outfit-info">
-                        <div class="iig-quick-outfit-name">${escapeHtml(item.name)}</div>
-                        <div class="iig-quick-outfit-desc">${escapeHtml(item.description || 'Без описания')}</div>
-                    </div>
-                    ${item.id === activeId ? '<div class="iig-quick-outfit-badge"><i class="fa-solid fa-check"></i></div>' : ''}
+    const activeItem = allItems.find(i => i.id === activeId) || null;
+    const items = filterWardrobeItems(allItems, iigWardrobeFilter);
+    const imgSrc = item => `data:${detectMimeType(item.imageData)};base64,${item.imageData}`;
+
+    const toolbar = `
+        <div class="iig-wardrobe-toolbar">
+            <input type="search" class="text_pole iig-wardrobe-search" placeholder="Поиск по названию и описанию" aria-label="Поиск одежды" value="${escapeHtml(iigWardrobeFilter.search)}">
+            <details class="iig-wardrobe-filter">
+                <summary title="Категория"><i class="fa-solid fa-filter" aria-hidden="true"></i><span>${escapeHtml(iigWardrobeFilter.category === 'all' ? 'Все' : (WARDROBE_CATEGORIES[iigWardrobeFilter.category] || 'Все'))}</span></summary>
+                <div class="iig-wardrobe-filter-menu" role="radiogroup" aria-label="Категория">
+                    ${[['all', 'Все категории'], ...Object.entries(WARDROBE_CATEGORIES)].map(([key, label]) => `
+                        <label><input type="radio" name="iig_wardrobe_cat" value="${key}" ${iigWardrobeFilter.category === key ? 'checked' : ''}> ${escapeHtml(label)}</label>`).join('')}
                 </div>
-            `).join('')}
-        </div>
-    `;
-    
-    content.innerHTML = html;
-    
-    // Add click handlers
-    content.querySelectorAll('.iig-quick-outfit-item').forEach(itemEl => {
-        const thumb = itemEl.querySelector('img');
-        thumb?.addEventListener('click', event => {
-            event.stopPropagation();
-            const item = settings.wardrobeItems.find(entry => entry.id === itemEl.dataset.id);
-            if (item) editSavedReferenceImage(item, () => renderWardrobeGrid(target));
-        });
-        thumb?.addEventListener('keydown', event => {
-            if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); thumb.click(); }
-        });
-        itemEl.addEventListener('click', () => {
-            const itemId = itemEl.dataset.id;
-            setActiveWardrobe(itemId, target);
-            updateFloatingButtonBadge();
+            </details>
+        </div>`;
+
+    const body = items.length === 0
+        ? `<div class="iig-no-outfits">
+                <i class="fa-solid fa-shirt" aria-hidden="true"></i>
+                <p>${allItems.length === 0 ? 'Нет нарядов в гардеробе' : 'Ничего не найдено'}</p>
+                ${allItems.length === 0 ? '<small>Добавьте одежду в настройках расширения</small>' : ''}
+           </div>`
+        : `<div class="iig-wardrobe-grid">${items.map(item => `
+            <div class="iig-wardrobe-card ${item.id === activeId ? 'iig-card-active' : ''}" data-id="${escapeHtml(item.id)}" role="button" tabindex="0" aria-pressed="${item.id === activeId}" title="${item.id === activeId ? 'Снять' : 'Надеть'}">
+                ${item.imageData
+                    ? `<img class="iig-wardrobe-card-img" src="${imgSrc(item)}" alt="${escapeHtml(item.name)}" title="Открыть / обрезать" tabindex="0">`
+                    : '<div class="iig-wardrobe-card-img iig-card-placeholder"><i class="fa-solid fa-shirt" aria-hidden="true"></i></div>'}
+                <div class="iig-wardrobe-card-body">
+                    <div class="iig-wardrobe-card-title">${escapeHtml(item.name)}</div>
+                    <div class="iig-wardrobe-card-category">${escapeHtml(WARDROBE_CATEGORIES[item.category] || WARDROBE_CATEGORIES.full)}</div>
+                </div>
+                ${item.id === activeId ? '<div class="iig-card-check" aria-hidden="true"><i class="fa-solid fa-check"></i></div>' : ''}
+            </div>`).join('')}
+           </div>`;
+
+    const footer = `
+        <div class="iig-wardrobe-footer">
+            <span class="iig-footer-label">Сейчас надето:</span>
+            ${activeItem
+                ? `${activeItem.imageData ? `<img src="${imgSrc(activeItem)}" alt="">` : ''}
+                   <span class="iig-footer-name">${escapeHtml(activeItem.name)}</span>
+                   <button type="button" class="menu_button iig-footer-clear" title="Снять" aria-label="Снять одежду"><i class="fa-solid fa-xmark"></i></button>`
+                : '<span class="iig-footer-name iig-footer-empty">ничего</span>'}
+        </div>`;
+
+    content.innerHTML = toolbar + body + footer;
+    bindWardrobeToolbar(content);
+    bindWardrobeCards(content, target, activeItem);
+}
+
+function filterWardrobeItems(items, filter) {
+    const category = filter?.category || 'all';
+    const needle = String(filter?.search || '').trim().toLowerCase();
+    return items.filter(item => {
+        if (category !== 'all' && (item.category || 'full') !== category) return false;
+        if (!needle) return true;
+        return String(item.name || '').toLowerCase().includes(needle)
+            || String(item.description || '').toLowerCase().includes(needle);
+    });
+}
+
+function bindWardrobeToolbar(container) {
+    const search = container.querySelector('.iig-wardrobe-search');
+    search?.addEventListener('input', event => {
+        iigWardrobeFilter.search = event.target.value;
+        const caret = event.target.selectionStart;
+        renderQuickWardrobeList();
+        // Re-render replaces the input; restore focus and caret so typing is not interrupted.
+        const fresh = document.querySelector('#iig-wardrobe-content .iig-wardrobe-search');
+        if (fresh) {
+            fresh.focus();
+            try { fresh.setSelectionRange(caret, caret); } catch (_) { /* type=search may not support it */ }
+        }
+    });
+    container.querySelectorAll('input[name="iig_wardrobe_cat"]').forEach(radio => {
+        radio.addEventListener('change', () => {
+            iigWardrobeFilter.category = radio.value;
             renderQuickWardrobeList();
-            
-            const item = settings.wardrobeItems.find(i => i.id === itemId);
-            if (item) {
-                toastr.success(`Надет: ${item.name}`, 'Гардероб');
-            }
         });
+    });
+}
+
+function bindWardrobeCards(container, target, activeItem) {
+    const settings = getSettings();
+    const toggleItem = itemId => {
+        const wasActive = activeItem?.id === itemId;
+        // setActiveWardrobe toggles: same id → null.
+        setActiveWardrobe(itemId, target);
+        updateFloatingButtonBadge();
+        renderQuickWardrobeList();
+        const item = settings.wardrobeItems.find(i => i.id === itemId);
+        if (item) toastr[wasActive ? 'info' : 'success'](`${wasActive ? 'Снят' : 'Надет'}: ${item.name}`, 'Гардероб');
+    };
+
+    container.querySelectorAll('.iig-wardrobe-card').forEach(card => {
+        const itemId = card.dataset.id;
+        const img = card.querySelector('img.iig-wardrobe-card-img');
+        img?.addEventListener('click', event => {
+            event.stopPropagation();
+            const item = settings.wardrobeItems.find(i => i.id === itemId);
+            if (item) editSavedReferenceImage(item, renderQuickWardrobeList);
+        });
+        img?.addEventListener('keydown', event => {
+            if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); event.stopPropagation(); img.click(); }
+        });
+        card.addEventListener('click', () => toggleItem(itemId));
+        card.addEventListener('keydown', event => {
+            if (event.target !== card) return;
+            if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); toggleItem(itemId); }
+        });
+    });
+
+    container.querySelector('.iig-footer-clear')?.addEventListener('click', () => {
+        if (activeItem) toggleItem(activeItem.id);
     });
 }

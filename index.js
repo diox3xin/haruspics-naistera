@@ -89,10 +89,6 @@ const defaultSettings = Object.freeze({
     defaultStyle: '',
     aspectRatio: '1:1',
     imageSize: '1K',
-    chatImageConfig: 'auto', // auto: OpenRouter only; enabled: explicit compatible provider
-    imageDefaults: {},
-    newImagePlacement: 'block',
-    fusionTheme: {},
     npcReferences: [],
     characterReferenceLibrary: {
         characters: {},
@@ -105,7 +101,6 @@ const defaultSettings = Object.freeze({
     wardrobeSendMode: 'both', // 'both', 'text', 'none'
     activeWardrobeChar: null,
     activeWardrobeUser: null,
-    wornByEntity: {},
     injectWardrobeToChat: true,
     wardrobeInjectionDepth: 1,
     wardrobeDescEndpoint: '',
@@ -269,7 +264,7 @@ function getSettings() {
     if (s.apiType === 'novelai-custom') s.apiType = 'novelai-direct';
     for (const key of Object.keys(defaultSettings)) {
         if (!Object.hasOwn(s, key)) {
-            s[key] = structuredClone(defaultSettings[key]);
+            s[key] = defaultSettings[key];
         }
     }
     if (!s.characterReferenceLibrary || typeof s.characterReferenceLibrary !== 'object') {
@@ -284,7 +279,6 @@ function getSettings() {
     // Migrate wardrobe items without description
     for (const item of (s.wardrobeItems || [])) {
         if (!Object.hasOwn(item, 'description')) item.description = '';
-        item.transferRules = normalizeTransferRules(item.transferRules);
     }
     if (!Array.isArray(s.styleGalleryItems)) s.styleGalleryItems = [];
     if (!Array.isArray(s.activeStyleIds)) s.activeStyleIds = [];
@@ -300,7 +294,7 @@ function getSettings() {
     if (!s.promptInstructionItems.some(item => item.id === s.activePromptInstructionId)) s.activePromptInstructionId = 'builtin-image';
     if (!Number.isFinite(Number(s.promptGenMaxTokens))) s.promptGenMaxTokens = 700;
     if (!Number.isFinite(Number(s.promptGenTemperature))) s.promptGenTemperature = 0.7;
-    for (const npc of (s.npcReferences || [])) {
+        for (const npc of (s.npcReferences || [])) {
         ensureNpcDefaults(npc);
 
         // миграция старого одиночного outfit -> новый массив outfits
@@ -315,7 +309,6 @@ function getSettings() {
             npc.activeOutfitId = npc.outfits[0].id;
         }
     }
-    for (const item of (s.hairstyleItems || [])) item.transferRules = normalizeTransferRules(item.transferRules);
     return s;
 }
 
@@ -391,9 +384,7 @@ function makeCharacterLibraryEntry(raw = {}) {
     const primary = raw.primary && typeof raw.primary === 'object' ? raw.primary : {};
     const appearanceItems = Array.isArray(raw.appearanceItems) ? raw.appearanceItems : [];
     return {
-        ...raw,
         displayName: String(raw.displayName || '').trim(),
-        aliases: Array.isArray(raw.aliases) ? raw.aliases.map(String) : [],
         primary: {
             enabled: primary.enabled !== false,
             imageData: String(primary.imageData || ''),
@@ -419,10 +410,7 @@ function getCharacterLibraryEntry(kind, key, settings = getSettings(), create = 
         bucket[normalizedKey] = makeCharacterLibraryEntry();
     }
     if (!bucket[normalizedKey]) return null;
-    // Preserve object identity: open editors hold this object while collectors run.
-    if (!bucket[normalizedKey].primary || !Array.isArray(bucket[normalizedKey].appearanceItems)) {
-        Object.assign(bucket[normalizedKey], makeCharacterLibraryEntry(bucket[normalizedKey]));
-    }
+    bucket[normalizedKey] = makeCharacterLibraryEntry(bucket[normalizedKey]);
     return bucket[normalizedKey];
 }
 
@@ -448,15 +436,11 @@ function readLibraryFileAsBase64(file) {
     });
 }
 
-async function collectCharacterLibraryReferences(kind, settings = getSettings(), prompt = '') {
+async function collectCharacterLibraryReferences(kind, settings = getSettings()) {
     if (!settings.characterLibraryEnabled) return { refs: [], descriptions: [], hasPrimary: false };
     const entity = getCurrentLibraryEntity(kind, settings);
     const entry = getCharacterLibraryEntry(kind, entity.key, settings, false);
     if (!entry) return { refs: [], descriptions: [], hasPrimary: false };
-    if (entry.sceneOnly && ![entry.displayName || entity.title, ...(entry.aliases || [])].some(name => nameAppearsInPrompt(name, prompt))) {
-        return { refs: [], descriptions: [], hasPrimary: true };
-    }
-    entity.title = entry.displayName || (kind === 'user' ? SillyTavern.getContext().name1 : '') || entity.title;
 
     const refs = [];
     const descriptions = [];
@@ -632,9 +616,7 @@ function getPromptGenerationContext(message, instruction) {
 
 async function generateImagePromptForMessage(messageId, signal) {
     const context = SillyTavern.getContext();
-    const guard = createFusionMessageGuard(messageId, signal);
     const message = context.chat?.[messageId];
-    const swipe = message?.swipe_id;
     if (!message) throw new Error('Сообщение не найдено');
     const settings = getSettings();
     const instruction = getActivePromptInstruction();
@@ -660,8 +642,6 @@ async function generateImagePromptForMessage(messageId, signal) {
     const result = await response.json();
     const prompt = result.choices?.[0]?.message?.content?.trim();
     if (!prompt) throw new Error('Модель промпта вернула пустой ответ');
-    guard.assert();
-    assertFusionMessageCurrent(context.chat, messageId, message, swipe, signal);
 
     if (!message.extra || typeof message.extra !== 'object') message.extra = {};
     message.extra.iig_prompt_block = {
@@ -678,64 +658,19 @@ async function generateImagePromptForMessage(messageId, signal) {
 
 async function generateImageFromPromptBlock(messageId, panel, signal) {
     const context = SillyTavern.getContext();
-    const guard = createFusionMessageGuard(messageId, signal);
     const message = context.chat?.[messageId];
     const state = message?.extra?.iig_prompt_block;
-    const swipe = message?.swipe_id;
     if (!message || !state?.prompt) throw new Error('Сначала сгенерируйте или введите промпт');
-    const placement = state.imagePath ? 'block' : (getSettings().newImagePlacement === 'inline' ? 'inline' : 'block');
     const status = panel?.querySelector('.iig-prompt-status');
-    const refs = await collectReferenceImages(state.prompt);
-    guard.assert();
-    const requested = resolveImageOptions(getSettings(), state.imageOptions || {});
-    const dataUrl = await generateImageWithRetry(state.prompt, state.style ?? buildEffectiveStyle(''), text => {
+    const refs = await collectReferenceImages(state.prompt).catch(() => ({ imageRefs: [], textOnlyClothing: [], warnings: [] }));
+    const dataUrl = await generateImageWithRetry(state.prompt, buildEffectiveStyle(''), text => {
         if (status) status.textContent = text;
-    }, { ...requested, negativePrompt: state.negativePrompt ?? getActiveNegativePrompt(), refData: refs, signal });
-    assertFusionMessageCurrent(context.chat, messageId, message, swipe, signal);
-    guard.assert();
+    }, { negativePrompt: getActiveNegativePrompt() || state.negativePrompt, refData: refs, signal });
     if (status) status.textContent = 'Сохранение...';
-    const imagePath = await saveImageToFile(dataUrl);
-    assertFusionMessageCurrent(context.chat, messageId, message, swipe, signal);
-    guard.assert();
-    // Never move an existing block image when the global placement changes.
-    if (placement === 'inline') {
-        const tag = { prompt: state.prompt, style: state.style, negativePrompt: state.negativePrompt, ...requested };
-        message.mes += '\n' + buildGeneratedImageTag(tag, imagePath);
-        const text = panel?.closest('.mes')?.querySelector('.mes_text');
-        if (text) {
-            const image = document.createElement('img'); image.src = imagePath; image.alt = state.prompt;
-            text.appendChild(image); // Append only our image; do not reformat foreign content.
-        }
-        state.lastInlineImagePath = imagePath;
-    } else state.imagePath = imagePath;
-    state.requested = { aspectRatio: requested.aspectRatio, imageSize: requested.imageSize, size: requested.size, quality: requested.quality };
-    state.references = (refs.imageRefs || []).map(ref => `${ref.name}: ${ref.type}`);
+    state.imagePath = await saveImageToFile(dataUrl);
     state.updatedAt = Date.now();
     await context.saveChat();
     return state;
-}
-
-function assertFusionMessageCurrent(chat, id, message, swipe, signal) {
-    const current = SillyTavern.getContext();
-    if (signal?.aborted || current.chat !== chat || current.chat?.[id] !== message || message.swipe_id !== swipe) {
-        throw new Error('Запрос отменён: чат или свайп изменился. Старое изображение сохранено.');
-    }
-}
-
-// Capture the array itself: ST may reuse a context object while replacing its chat.
-function createFusionMessageGuard(messageId, signal) {
-    const chat = SillyTavern.getContext().chat;
-    const message = chat?.[messageId];
-    const swipe = message?.swipe_id;
-    let text = message?.mes;
-    const current = () => {
-        const now = SillyTavern.getContext();
-        return !signal?.aborted && now.chat === chat && now.chat?.[messageId] === message &&
-            message?.swipe_id === swipe && message?.mes === text;
-    };
-    current.assert = () => { if (!current()) throw new Error('Запрос отменён: сообщение, чат или свайп изменился.'); };
-    current.accept = () => { text = message.mes; };
-    return current;
 }
 
 // ============================================================
@@ -1075,27 +1010,6 @@ function restorePromptInstruction(itemId) {
 // WARDROBE SYSTEM
 // ============================================================
 
-// Rules concern the SOURCE outfit, never removal of traits from the TARGET.
-const TRANSFER_TRAITS = { tattoos: 'татуировки', scars: 'шрамы', jewelry: 'украшения', face: 'лицо', hair: 'причёску', body: 'телосложение', background: 'фон', pose: 'позу' };
-function normalizeTransferRules(raw = {}) {
-    if (!raw || typeof raw !== 'object') raw = {};
-    const allowed = Object.keys(TRANSFER_TRAITS);
-    return {
-        ignore: [...new Set((Array.isArray(raw.ignore) ? raw.ignore : []).filter(key => allowed.includes(key)))],
-        preserve: [...new Set((Array.isArray(raw.preserve) ? raw.preserve : []).filter(key => ['face', 'body', 'tattoos', 'hair'].includes(key)))],
-    };
-}
-
-function buildTransferDirective(rules, name) {
-    const { ignore, preserve } = normalizeTransferRules(rules);
-    if (!ignore.length && !preserve.length) return '';
-    const traits = { tattoos: 'tattoos', scars: 'scars', jewelry: 'jewelry', face: 'face', hair: 'hairstyle', body: 'body shape and proportions', background: 'background', pose: 'pose' };
-    return `[OUTFIT TRANSFER for ${name || 'target character'}]\n` +
-        (ignore.length ? `Do not copy ${ignore.map(key => traits[key]).join(', ')} from the SOURCE clothing reference. This does NOT remove these traits from the TARGET character.\n` : '') +
-        (preserve.length ? `Preserve the TARGET character's ${preserve.map(key => traits[key]).join(', ')} from their appearance description and character reference, not from the source outfit.\n` : '') +
-        'These transfer rules override conflicting source outfit details. Fit the garment to the target body; never reshape the target to fit the source.';
-}
-
 function addWardrobeItem(name, imageData, target = 'char') {
     const settings = getSettings();
     const item = {
@@ -1142,18 +1056,14 @@ function removeHairstyleItem(itemId) {
 function setActiveHairstyle(itemId, target) {
     const settings = getSettings();
     const key = target === 'char' ? 'activeHairstyleChar' : 'activeHairstyleUser';
-    const slot = getFusionWornSlot(target);
-    slot.hair = getActiveHairstyleItem(target)?.id === itemId ? null : itemId;
-    settings[key] = slot.hair;
+    settings[key] = settings[key] === itemId ? null : itemId;
     saveSettings();
 }
 
 function getActiveHairstyleItem(target) {
     const settings = getSettings();
-    const slot = getFusionWornSlot(target);
-    const activeId = Object.hasOwn(slot, 'hair') ? slot.hair : settings[target === 'char' ? 'activeHairstyleChar' : 'activeHairstyleUser'];
-    const item = activeId ? settings.hairstyleItems?.find(i => i.id === activeId) : null;
-    return item && (!item.ownerId || item.ownerId === `${target}:${getCurrentLibraryEntity(target, settings).key}`) ? item : null;
+    const activeId = settings[target === 'char' ? 'activeHairstyleChar' : 'activeHairstyleUser'];
+    return activeId ? (settings.hairstyleItems?.find(i => i.id === activeId) || null) : null;
 }
 
 function updateHairstyleItemDescription(itemId, description) {
@@ -1217,35 +1127,15 @@ function removeWardrobeItem(itemId) {
 function setActiveWardrobe(itemId, target) {
     const settings = getSettings();
     const key = target === 'char' ? 'activeWardrobeChar' : 'activeWardrobeUser';
-    const slot = getFusionWornSlot(target);
-    slot.outfit = getActiveWardrobeItem(target)?.id === itemId ? null : itemId;
-    settings[key] = slot.outfit;
+    settings[key] = settings[key] === itemId ? null : itemId;
     saveSettings();
     updateWardrobeInjection();
 }
 
 function getActiveWardrobeItem(target) {
     const settings = getSettings();
-    const slot = getFusionWornSlot(target);
-    const activeId = Object.hasOwn(slot, 'outfit') ? slot.outfit : settings[target === 'char' ? 'activeWardrobeChar' : 'activeWardrobeUser'];
-    const item = activeId ? settings.wardrobeItems.find(i => i.id === activeId) : null;
-    return item && (!item.ownerId || item.ownerId === `${target}:${getCurrentLibraryEntity(target, settings).key}`) ? item : null;
-}
-
-function getFusionWornSlot(target) {
-    const settings = getSettings();
-    const id = `${target}:${getCurrentLibraryEntity(target, settings).key}`;
-    settings.wornByEntity ||= {};
-    if (!Object.hasOwn(settings.wornByEntity, id)) {
-        // Snapshot legacy selections on first use, without deleting their fields.
-        const outfit = settings.wardrobeItems.find(item => item.id === settings[target === 'char' ? 'activeWardrobeChar' : 'activeWardrobeUser']);
-        const hair = settings.hairstyleItems.find(item => item.id === settings[target === 'char' ? 'activeHairstyleChar' : 'activeHairstyleUser']);
-        settings.wornByEntity[id] = {
-            outfit: outfit && (!outfit.ownerId || outfit.ownerId === id) ? outfit.id : null,
-            hair: hair && (!hair.ownerId || hair.ownerId === id) ? hair.id : null,
-        };
-    }
-    return settings.wornByEntity[id];
+    const activeId = settings[target === 'char' ? 'activeWardrobeChar' : 'activeWardrobeUser'];
+    return activeId ? (settings.wardrobeItems.find(i => i.id === activeId) || null) : null;
 }
 
 function updateWardrobeItemDescription(itemId, description) {
@@ -1300,21 +1190,15 @@ async function generateWardrobeDescription(itemId) {
 
 function ensureNpcDefaults(npc) {
     if (!npc) return;
-    if (!npc.id) npc.id = `npc_${Date.now()}_${Math.random().toString(36).slice(2)}`;
     if (!Object.hasOwn(npc, 'appearance')) npc.appearance = '';
     if (!Object.hasOwn(npc, 'outfit')) npc.outfit = '';
     if (!Array.isArray(npc.outfits)) npc.outfits = [];
     if (!Object.hasOwn(npc, 'activeOutfitId')) npc.activeOutfitId = null;
-    if (!Array.isArray(npc.aliases)) npc.aliases = [];
-    if (!Object.hasOwn(npc, 'appearanceEnabled')) npc.appearanceEnabled = true;
-    if (!Array.isArray(npc.hairstyles)) npc.hairstyles = [];
 
     for (const outfit of npc.outfits) {
         if (!Object.hasOwn(outfit, 'description')) outfit.description = '';
         if (!Object.hasOwn(outfit, 'imageData')) outfit.imageData = null;
-        outfit.transferRules = normalizeTransferRules(outfit.transferRules);
     }
-    for (const hairstyle of npc.hairstyles) hairstyle.transferRules = normalizeTransferRules(hairstyle.transferRules);
 }
 
 async function generateVisionDescriptionFromImage(imageData, promptText) {
@@ -1591,7 +1475,7 @@ function initCollapsibleSections() {
 function nameAppearsInPrompt(name, prompt) {
     if (!name || !prompt) return false;
     const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const regex = new RegExp(`(?:^|[^\\p{L}\\p{N}_])${escaped}(?=$|[^\\p{L}\\p{N}_])`, 'iu');
+    const regex = new RegExp(`\\b${escaped}\\b`, 'i');
     return regex.test(prompt);
 }
 
@@ -1622,8 +1506,8 @@ async function collectReferenceImages(prompt) {
     const charName = context.characters?.[context.characterId]?.name || null;
     const userName = context.name1 || null;
 
-    const characterLibrary = await collectCharacterLibraryReferences('char', settings, prompt);
-    const userLibrary = await collectCharacterLibraryReferences('user', settings, prompt);
+    const characterLibrary = await collectCharacterLibraryReferences('char', settings);
+    const userLibrary = await collectCharacterLibraryReferences('user', settings);
     textDirectives.push(...characterLibrary.descriptions, ...userLibrary.descriptions);
 
     // ===== STEP 1: Collect face references (HIGHEST PRIORITY) =====
@@ -1670,8 +1554,7 @@ async function collectReferenceImages(prompt) {
         for (const npc of settings.npcReferences) {
             ensureNpcDefaults(npc);
             if (!npc.enabled || !npc.name) continue;
-            if (npc.parentKey && npc.parentKey !== getCurrentCharacterLibraryKey()) continue;
-            if (![npc.name, ...(npc.aliases || [])].some(name => nameAppearsInPrompt(name, prompt))) continue;
+            if (!nameAppearsInPrompt(npc.name, prompt)) continue;
 
             if (npc.imageData) {
                 faceRefs.push({
@@ -1683,13 +1566,12 @@ async function collectReferenceImages(prompt) {
                 iigLog('INFO', `Face ref: NPC "${npc.name}" added (${Math.round(npc.imageData.length / 1024)}KB)`);
             }
 
-            if (npc.appearance && npc.appearanceEnabled !== false) {
+            if (npc.appearance) {
                 textDirectives.push(`[CHARACTER APPEARANCE for "${npc.name}"]: ${npc.appearance}`);
             }
 
-            const activeNpcOutfit = settings.wardrobeSendMode === 'none' ? null : getActiveNpcOutfit(npc);
-            if (activeNpcOutfit?.transferRules) textDirectives.push(buildTransferDirective(activeNpcOutfit.transferRules, npc.name));
-            if (activeNpcOutfit?.imageData && settings.wardrobeSendMode !== 'text') {
+            const activeNpcOutfit = getActiveNpcOutfit(npc);
+            if (activeNpcOutfit?.imageData) {
                 clothingRefs.push({
                     data: activeNpcOutfit.imageData,
                     mimeType: detectMimeType(activeNpcOutfit.imageData),
@@ -1700,16 +1582,8 @@ async function collectReferenceImages(prompt) {
                 });
             } else if (activeNpcOutfit?.description) {
                 textDirectives.push(`[CLOTHING INSTRUCTION for "${npc.name}"]: ${npc.name} is wearing: ${activeNpcOutfit.description}`);
-            } else if (npc.outfit && settings.wardrobeSendMode !== 'none') {
+            } else if (npc.outfit) {
                 textDirectives.push(`[CLOTHING INSTRUCTION for "${npc.name}"]: ${npc.name} is wearing: ${npc.outfit}`);
-            }
-            const hair = npc.hairstyles?.find(item => item.id === npc.activeHairstyleId);
-            if (hair && settings.hairstyleSendMode !== 'none') {
-                if (hair.description) textDirectives.push(`[HAIRSTYLE for ${npc.name}]: ${hair.description}`);
-                if (hair.transferRules) textDirectives.push(buildTransferDirective(hair.transferRules, npc.name));
-                if (hair.imageData && settings.hairstyleSendMode !== 'text' && !['novelai', 'novelai-direct'].includes(settings.apiType)) {
-                    clothingRefs.push({ data: hair.imageData, mimeType: detectMimeType(hair.imageData), name: npc.name, type: 'hairstyle', description: hair.description || '' });
-                }
             }
         }
     }
@@ -1722,7 +1596,6 @@ async function collectReferenceImages(prompt) {
         const outfit = getActiveWardrobeItem(target);
         const wardrobeMode = settings.wardrobeSendMode || 'both';
         if (outfit && wardrobeMode !== 'none') {
-            if (outfit.transferRules) textDirectives.push(buildTransferDirective(outfit.transferRules, name));
             if (outfit.imageData && wardrobeMode === 'both' && !textOnlyProvider) {
                 clothingRefs.push({
                     data: outfit.imageData, mimeType: detectMimeType(outfit.imageData),
@@ -1738,7 +1611,6 @@ async function collectReferenceImages(prompt) {
         const hairstyle = getActiveHairstyleItem(target);
         const hairMode = settings.hairstyleSendMode || 'both';
         if (hairstyle && hairMode !== 'none') {
-            if (hairstyle.transferRules) textDirectives.push(buildTransferDirective(hairstyle.transferRules, name));
             if (hairstyle.description?.trim()) {
                 textDirectives.push(`[HAIRSTYLE INSTRUCTION for "${name}"]: ${hairstyle.description}`);
             }
@@ -2035,7 +1907,6 @@ async function generateImageNovelAI(prompt, style, refData = {}, options = {}) {
     const ratio = String(options.aspectRatio || '');
     let width = Number(settings.novelaiWidth);
     let height = Number(settings.novelaiHeight);
-    if (/^\d+x\d+$/.test(options.size || '')) [width, height] = options.size.split('x').map(Number);
     if (/^\d+:\d+$/.test(ratio)) {
         const [w, h] = ratio.split(':').map(Number);
         if (w > 0 && h > 0 && w / h >= 0.4 && w / h <= 2.5) {
@@ -2139,8 +2010,13 @@ async function generateImageOpenAI(prompt, style, refData, options = {}) {
 
     const fullPrompt = promptParts.join('\n\n');
 
-    const resolved = resolveImageOptions(settings, options);
-    const size = resolved.size;
+    let size = settings.size;
+    if (options.aspectRatio) {
+        if (options.aspectRatio === '16:9' || options.aspectRatio === '3:2') size = '1536x1024';
+        else if (options.aspectRatio === '9:16' || options.aspectRatio === '2:3') size = '1024x1536';
+        else if (options.aspectRatio === '1:1') size = '1024x1024';
+        else size = 'auto';
+    }
 
     const body = {
         model: settings.model,
@@ -2155,7 +2031,6 @@ async function generateImageOpenAI(prompt, style, refData, options = {}) {
     if (galleryNegative) body.negative_prompt = galleryNegative;
 
     if (size && size !== 'auto') body.size = size;
-    if (resolved.quality) body.quality = resolved.quality;
 
     // Send reference images via body.image (gpt-image-1 compatible)
     if (imageRefs.length === 1) {
@@ -2277,13 +2152,11 @@ function parseImageFromApiResponse(result) {
 
 async function generateImageOpenAIChat(prompt, style, refData, options = {}) {
     const settings = getSettings();
-    const resolved = resolveImageOptions(settings, options);
     const url = buildOpenAIUrl(settings.endpoint, 'chat/completions');
     const { imageRefs = [], textOnlyClothing = [], textDirectives = [] } = refData;
 
     const promptParts = [];
     promptParts.push('Generate an image from the following instruction. Return the generated image in the response.');
-    if (resolved.aspectRatio) promptParts.push(`Requested image aspect ratio: ${resolved.aspectRatio}.`);
     if (style) promptParts.push(`[Art Style: ${style}]`);
     for (const directive of textDirectives) promptParts.push(directive);
     for (const c of textOnlyClothing) promptParts.push(`[CLOTHING: ${c.charName} is wearing: ${c.description}]`);
@@ -2312,11 +2185,6 @@ async function generateImageOpenAIChat(prompt, style, refData, options = {}) {
         messages: [{ role: 'user', content }],
         modalities: ['image', 'text']
     };
-    if (getImageCapabilities(settings).imageConfig) {
-        body.image_config = {};
-        if (resolved.aspectRatio) body.image_config.aspect_ratio = resolved.aspectRatio;
-        if (resolved.imageSize) body.image_config.image_size = resolved.imageSize;
-    }
 
     iigLog('INFO', `OpenAI Chat/Router Request: model=${body.model}, refs=${imageRefs.length}, prompt=${fullPrompt.length} chars`);
 
@@ -2472,7 +2340,7 @@ async function generateImageGemini(prompt, style, refData, options = {}) {
         contents: [{ role: 'user', parts }],
         generationConfig: {
             responseModalities: ['TEXT', 'IMAGE'],
-            imageConfig: { aspectRatio, ...(getImageCapabilities(settings).resolution ? { imageSize } : {}) }
+            imageConfig: { aspectRatio, imageSize }
         }
     };
 
@@ -2529,66 +2397,6 @@ async function generateImageGemini(prompt, style, refData, options = {}) {
 // GENERATION WITH RETRY
 // ============================================================
 
-function getImageCapabilities(settings = getSettings()) {
-    const model = String(settings.model || '').toLowerCase();
-    const chat = settings.apiType === 'openai-chat' ||
-        (['gemini', 'openai'].includes(settings.apiType) && isRouterEndpoint(settings.endpoint));
-    let openRouter = false;
-    try { openRouter = new URL(settings.endpoint).hostname === 'openrouter.ai'; } catch { /* Unconfigured endpoint. */ }
-    const imageConfig = chat && (settings.chatImageConfig === 'enabled' || (settings.chatImageConfig !== 'disabled' && openRouter));
-    const gemini = settings.apiType === 'gemini' && !chat;
-    const novelai = ['novelai', 'novelai-direct'].includes(settings.apiType);
-    const images = settings.apiType === 'openai' && !chat;
-    const gpt = images && model.includes('gpt-image');
-    const dalle3 = images && model.includes('dall-e-3');
-    const dalle2 = images && model.includes('dall-e-2');
-    return {
-        chat, imageConfig, gemini, novelai, images,
-        resolution: (gemini || imageConfig) && !model.includes('2.5-flash'),
-        sizes: gpt ? ['1024x1024', '1536x1024', '1024x1536'] : dalle3 ? ['1024x1024', '1792x1024', '1024x1792'] : dalle2 ? ['256x256', '512x512', '1024x1024'] : [],
-        qualities: gpt ? ['auto', 'low', 'medium', 'high'] : dalle3 ? ['standard', 'hd'] : [],
-        warning: chat && !imageConfig ? 'Chat API: пропорции передаются только текстом, точный размер не гарантирован. image_config включайте только при поддержке вашим сервисом.' :
-            novelai ? 'NovelAI: размеры кратны 64; повышенное разрешение может увеличить стоимость. Референсы используются только как текст.' :
-            settings.apiType === 'naistera' ? 'Naistera: передаются пропорции; разрешение и API-качество этим адаптером не задаются.' :
-            'Поддержка параметров зависит от модели и сервиса. 2K/4K — не апскейл; стоимость и время могут увеличиться.',
-    };
-}
-
-function resolveImageOptions(settings, overrides = {}) {
-    const caps = getImageCapabilities(settings);
-    const saved = settings.imageDefaults || {};
-    const result = { ...saved };
-    for (const [key, value] of Object.entries(overrides)) if (value !== '' && value != null) result[key] = value;
-    result.aspectRatio ||= settings.apiType === 'naistera' ? settings.naisteraAspectRatio :
-        (caps.gemini || caps.chat ? settings.aspectRatio : '');
-    result.imageSize ||= settings.imageSize || '1K';
-    result.size ||= caps.novelai ? `${settings.novelaiWidth}x${settings.novelaiHeight}` : settings.size;
-    result.quality ||= caps.qualities.includes(settings.quality) ? settings.quality : '';
-    if (result.aspectRatio && !/^\d+:\d+$/.test(result.aspectRatio)) throw new Error('Некорректное соотношение сторон');
-    if (result.aspectRatio) {
-        const [w, h] = result.aspectRatio.split(':').map(Number);
-        if (!w || !h) throw new Error('Пропорции должны быть больше нуля');
-        if (caps.images && caps.sizes.length) {
-            const exact = caps.sizes.find(size => { const [x, y] = size.split('x').map(Number); return x * h === y * w; });
-            if (!exact) throw new Error(`Модель не поддерживает точные пропорции ${result.aspectRatio}. Выберите доступный размер; 1536×1024 — это 3:2, не 16:9.`);
-            result.size = exact;
-        } else if (caps.images) {
-            throw new Error('Для неизвестной Images-модели задайте точный размер в пикселях вместо пропорций.');
-        }
-    }
-    if ((caps.images || caps.novelai) && result.size && result.size !== 'auto') {
-        if (!/^\d+x\d+$/.test(result.size)) throw new Error('Размер должен быть в формате 1024x1024');
-        const [w, h] = result.size.split('x').map(Number);
-        if (w < 64 || h < 64 || w > 8192 || h > 8192) throw new Error('Недопустимый размер изображения');
-        if (caps.sizes.length && !caps.sizes.includes(result.size)) throw new Error(`Доступные размеры: ${caps.sizes.join(', ')}`);
-        if (caps.novelai && (w % 64 || h % 64)) throw new Error('Размеры NovelAI должны быть кратны 64');
-    }
-    if (!caps.resolution) delete result.imageSize;
-    if (!caps.images && !caps.novelai) delete result.size;
-    if (!caps.qualities.includes(result.quality)) delete result.quality;
-    return result;
-}
-
 function validateSettings() {
     const settings = getSettings();
     const errors = [];
@@ -2612,7 +2420,6 @@ function validateSettings() {
 async function generateImageWithRetry(prompt, style, onStatusUpdate, options = {}) {
     validateSettings();
     const settings = getSettings();
-    options = { ...options, ...resolveImageOptions(settings, options) };
 
     // Use pre-collected refData or collect now
     let refData = options.refData;
@@ -2757,7 +2564,6 @@ async function parseImageTags(text, options = {}) {
                 style: data.style || '', prompt: data.prompt || '',
                 aspectRatio: data.aspect_ratio || data.aspectRatio || null,
                 imageSize: data.image_size || data.imageSize || null,
-                size: data.size || null,
                 quality: data.quality || null,
                 preset: data.preset || null,
                 negativePrompt: data.negative_prompt || data.negativePrompt || null,
@@ -2810,7 +2616,6 @@ async function parseImageTags(text, options = {}) {
                 style: data.style || '', prompt: data.prompt || '',
                 aspectRatio: data.aspect_ratio || data.aspectRatio || null,
                 imageSize: data.image_size || data.imageSize || null,
-                size: data.size || null,
                 quality: data.quality || null,
                 preset: data.preset || null,
                 negativePrompt: data.negative_prompt || data.negativePrompt || null,
@@ -2894,7 +2699,7 @@ function wrapImageWithRegen(img, messageId, tagIndex) {
 function buildGeneratedImageTag(tag, imagePath) {
     const instruction = JSON.stringify({
         prompt: tag.prompt, style: tag.style, aspect_ratio: tag.aspectRatio,
-        image_size: tag.imageSize, size: tag.size, quality: tag.quality, preset: tag.preset,
+        image_size: tag.imageSize, quality: tag.quality, preset: tag.preset,
         negative_prompt: tag.negativePrompt
     }).replace(/[&'<>]/g, char => '\\u' + char.charCodeAt(0).toString(16).padStart(4, '0'));
     return `<img class="iig-generated-image" data-iig-instruction='${instruction}' src="${escapeHtml(imagePath)}">`;
@@ -2980,22 +2785,13 @@ async function processMessageTags(messageId) {
     const context = SillyTavern.getContext();
     const settings = getSettings();
     if (!settings.enabled) return;
-    if (processingMessages.has(messageId) || activeAbortControllers.has(messageId) || activePromptAbortControllers.has(messageId)) return;
+    if (processingMessages.has(messageId)) return;
 
     const message = context.chat[messageId];
     if (!message || message.is_user) return;
 
-    const initialGuard = createFusionMessageGuard(messageId);
-    const tags = (await parseImageTags(message.mes, { checkExistence: true })).filter(tag => !getFusionTagBlock(message, tag));
-    if (!initialGuard() || processingMessages.has(messageId) || activeAbortControllers.has(messageId)) return;
+    const tags = await parseImageTags(message.mes, { checkExistence: true });
     if (tags.length === 0) return;
-    if (settings.newImagePlacement === 'block') {
-        const fresh = tags.filter(isFreshFusionTag);
-        if (fresh.length) {
-            await generateFusionTagBlocks(messageId, fresh);
-            return; // Missing legacy files remain inline; regenerate them explicitly.
-        }
-    }
 
     processingMessages.add(messageId);
     toastr.info(`Найдено тегов: ${tags.length}. Генерация...`, 'Генерация картинок', { timeOut: 3000 });
@@ -3007,7 +2803,6 @@ async function processMessageTags(messageId) {
 
     const abortController = new AbortController();
     activeAbortControllers.set(messageId, abortController);
-    const guard = createFusionMessageGuard(messageId, abortController.signal);
 
     // Collect references ONCE using all prompts
     const allPrompts = tags.map(t => t.prompt).join(' ');
@@ -3019,9 +2814,6 @@ async function processMessageTags(messageId) {
         iigLog('WARN', 'Failed to collect references:', e.message);
     }
 
-    if (!guard()) {
-        processingMessages.delete(messageId); activeAbortControllers.delete(messageId); return;
-    }
     // Prepare legacy tag placeholders via TreeWalker (DOM-safe)
     for (let i = 0; i < tags.length; i++) {
         const tag = tags[i];
@@ -3049,7 +2841,7 @@ async function processMessageTags(messageId) {
 
     // Sequential generation
     for (let index = 0; index < tags.length; index++) {
-        if (!guard()) break;
+        if (abortController.signal.aborted) break;
 
         const tag = tags[index];
         const tagId = `iig-${messageId}-${index}`;
@@ -3108,17 +2900,15 @@ async function processMessageTags(messageId) {
                 tag.prompt, tagStyle,
                 (s) => { if (statusEl) statusEl.textContent = s; },
                 {
-                    aspectRatio: tag.aspectRatio, imageSize: tag.imageSize, size: tag.size, quality: tag.quality,
+                    aspectRatio: tag.aspectRatio, imageSize: tag.imageSize, quality: tag.quality,
                     preset: tag.preset, negativePrompt: tag.negativePrompt,
                     refData: sharedRefData,
                     signal: abortController.signal
                 }
             );
 
-            guard.assert();
             if (statusEl) statusEl.textContent = 'Сохранение...';
             const imagePath = await saveImageToFile(dataUrl);
-            guard.assert();
 
             const img = document.createElement('img');
             img.className = 'iig-generated-image';
@@ -3135,23 +2925,15 @@ async function processMessageTags(messageId) {
             loadingPlaceholder.replaceWith(wrapped);
 
             message.mes = message.mes.replace(tag.fullMatch, buildGeneratedImageTag(tag, imagePath));
-            guard.accept();
-            await context.saveChat();
 
             toastr.success(`Картинка ${index + 1}/${tags.length} готова`, 'Генерация картинок', { timeOut: 2000 });
         } catch (error) {
             iigLog('ERROR', `Failed to generate image for tag ${index}:`, error.message);
-            if (!guard()) {
-                if (targetElement) loadingPlaceholder.replaceWith(targetElement);
-                else loadingPlaceholder.remove();
-                break;
-            }
 
             const errorPlaceholder = createErrorPlaceholder(tagId, error.message, tag);
             loadingPlaceholder.replaceWith(errorPlaceholder);
 
             message.mes = message.mes.replace(tag.fullMatch, buildGeneratedImageTag(tag, ERROR_IMAGE_PATH));
-            guard.accept();
 
             if (abortController.signal.aborted) {
                 toastr.warning('Генерация отменена', 'Генерация картинок');
@@ -3163,7 +2945,7 @@ async function processMessageTags(messageId) {
 
     processingMessages.delete(messageId);
     activeAbortControllers.delete(messageId);
-    if (guard()) await context.saveChat();
+    await context.saveChat();
 
     // Do not rebuild .mes_text here. ExtBlocks may expose its generated
     // content through extra.display_text and Horae mounts panels beside it.
@@ -3185,9 +2967,8 @@ async function regenerateSingleImage(messageId, tagIndex) {
     const message = context.chat[messageId];
     if (!message) { toastr.error('Сообщение не найдено'); return; }
 
-    const initialGuard = createFusionMessageGuard(messageId);
     const tags = await parseImageTags(message.mes, { forceAll: true });
-    if (!initialGuard() || processingMessages.has(messageId) || activeAbortControllers.has(messageId)) return;
+    if (processingMessages.has(messageId)) return;
     if (!tags[tagIndex]) { toastr.error('Тег не найден'); return; }
     const tag = tags[tagIndex];
 
@@ -3207,7 +2988,6 @@ async function regenerateSingleImage(messageId, tagIndex) {
 
     const abortController = new AbortController();
     activeAbortControllers.set(messageId, abortController);
-    const guard = createFusionMessageGuard(messageId, abortController.signal);
     const lp = createLoadingPlaceholder(`iig-single-${messageId}-${tagIndex}`, () => abortController.abort());
     targetEl.replaceWith(lp);
     const statusEl = lp.querySelector('.iig-status');
@@ -3218,16 +2998,13 @@ async function regenerateSingleImage(messageId, tagIndex) {
     }
 
     try {
-        guard.assert();
         const dataUrl = await generateImageWithRetry(
             tag.prompt, tagStyle,
             (s) => { if (statusEl) statusEl.textContent = s; },
-                { aspectRatio: tag.aspectRatio, imageSize: tag.imageSize, size: tag.size, quality: tag.quality, preset: tag.preset, negativePrompt: tag.negativePrompt, refData, signal: abortController.signal }
+                { aspectRatio: tag.aspectRatio, imageSize: tag.imageSize, quality: tag.quality, preset: tag.preset, negativePrompt: tag.negativePrompt, refData, signal: abortController.signal }
         );
-        guard.assert();
         if (statusEl) statusEl.textContent = 'Сохранение...';
         const imagePath = await saveImageToFile(dataUrl);
-        guard.assert();
 
         const img = document.createElement('img');
         img.className = 'iig-generated-image';
@@ -3240,7 +3017,6 @@ async function regenerateSingleImage(messageId, tagIndex) {
         lp.replaceWith(wrapped);
 
         message.mes = message.mes.replace(tag.fullMatch, buildGeneratedImageTag(tag, imagePath));
-        guard.accept();
         await context.saveChat();
         toastr.success('Картинка перегенерирована', 'Генерация картинок', { timeOut: 2000 });
     } catch (error) {
@@ -3251,7 +3027,7 @@ async function regenerateSingleImage(messageId, tagIndex) {
     } finally {
         processingMessages.delete(messageId);
         activeAbortControllers.delete(messageId);
-        if (guard()) await restoreImageRegenButtons(messageElement, messageId);
+        await restoreImageRegenButtons(messageElement, messageId);
     }
 }
 
@@ -3264,9 +3040,7 @@ async function regenerateMessageImages(messageId) {
     const message = context.chat[messageId];
     if (!message) { toastr.error('Сообщение не найдено'); return; }
 
-    const initialGuard = createFusionMessageGuard(messageId);
     const tags = await parseImageTags(message.mes, { forceAll: true });
-    if (!initialGuard() || processingMessages.has(messageId) || activeAbortControllers.has(messageId)) return;
     if (tags.length === 0) { toastr.warning('Нет тегов для перегенерации'); return; }
 
     const settings = getSettings();
@@ -3279,7 +3053,6 @@ async function regenerateMessageImages(messageId) {
 
     const abortController = new AbortController();
     activeAbortControllers.set(messageId, abortController);
-    const guard = createFusionMessageGuard(messageId, abortController.signal);
 
     // Shared references
     const allPrompts = tags.map(t => t.prompt).join(' ');
@@ -3295,7 +3068,6 @@ async function regenerateMessageImages(messageId) {
 
     for (let index = 0; index < tags.length; index++) {
         if (abortController.signal.aborted) break;
-        try { guard.assert(); } catch (error) { toastr.warning(error.message); break; }
 
         const tag = tags[index];
         const tagStyle = buildEffectiveStyle(tag.style);
@@ -3304,12 +3076,10 @@ async function regenerateMessageImages(messageId) {
         if (!targetEl) { iigLog('WARN', `No matching element for tag ${index}`); continue; }
 
         const innerImg = targetEl.querySelector?.('img[data-iig-instruction]') || targetEl;
-        let lp;
 
         try {
-            guard.assert();
             const instruction = innerImg.getAttribute?.('data-iig-instruction');
-            lp = createLoadingPlaceholder(`iig-regen-${messageId}-${index}`, () => abortController.abort());
+            const lp = createLoadingPlaceholder(`iig-regen-${messageId}-${index}`, () => abortController.abort());
             targetEl.replaceWith(lp);
             const statusEl = lp.querySelector('.iig-status');
 
@@ -3319,7 +3089,6 @@ async function regenerateMessageImages(messageId) {
                 {
                     aspectRatio: tag.aspectRatio,
                     imageSize: tag.imageSize,
-                    size: tag.size,
                     quality: tag.quality,
                     preset: tag.preset,
                     negativePrompt: tag.negativePrompt,
@@ -3327,11 +3096,9 @@ async function regenerateMessageImages(messageId) {
                     signal: abortController.signal
                 }
             );
-            guard.assert();
 
             if (statusEl) statusEl.textContent = 'Сохранение...';
             const imagePath = await saveImageToFile(dataUrl);
-            guard.assert();
 
             const img = document.createElement('img');
             img.className = 'iig-generated-image';
@@ -3342,21 +3109,18 @@ async function regenerateMessageImages(messageId) {
             const wrapped = wrapImageWithRegen(img, messageId, index);
             lp.replaceWith(wrapped);
 
-            message.mes = message.mes.replace(tag.fullMatch, buildGeneratedImageTag(tag, imagePath));
-            guard.accept();
-            await context.saveChat();
+            message.mes = message.mes.replace(tag.fullMatch, tag.fullMatch.replace(/src\s*=\s*(['"])[^'"]*\1/i, `src="${imagePath}"`));
             toastr.success(`Картинка ${index + 1}/${tags.length} готова`, 'Генерация картинок', { timeOut: 2000 });
         } catch (error) {
-            lp?.replaceWith(targetEl);
             iigLog('ERROR', `Regen failed for tag ${index}: ${error.message}`);
-            if (!guard()) { toastr.warning('Перегенерация отменена'); break; }
+            if (abortController.signal.aborted) { toastr.warning('Перегенерация отменена'); break; }
             toastr.error(`Ошибка: ${error.message}`);
         }
     }
 
     processingMessages.delete(messageId);
     activeAbortControllers.delete(messageId);
-    if (guard()) await context.saveChat();
+    await context.saveChat();
 }
 
 // ============================================================
@@ -3395,8 +3159,7 @@ function ensurePromptPanelForMessage(messageElement, messageId) {
     const context = SillyTavern.getContext();
     const message = context.chat?.[messageId];
     if (!message || message.is_user) return null;
-    renderFusionTagBlocks(messageElement, messageId);
-    let panel = Array.from(messageElement.querySelectorAll('.iig-prompt-panel')).find(candidate => !candidate.dataset.fusionBlock);
+    let panel = messageElement.querySelector('.iig-prompt-panel');
     const isNew = !panel;
     if (!panel) {
         panel = document.createElement('div');
@@ -3410,144 +3173,33 @@ function ensurePromptPanelForMessage(messageElement, messageId) {
     return panel;
 }
 
-function isFreshFusionTag(tag) {
-    return !tag.existingSrc || tag.existingSrc === '#' || tag.existingSrc.includes('[IMG:GEN]');
-}
-
-function getFusionTagBlock(message, tag) {
-    return message.extra?.iig_tag_blocks?.find(item => item.source === tag.fullMatch && item.sourceIndex === tag.index && item.swipe === (message.swipe_id ?? null));
-}
-
-async function generateFusionTagBlocks(messageId, tags, retryId = '') {
-    if (processingMessages.has(messageId) || activeAbortControllers.has(messageId) || activePromptAbortControllers.has(messageId)) return;
-    const context = SillyTavern.getContext(), message = context.chat?.[messageId];
-    if (!message) return;
-    const controller = new AbortController();
-    const guard = createFusionMessageGuard(messageId, controller.signal);
-    const element = document.querySelector(`#chat .mes[mesid="${messageId}"]`);
-    processingMessages.add(messageId); activeAbortControllers.set(messageId, controller);
-    try {
-        for (const tag of tags) {
-            guard.assert();
-            let item = getFusionTagBlock(message, tag);
-            if (item && item.id !== retryId) continue;
-            if (!item) {
-                message.extra ||= {};
-                message.extra.iig_tag_blocks ||= [];
-                item = { id: `block_${Date.now()}_${Math.random().toString(36).slice(2)}`, source: tag.fullMatch, sourceIndex: tag.index, swipe: message.swipe_id ?? null, tag: { ...tag }, imagePath: '' };
-                message.extra.iig_tag_blocks.push(item);
-            }
-            item.status = 'Сбор референсов...'; item.error = '';
-            renderFusionTagBlocks(element, messageId, true);
-            try {
-                const refs = await collectReferenceImages(tag.prompt);
-                guard.assert();
-                const requested = resolveImageOptions(getSettings(), tag);
-                const result = await generateImageWithRetry(tag.prompt, buildEffectiveStyle(tag.style), text => {
-                    item.status = text;
-                    const status = element?.querySelector(`[data-fusion-block="${item.id}"] [role="status"]`);
-                    if (status) status.textContent = text;
-                }, { ...requested, refData: refs, signal: controller.signal });
-                guard.assert();
-                const imagePath = await saveImageToFile(result);
-                guard.assert();
-                item.imagePath = imagePath;
-                item.requested = [requested.aspectRatio, requested.imageSize, requested.size, requested.quality].filter(Boolean).join(' / ');
-                item.status = 'Готово';
-            } catch (error) {
-                if (!guard()) throw error;
-                item.error = error.message; item.status = '';
-            }
-            guard.assert();
-            await context.saveChat();
-            renderFusionTagBlocks(element, messageId, true);
-        }
-    } catch (error) {
-        toastr.warning(error.message);
-    } finally {
-        processingMessages.delete(messageId); activeAbortControllers.delete(messageId);
-        if (guard()) renderFusionTagBlocks(element, messageId, true);
-    }
-}
-
-function renderFusionTagBlocks(element, messageId, force = false) {
-    if (!element) return;
-    const message = SillyTavern.getContext().chat?.[messageId];
-    const items = (message?.extra?.iig_tag_blocks || []).filter(item => item.swipe === (message.swipe_id ?? null) && message.mes.slice(item.sourceIndex, item.sourceIndex + item.source.length) === item.source);
-    let container = element.querySelector('.iig-tag-blocks');
-    if (!items.length) { container?.remove(); return; }
-    if (!container) {
-        container = document.createElement('div'); container.className = 'iig-tag-blocks';
-        (element.querySelector('.mes_text')?.parentElement || element).appendChild(container);
-    }
-    const signature = JSON.stringify(items.map(item => [item.id, item.imagePath, item.error]));
-    if (!force && container.dataset.signature === signature) return;
-    container.dataset.signature = signature;
-    container.replaceChildren();
-    for (const item of items) {
-        const card = document.createElement('section'); card.className = 'iig-prompt-panel'; card.dataset.fusionBlock = item.id;
-        card.innerHTML = `${item.imagePath ? `<img class="iig-prompt-result-image" src="${escapeHtml(item.imagePath)}" alt="${escapeHtml(item.tag.prompt)}">` : ''}<details><summary>Промпт</summary><p>${escapeHtml(item.tag.prompt)}</p></details><p role="status">${escapeHtml(item.error || item.status || '')}</p><p class="iig-block-dimensions"></p><button type="button" data-retry>Перегенерировать</button><button type="button" data-cancel>Отмена</button>`;
-        card.querySelector('[data-retry]').addEventListener('click', () => generateFusionTagBlocks(messageId, [item.tag], item.id));
-        card.querySelector('[data-cancel]').addEventListener('click', () => activeAbortControllers.get(messageId)?.abort());
-        const img = card.querySelector('img');
-        const dimensions = () => { card.querySelector('.iig-block-dimensions').textContent = `Запрошено: ${item.requested || 'по умолчанию'}; файл: ${img?.naturalWidth ? `${img.naturalWidth}×${img.naturalHeight}` : 'не загружен'}`; };
-        img?.addEventListener('load', dimensions); dimensions(); container.appendChild(card);
-    }
-}
-
 function renderPromptPanel(panel, messageId) {
     const context = SillyTavern.getContext();
     const message = context.chat?.[messageId];
     if (!panel || !message) return;
     const state = message.extra?.iig_prompt_block || {};
-    const panelGuard = createFusionMessageGuard(messageId);
     const instruction = getPromptInstructions().find(item => item.id === state.instructionId) || getActivePromptInstruction();
     panel.innerHTML = `${state.imagePath ? `<img class="iig-prompt-result-image" src="${escapeHtml(state.imagePath)}" alt="${escapeHtml(state.prompt || 'Generated image')}">` : ''}
         <div class="iig-prompt-panel-head"><strong><i class="fa-solid fa-wand-magic-sparkles"></i> Image prompt</strong><span class="iig-prompt-status"></span></div>
         <div class="iig-prompt-panel-controls"><span class="iig-prompt-selection">${escapeHtml(instruction.name)}</span><button type="button" class="menu_button iig-prompt-generate"><i class="fa-solid fa-wand-magic-sparkles"></i> Промпт</button><button type="button" class="menu_button iig-image-from-prompt"><i class="fa-solid fa-image"></i> Картинка</button></div>
-        <details><summary>Промпт и параметры</summary><textarea class="iig-prompt-value" rows="3" placeholder="Здесь появится prompt картинки..."></textarea><div class="iig-image-options"></div>
-        <label>Стиль<input class="text_pole iig-panel-style" value="${escapeHtml(state.style ?? buildEffectiveStyle(''))}"></label>
-        <label>Негатив<input class="text_pole iig-panel-negative" value="${escapeHtml(state.negativePrompt ?? getActiveNegativePrompt())}"></label></details>
-        <button type="button" class="menu_button iig-panel-cancel">Отмена</button><div class="iig-image-dimensions"></div>
+        <textarea class="iig-prompt-value" rows="3" placeholder="Здесь появится prompt картинки..."></textarea>
         <div class="iig-prompt-meta"><span>Стиль: ${escapeHtml(state.style || buildEffectiveStyle('') || 'не выбран')}</span><span>Негатив: ${escapeHtml(state.negativePrompt || getActiveNegativePrompt() || 'не выбран')}</span></div>`;
     const textarea = panel.querySelector('.iig-prompt-value');
-    const savePatch = async patch => {
-        if (!panelGuard()) return;
-        message.extra ||= {};
-        message.extra.iig_prompt_block = { ...(message.extra.iig_prompt_block || {}), ...patch };
-        await context.saveChat();
-    };
-    renderFusionImageOptions(panel.querySelector('.iig-image-options'), state.imageOptions || {}, imageOptions => savePatch({ imageOptions }));
-    panel.querySelector('.iig-panel-style').addEventListener('change', event => savePatch({ style: event.target.value }));
-    panel.querySelector('.iig-panel-negative').addEventListener('change', event => savePatch({ negativePrompt: event.target.value }));
-    panel.querySelector('.iig-panel-cancel').addEventListener('click', () => {
-        activeAbortControllers.get(messageId)?.abort();
-        activePromptAbortControllers.get(messageId)?.abort();
-    });
-    const resultImage = panel.querySelector('.iig-prompt-result-image');
-    const showDimensions = () => {
-        const requested = state.requested || {};
-        panel.querySelector('.iig-image-dimensions').textContent = `Запрошено: ${[requested.aspectRatio, requested.imageSize, requested.size, requested.quality].filter(Boolean).join(' / ') || 'по умолчанию'}; файл: ${resultImage?.naturalWidth ? `${resultImage.naturalWidth}×${resultImage.naturalHeight}` : 'не загружен'}. ${state.references?.length ? 'Референсы: ' + state.references.join(', ') : ''}`;
-    };
-    resultImage?.addEventListener('load', showDimensions);
-    showDimensions();
     textarea.value = state.prompt || '';
     textarea.addEventListener('change', async () => {
-        if (!panelGuard()) return;
         if (!message.extra || typeof message.extra !== 'object') message.extra = {};
         message.extra.iig_prompt_block = {
             ...(message.extra.iig_prompt_block || {}),
             prompt: textarea.value.trim(),
-            style: panel.querySelector('.iig-panel-style').value,
-            negativePrompt: panel.querySelector('.iig-panel-negative').value,
+            style: buildEffectiveStyle(''),
+            negativePrompt: getActiveNegativePrompt(),
             updatedAt: Date.now(),
         };
         await context.saveChat();
     });
     panel.querySelector('.iig-prompt-generate')?.addEventListener('click', async event => {
-        if (!panelGuard()) return;
         const button = event.currentTarget;
-        if (activePromptAbortControllers.has(messageId) || activeAbortControllers.has(messageId) || processingMessages.has(messageId)) return;
+        if (activePromptAbortControllers.has(messageId)) return;
         const controller = new AbortController();
         activePromptAbortControllers.set(messageId, controller);
         button.classList.add('disabled');
@@ -3566,9 +3218,8 @@ function renderPromptPanel(panel, messageId) {
         }
     });
     panel.querySelector('.iig-image-from-prompt')?.addEventListener('click', async event => {
-        if (!panelGuard()) return;
         const button = event.currentTarget;
-        if (activeAbortControllers.has(messageId) || activePromptAbortControllers.has(messageId) || processingMessages.has(messageId)) return;
+        if (activeAbortControllers.has(messageId)) return;
         const controller = new AbortController();
         activeAbortControllers.set(messageId, controller);
         button.classList.add('disabled');
@@ -5022,7 +4673,7 @@ function createSettingsUI() {
         <div class="iig-settings" id="iig_settings_root">
             <div class="inline-drawer">
                 <div class="inline-drawer-toggle inline-drawer-header">
-                    <b>🎨 Haruspics Fusion</b>
+                    <b>🎨 Inline Image Generation v3.0</b>
                     <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
                 </div>
                 <div class="inline-drawer-content">
@@ -5205,14 +4856,6 @@ function createSettingsUI() {
                                     <option value="low" ${settings.quality === 'low' ? 'selected' : ''}>low</option>
                                 </select>
                             </div>
-                            <div class="flex-row">
-                                <label>Новые картинки</label>
-                                <select id="iig_new_image_placement" class="flex1">
-                                    <option value="block" ${settings.newImagePlacement === 'block' ? 'selected' : ''}>Отдельный блок (рекомендуется)</option>
-                                    <option value="inline" ${settings.newImagePlacement === 'inline' ? 'selected' : ''}>Внутри сообщения</option>
-                                </select>
-                            </div>
-                            <p class="hint">Для новых картинок панели и тегов. Старые изображения не перемещаются. В режиме блока исходные теги в тексте сохраняются ради совместимости с инфоблоками.</p>
 
                             <div id="iig_gemini_section" class="${settings.apiType !== 'gemini' ? 'hidden' : ''}">
                                 <div class="flex-row">
@@ -5542,103 +5185,6 @@ function createSettingsUI() {
     initCollapsibleSections();
     updateCharAvatarPreview();
     renderPresetSelect();
-    setupFusionSettings();
-}
-
-function renderFusionImageOptions(container, values, onChange) {
-    if (!container) return;
-    const caps = getImageCapabilities();
-    const option = (value, label, disabled = false) => `<option value="${escapeHtml(value)}" ${disabled ? 'disabled' : ''}>${escapeHtml(label || value)}</option>`;
-    const ratioSupported = ratio => !caps.images || caps.sizes.some(size => {
-        const [w, h] = size.split('x').map(Number), [a, b] = ratio.split(':').map(Number);
-        return w * b === h * a;
-    });
-    container.innerHTML = `<div class="iig-fusion-fields">
-        <label>Пропорции<select data-option="aspectRatio">${option('', 'По умолчанию')}${VALID_ASPECT_RATIOS.map(r => option(r, r + (ratioSupported(r) ? '' : ' — недоступно'), !ratioSupported(r))).join('')}</select></label>
-        <label>Разрешение<select data-option="imageSize" ${caps.resolution ? '' : 'disabled'}>${option('', 'По умолчанию')}${VALID_IMAGE_SIZES.map(r => option(r)).join('')}</select></label>
-        <label>Пиксели<input data-option="size" placeholder="1024x1024" ${caps.images || caps.novelai ? '' : 'disabled'}></label>
-        <label>API-качество<select data-option="quality" ${caps.qualities.length ? '' : 'disabled'}>${option('', 'По умолчанию')}${caps.qualities.map(r => option(r)).join('')}</select></label></div>
-        <p class="iig-fusion-warning">${escapeHtml(caps.warning)} ${caps.sizes.length ? 'Размеры: ' + caps.sizes.join(', ') : ''}</p>`;
-    for (const input of container.querySelectorAll('[data-option]')) {
-        input.value = values[input.dataset.option] || '';
-        input.title = input.disabled ? 'Не поддерживается выбранным API/моделью' : 'Пусто — использовать общие настройки';
-        input.addEventListener('change', () => {
-            const next = { ...values, [input.dataset.option]: input.value };
-            if (!input.value) delete next[input.dataset.option];
-            Object.assign(values, next);
-            if (!input.value) delete values[input.dataset.option];
-            onChange({ ...values });
-        });
-    }
-}
-
-function setupFusionSettings() {
-    const root = document.getElementById('iig_settings_root');
-    const content = root?.querySelector('.inline-drawer-content');
-    if (!content || root.querySelector('.iig-fusion-layout')) return;
-    const settings = getSettings();
-    const layout = document.createElement('div');
-    layout.className = 'iig-fusion-layout';
-    const nav = document.createElement('nav');
-    const pages = document.createElement('div');
-    layout.append(nav, pages);
-    const groups = {
-        generation: ['Генерация', ['prompt_generator', 'errors']],
-        styles: ['Стили и негативы', ['style']],
-        characters: ['Персонажи', ['avatars', 'character_library', 'npc']],
-        wardrobe: ['Гардероб', ['wardrobe_char', 'wardrobe_user', 'wardrobe_inject', 'hairstyle_char', 'hairstyle_user', 'hairstyle_mode']],
-        connections: ['Подключения', ['api', 'vision']],
-    };
-    const panels = {};
-    for (const [key, [title, sections]] of Object.entries(groups)) {
-        const page = document.createElement('section');
-        page.className = 'iig-fusion-page';
-        page.innerHTML = `<h3>${title}</h3><details class="iig-fusion-faq"><summary>FAQ / подсказки</summary><p>Настройки этого раздела сохраняются автоматически. Внешность и правила референсов влияют только на картинки. Гардероб может отдельно инжектироваться в чат, если это включено в его настройках. Ограничения API показаны независимо от FAQ.</p></details>`;
-        for (const id of sections) {
-            const section = root.querySelector(`[data-section-id="${id}"]`);
-            if (section) page.appendChild(section);
-        }
-        panels[key] = page;
-        pages.appendChild(page);
-        const button = document.createElement('button');
-        button.type = 'button'; button.textContent = title;
-        button.addEventListener('click', () => selectPage(key));
-        button.dataset.page = key;
-        nav.appendChild(button);
-    }
-    function selectPage(key) {
-        for (const [id, page] of Object.entries(panels)) page.hidden = id !== key;
-        nav.querySelectorAll('button').forEach(button => button.setAttribute('aria-pressed', String(button.dataset.page === key)));
-        settings.fusionPage = key; saveSettings();
-    }
-    content.appendChild(layout);
-    const options = document.createElement('div');
-    panels.generation.querySelector('h3').after(options);
-    const placementRow = root.querySelector('#iig_new_image_placement')?.closest('.flex-row');
-    if (placementRow) {
-        const hint = placementRow.nextElementSibling;
-        options.before(placementRow);
-        if (hint?.classList.contains('hint')) placementRow.after(hint);
-    }
-    const refresh = () => renderFusionImageOptions(options, settings.imageDefaults, value => { settings.imageDefaults = value; saveSettings(); });
-    refresh();
-    root.addEventListener('change', event => { if (['iig_api_type', 'iig_model', 'iig_preset_select'].includes(event.target.id)) refresh(); });
-    const config = document.createElement('details');
-    config.innerHTML = `<summary>Дополнительно: совместимость Chat API</summary><label>image_config <select><option value="auto">Авто (только OpenRouter)</option><option value="enabled">Включить — сервис поддерживает</option><option value="disabled">Не отправлять</option></select></label><p>Не универсальный параметр OpenAI-compatible API. При ошибке unknown field отключите его.</p>`;
-    config.querySelector('select').value = settings.chatImageConfig;
-    config.querySelector('select').addEventListener('change', event => { settings.chatImageConfig = event.target.value; saveSettings(); refresh(); });
-    panels.connections.prepend(config);
-    const warning = document.createElement('p'); warning.className = 'iig-fusion-warning';
-    warning.textContent = 'Не включайте одновременно Fusion и sillyimages: они используют общий ключ настроек inline_image_gen.';
-    panels.connections.prepend(warning);
-    const wardrobeButton = document.createElement('button'); wardrobeButton.type = 'button'; wardrobeButton.textContent = 'Открыть гардероб';
-    wardrobeButton.addEventListener('click', openWardrobeModal); panels.wardrobe.prepend(wardrobeButton);
-    const peopleButton = document.createElement('button'); peopleButton.type = 'button'; peopleButton.textContent = 'Внешность: персона, боты, RPG и NPC';
-    peopleButton.addEventListener('click', openFusionCharacters); panels.characters.prepend(peopleButton);
-    const theme = document.createElement('details'); theme.innerHTML = '<summary>Оформление Fusion</summary><div></div>';
-    panels.wardrobe.appendChild(theme); renderFusionThemeEditor(theme.querySelector('div'));
-    selectPage(Object.hasOwn(groups, settings.fusionPage) ? settings.fusionPage : 'generation');
-    applyFusionTheme();
 }
 
 function bindSettingsEvents() {
@@ -5814,7 +5360,6 @@ function bindSettingsEvents() {
     document.getElementById('iig_quality')?.addEventListener('change', (e) => { settings.quality = e.target.value; saveSettings(); });
     document.getElementById('iig_aspect_ratio')?.addEventListener('change', (e) => { settings.aspectRatio = e.target.value; saveSettings(); });
     document.getElementById('iig_image_size')?.addEventListener('change', (e) => { settings.imageSize = e.target.value; saveSettings(); });
-    document.getElementById('iig_new_image_placement')?.addEventListener('change', (e) => { settings.newImagePlacement = e.target.value === 'inline' ? 'inline' : 'block'; saveSettings(); });
 
     document.getElementById('iig_default_style')?.addEventListener('input', (e) => { settings.defaultStyle = e.target.value; saveSettings(); });
 
@@ -6138,7 +5683,7 @@ function bindSettingsEvents() {
 // INIT
 // ============================================================
 
-queueMicrotask(function init() {
+(function init() {
     const context = SillyTavern.getContext();
     getSettings();
 
@@ -6152,8 +5697,6 @@ queueMicrotask(function init() {
     });
 
     context.eventSource.on(context.event_types.CHAT_CHANGED, () => {
-        for (const controller of activeAbortControllers.values()) controller.abort();
-        for (const controller of activePromptAbortControllers.values()) controller.abort();
         setTimeout(() => {
             observeImageRegenButtons();
             addButtonsToExistingMessages();
@@ -6171,7 +5714,7 @@ queueMicrotask(function init() {
     createFloatingWardrobeButton();
     
     console.log('[IIG] Inline Image Generation v3.0 initialized');
-});
+})();
 
 // ============================================================
 // FLOATING WARDROBE BUTTON
@@ -6180,7 +5723,6 @@ queueMicrotask(function init() {
 let iigFloatingBtn = null;
 let iigWardrobeModal = null;
 let iigCurrentWardrobeTab = 'char';
-let iigWardrobeEscHandler = null;
 
 function createFloatingWardrobeButton() {
     // Remove existing button if any
@@ -6188,8 +5730,7 @@ function createFloatingWardrobeButton() {
     iigWardrobeModal?.remove();
     
     // Create floating button
-    iigFloatingBtn = document.createElement('button');
-    iigFloatingBtn.type = 'button';
+    iigFloatingBtn = document.createElement('div');
     iigFloatingBtn.id = 'iig-float-btn';
     iigFloatingBtn.innerHTML = '<i class="fa-solid fa-shirt"></i>';
     iigFloatingBtn.title = 'Гардероб';
@@ -6198,9 +5739,7 @@ function createFloatingWardrobeButton() {
     updateFloatingButtonBadge();
     
     iigFloatingBtn.addEventListener('click', toggleWardrobeModal);
-    const inputBar = document.getElementById('send_form');
-    (inputBar || document.body).appendChild(iigFloatingBtn);
-    if (inputBar) iigFloatingBtn.classList.add('iig-at-input');
+    document.body.appendChild(iigFloatingBtn);
     
     iigLog('INFO', 'Floating wardrobe button created');
 }
@@ -6292,31 +5831,25 @@ function openWardrobeModal() {
         });
     });
     
-    // Native nested dialogs own Escape; never close their parent underneath.
-    iigWardrobeEscHandler = (e) => {
-        if (e.key === 'Escape' && !document.querySelector('dialog[open]')) {
+    // Close on Escape
+    const escHandler = (e) => {
+        if (e.key === 'Escape') {
             closeWardrobeModal();
+            document.removeEventListener('keydown', escHandler);
         }
     };
-    document.addEventListener('keydown', iigWardrobeEscHandler);
+    document.addEventListener('keydown', escHandler);
     
     // Initial render
     renderQuickWardrobeList();
-    applyFusionTheme();
 }
 
 function closeWardrobeModal() {
-    if (iigWardrobeEscHandler) document.removeEventListener('keydown', iigWardrobeEscHandler);
-    iigWardrobeEscHandler = null;
     iigWardrobeModal?.remove();
     iigWardrobeModal = null;
 }
 
 function renderQuickWardrobeList() {
-    return renderFusionWardrobe();
-}
-
-function renderLegacyQuickWardrobeList() {
     const content = document.getElementById('iig-wardrobe-content');
     if (!content) return;
     
@@ -6381,277 +5914,4 @@ function renderLegacyQuickWardrobeList() {
             }
         });
     });
-}
-
-// Fusion editors adapt existing records instead of deleting or replacing libraries.
-function getFusionPeople() {
-    const settings = getSettings(), context = SillyTavern.getContext();
-    const result = ['char', 'user'].map(kind => {
-        const entity = getCurrentLibraryEntity(kind, settings);
-        const entry = getCharacterLibraryEntry(kind, entity.key, settings, true);
-        const name = entry.displayName || (kind === 'user' ? context.name1 : context.characters?.[context.characterId]?.name) || entity.title;
-        return { id: `${kind}:${entity.key}`, kind, name, record: entry, primary: entry.primary, key: entity.key };
-    });
-    settings.npcReferences.forEach((npc, index) => {
-        if (npc.parentKey && npc.parentKey !== getCurrentCharacterLibraryKey()) return;
-        result.push({ id: `npc:${npc.id}`, kind: 'npc', name: npc.name, record: npc, key: String(index) });
-    });
-    return result;
-}
-
-function fusionDialog(title, html) {
-    const dialog = document.createElement('dialog');
-    dialog.className = 'iig-fusion-dialog';
-    dialog.innerHTML = `<header><h3>${escapeHtml(title)}</h3><button type="button" data-close aria-label="Закрыть">×</button></header>${html}<p class="iig-fusion-status" role="status"></p>`;
-    dialog.querySelector('[data-close]').addEventListener('click', () => dialog.close());
-    dialog.addEventListener('close', () => dialog.remove(), { once: true });
-    document.body.appendChild(dialog); applyFusionTheme(); dialog.showModal();
-    return dialog;
-}
-
-function openFusionCharacters() {
-    const dialog = fusionDialog('Персонажи и внешность', '<select class="iig-person"></select><button type="button" class="iig-add-rpg">Добавить героя RPG-карточки</button><button type="button" class="iig-add-npc">Добавить NPC</button><div class="iig-person-editor"></div><p>Описания используются в image-prompt, в том числе NovelAI. Основной текст чата не изменяется. NPC/RPG выбираются по имени и алиасам.</p>');
-    const select = dialog.querySelector('.iig-person');
-    let people;
-    const refresh = selected => {
-        people = getFusionPeople();
-        select.innerHTML = people.map(person => `<option value="${escapeHtml(person.id)}">${escapeHtml(person.name)} (${person.kind})</option>`).join('');
-        if (selected) select.value = selected;
-        render();
-    };
-    const render = () => {
-        const person = people.find(p => p.id === select.value); if (!person) return;
-        const record = person.record, primary = person.primary;
-        const editor = dialog.querySelector('.iig-person-editor');
-        editor.innerHTML = `<label>Имя<input data-field="name"></label><label>Алиасы (через запятую)<input data-field="aliases"></label>
-            <label><input type="checkbox" data-field="enabled"> Использовать описание</label>
-            ${primary ? '<label><input type="checkbox" data-field="sceneOnly"> Только при упоминании имени / алиаса</label>' : ''}
-            <textarea rows="6" data-field="description" placeholder="Внешность, телосложение, характерные черты..."></textarea>
-            <input type="file" accept="image/*"><button type="button" data-avatar>Взять текущий аватар</button><button type="button" data-vision>Описать по изображению</button><img class="iig-fusion-preview" alt="Референс">`;
-        const field = name => editor.querySelector(`[data-field="${name}"]`);
-        field('name').value = person.name; field('aliases').value = (record.aliases || []).join(', ');
-        field('description').value = primary ? primary.description : record.appearance || '';
-        field('enabled').checked = primary ? primary.enabled !== false : record.appearanceEnabled !== false;
-        if (primary) field('sceneOnly').checked = !!record.sceneOnly;
-        const image = editor.querySelector('img');
-        const updateImage = () => { const data = primary ? primary.imageData : record.imageData; image.hidden = !data; if (data) image.src = `data:${detectMimeType(data)};base64,${data}`; };
-        updateImage();
-        editor.onchange = event => {
-            if (!event.target.dataset.field) return;
-            if (primary) { record.displayName = field('name').value; primary.description = field('description').value; primary.enabled = field('enabled').checked; record.sceneOnly = field('sceneOnly').checked; }
-            else { record.name = field('name').value; record.appearance = field('description').value; record.appearanceEnabled = field('enabled').checked; }
-            record.aliases = field('aliases').value.split(',').map(s => s.trim()).filter(Boolean); saveSettings();
-        };
-        const setImage = data => { if (primary) primary.imageData = data; else record.imageData = data; saveSettings(); updateImage(); };
-        editor.querySelector('input[type="file"]').addEventListener('change', async event => {
-            try { const file = event.target.files[0]; if (file) setImage(await resizeImageBase64(await readLibraryFileAsBase64(file), 768)); }
-            catch (error) { dialog.querySelector('[role="status"]').textContent = error.message; }
-        });
-        editor.querySelector('[data-avatar]').disabled = !primary;
-        editor.querySelector('[data-avatar]').addEventListener('click', async () => {
-            const data = await (person.kind === 'user' ? getUserAvatarBase64() : getCharacterAvatarBase64());
-            if (data) setImage(await resizeImageBase64(data, 768));
-        });
-        editor.querySelector('[data-vision]').addEventListener('click', async event => {
-            event.target.disabled = true;
-            const status = dialog.querySelector('[role="status"]'); status.textContent = 'Анализ внешности...';
-            try {
-                const description = await generateVisionDescriptionFromImage(primary ? primary.imageData : record.imageData, 'Describe the visible appearance of this character for image generation: face, hair, skin, body build and proportions, distinctive markings. Do not infer personality. Write concise English.');
-                if (!dialog.isConnected) return;
-                field('description').value = description; field('description').dispatchEvent(new Event('change', { bubbles: true })); status.textContent = 'Описание сохранено. Проверьте его перед генерацией.';
-            } catch (error) { status.textContent = error.message; }
-            finally { event.target.disabled = false; }
-        });
-    };
-    select.addEventListener('change', render);
-    for (const kind of ['rpg', 'npc']) dialog.querySelector(`.iig-add-${kind}`).addEventListener('click', () => {
-        const settings = getSettings();
-        settings.npcReferences.push({ name: kind === 'rpg' ? 'Новый герой' : 'Новый NPC', aliases: [], enabled: true, appearance: '', imageData: '', outfits: [], ...(kind === 'rpg' ? { parentKey: getCurrentCharacterLibraryKey() } : {}) });
-        ensureNpcDefaults(settings.npcReferences.at(-1));
-        saveSettings(); refresh(`npc:${settings.npcReferences.at(-1).id}`);
-    });
-    refresh();
-}
-
-const fusionWardrobeView = { person: '', kind: 'outfit', query: '' };
-function renderFusionWardrobe() {
-    const content = document.getElementById('iig-wardrobe-content'); if (!content) return;
-    const scroll = content.scrollTop, settings = getSettings(), people = getFusionPeople();
-    const person = people.find(p => p.id === fusionWardrobeView.person) || people.find(p => p.kind === iigCurrentWardrobeTab) || people[0];
-    fusionWardrobeView.person = person.id;
-    const hair = fusionWardrobeView.kind === 'hair';
-    const items = person.kind === 'npc' ? (person.record[hair ? 'hairstyles' : 'outfits'] ||= []) :
-        settings[hair ? 'hairstyleItems' : 'wardrobeItems'].filter(item => item.target === person.kind && (!item.ownerId || item.ownerId === person.id));
-    const activeKey = hair ? 'activeHairstyleId' : 'activeOutfitId';
-    const active = person.kind === 'npc' ? person.record[activeKey] : (hair ? getActiveHairstyleItem(person.kind) : getActiveWardrobeItem(person.kind))?.id;
-    const current = items.find(item => item.id === active);
-    content.innerHTML = `<label>Участник<select data-person>${people.map(p => `<option value="${escapeHtml(p.id)}">${escapeHtml(p.name)}</option>`).join('')}</select></label>
-        <div class="iig-fusion-fields"><select data-kind><option value="outfit">Полные наряды</option><option value="hair">Причёски</option></select><input type="search" data-search placeholder="Поиск"><button type="button" data-add>Добавить</button></div>
-        <p>Надето: ${escapeHtml(current?.name || 'ничего')} · Один полный наряд + отдельная причёска</p><div class="iig-fusion-cards"></div>`;
-    content.querySelector('[data-person]').value = person.id;
-    content.querySelector('[data-kind]').value = fusionWardrobeView.kind;
-    content.querySelector('[data-search]').value = fusionWardrobeView.query;
-    content.querySelector('[data-person]').addEventListener('change', event => { fusionWardrobeView.person = event.target.value; renderFusionWardrobe(); });
-    content.querySelector('[data-kind]').addEventListener('change', event => { fusionWardrobeView.kind = event.target.value; renderFusionWardrobe(); });
-    const cards = content.querySelector('.iig-fusion-cards');
-    const filter = () => cards.querySelectorAll('article').forEach(card => { card.hidden = !card.textContent.toLowerCase().includes(fusionWardrobeView.query.toLowerCase()); });
-    content.querySelector('[data-search]').addEventListener('input', event => { fusionWardrobeView.query = event.target.value; filter(); });
-    const edit = item => openFusionOutfitEditor(item, person, hair, () => renderFusionWardrobe());
-    content.querySelector('[data-add]').addEventListener('click', () => edit(null));
-    for (const item of items) {
-        const card = document.createElement('article');
-        card.innerHTML = `${item.imageData ? `<img class="iig-fusion-preview" src="data:${detectMimeType(item.imageData)};base64,${item.imageData}" alt="">` : ''}<strong>${escapeHtml(item.name)}</strong><p>${escapeHtml(item.description || 'Без описания — NovelAI не увидит этот референс')}</p><button type="button" data-wear>${item.id === active ? '✓ Надето / снять' : 'Надеть'}</button><button type="button" data-edit>Редактор</button>`;
-        card.querySelector('[data-wear]').addEventListener('click', () => {
-            if (person.kind === 'npc') { person.record[activeKey] = active === item.id ? null : item.id; saveSettings(); }
-            else if (hair) setActiveHairstyle(item.id, person.kind); else setActiveWardrobe(item.id, person.kind);
-            renderFusionWardrobe(); updateFloatingButtonBadge();
-        });
-        card.querySelector('[data-edit]').addEventListener('click', () => edit(item)); cards.appendChild(card);
-    }
-    filter(); content.scrollTop = scroll;
-}
-
-function renderFusionRules(container, rules, onChange) {
-    const normalized = normalizeTransferRules(rules);
-    container.innerHTML = '<p>Не переносить с источника (не удаляет черты персонажа):</p><div data-ignore></div><p>Сохранить у целевого персонажа:</p><div data-preserve></div><button type="button" data-only>Учитывать только одежду</button>';
-    for (const group of ['ignore', 'preserve']) {
-        const keys = group === 'ignore' ? Object.keys(TRANSFER_TRAITS) : ['face', 'body', 'tattoos', 'hair'];
-        for (const key of keys) {
-            const button = document.createElement('button'); button.type = 'button'; button.textContent = TRANSFER_TRAITS[key];
-            button.setAttribute('aria-pressed', String(normalized[group].includes(key)));
-            button.addEventListener('click', () => {
-                normalized[group] = normalized[group].includes(key) ? normalized[group].filter(k => k !== key) : [...normalized[group], key];
-                onChange(normalized); renderFusionRules(container, normalized, onChange);
-            }); container.querySelector(`[data-${group}]`).appendChild(button);
-        }
-    }
-    container.querySelector('[data-only]').addEventListener('click', () => {
-        const next = { ignore: Object.keys(TRANSFER_TRAITS), preserve: ['face', 'body', 'tattoos', 'hair'] };
-        onChange(next); renderFusionRules(container, next, onChange);
-    });
-}
-
-function openFusionOutfitEditor(item, person, hair, onSave) {
-    const draft = structuredClone(item || { id: `fusion_${Date.now()}_${Math.random().toString(36).slice(2)}`, name: '', description: '', imageData: '', target: person.kind, ownerId: person.id });
-    const dialog = fusionDialog(hair ? 'Причёска' : 'Полный наряд', '<label>Название<input data-name></label><textarea data-description rows="4" placeholder="Текстовое описание / теги для NovelAI"></textarea><input type="file" accept="image/*"><img class="iig-fusion-preview" alt="Референс"><button type="button" data-crop>Просмотр / обрезка</button><button type="button" data-vision>Описать фото</button><details><summary>Правила переноса</summary><div data-rules></div></details><button type="button" data-adapt>Создать референс под персонажа</button><button type="button" data-save>Сохранить</button>');
-    const status = dialog.querySelector('[role="status"]');
-    dialog.querySelector('[data-name]').value = draft.name;
-    dialog.querySelector('[data-description]').value = draft.description || '';
-    const update = () => { const img = dialog.querySelector('img'); img.hidden = !draft.imageData; if (draft.imageData) img.src = `data:${detectMimeType(draft.imageData)};base64,${draft.imageData}`; };
-    const sync = () => { draft.name = dialog.querySelector('[data-name]').value.trim() || (hair ? 'Причёска' : 'Наряд'); draft.description = dialog.querySelector('[data-description]').value; };
-    update(); renderFusionRules(dialog.querySelector('[data-rules]'), draft.transferRules, value => { draft.transferRules = value; });
-    dialog.querySelector('input[type="file"]').addEventListener('change', async event => {
-        try { const file = event.target.files[0]; if (file) { draft.imageData = await resizeImageBase64(await readLibraryFileAsBase64(file), 1024); update(); } }
-        catch (error) { status.textContent = error.message; }
-    });
-    dialog.querySelector('[data-crop]').addEventListener('click', async () => {
-        if (!draft.imageData) return;
-        const result = await openReferenceImageEditor(draft.imageData, draft.name);
-        if (result !== null) { draft.imageData = result; update(); }
-    });
-    dialog.querySelector('[data-vision]').addEventListener('click', async event => {
-        event.target.disabled = true;
-        try { dialog.querySelector('[data-description]').value = await generateVisionDescriptionFromImage(draft.imageData, `Describe only the ${hair ? 'hairstyle' : 'complete outfit'}, not the source person. Write concise English tags. ${buildTransferDirective(draft.transferRules, person.name)}`); }
-        catch (error) { status.textContent = error.message; }
-        finally { event.target.disabled = false; }
-    });
-    dialog.querySelector('[data-adapt]').disabled = hair;
-    dialog.querySelector('[data-adapt]').addEventListener('click', () => { sync(); openFusionAdaptation(draft, person, onSave); });
-    dialog.querySelector('[data-save]').addEventListener('click', () => {
-        sync();
-        if (item) Object.assign(item, draft);
-        else if (person.kind === 'npc') (person.record[hair ? 'hairstyles' : 'outfits'] ||= []).push(draft);
-        else getSettings()[hair ? 'hairstyleItems' : 'wardrobeItems'].push(draft);
-        saveSettings(); onSave(); dialog.close();
-    });
-}
-
-function openFusionAdaptation(outfit, person, onSave) {
-    const target = person.primary?.imageData || person.record.imageData || '';
-    const dialog = fusionDialog('Создать референс под персонажа', '<p>Исходный наряд не изменяется. Результат сохранится новым элементом, привязанным к выбранному персонажу.</p><label>Режим<select data-mode><option value="clothed">Одежда на нужном теле, лицо нейтральное</option><option value="character">Образ на персонаже</option></select></label><textarea data-body rows="4" placeholder="Кратко опишите целевое телосложение и дополнительные требования"></textarea><textarea data-instruction rows="4" placeholder="Необязательно: попросите ИИ доработать инструкцию для Nano Banana/GPT"></textarea><button type="button" data-generate>Создать референс</button><img data-result class="iig-fusion-preview" alt="Результат"><button type="button" data-save disabled>Сохранить новым нарядом</button>');
-    dialog.querySelector('[data-body]').value = person.primary?.description || person.record.appearance || '';
-    const improve = document.createElement('button'); improve.type = 'button'; improve.textContent = 'Доработать инструкцию с ИИ';
-    dialog.querySelector('[data-instruction]').after(improve);
-    let result = '';
-    const status = dialog.querySelector('[role="status"]');
-    const controller = new AbortController();
-    dialog.addEventListener('close', () => controller.abort(), { once: true });
-    improve.addEventListener('click', async () => {
-        improve.disabled = true; status.textContent = 'Доработка инструкции...';
-        try {
-            const settings = getSettings();
-            if (!settings.promptGenModel) throw new Error('Выберите текстовую модель генератора промпта в Подключениях/Генерации.');
-            const response = await fetch(buildOpenAIUrl(settings.promptGenEndpoint || settings.endpoint, 'chat/completions'), {
-                method: 'POST', headers: buildAuthHeaders(settings.promptGenApiKey || settings.apiKey, { 'Content-Type': 'application/json' }), signal: controller.signal,
-                body: JSON.stringify({ model: settings.promptGenModel, max_tokens: 700, messages: [{ role: 'user', content: `Write a concise image-editing instruction for Gemini/GPT to fit a source outfit to this target body without changing target proportions. Do not invent target features. Return only the instruction. Target: ${dialog.querySelector('[data-body]').value}. Outfit: ${outfit.description || outfit.name}. Requirements: ${dialog.querySelector('[data-instruction]').value}. ${buildTransferDirective(outfit.transferRules, person.name)}` }] }),
-            });
-            if (!response.ok) throw new Error(`Prompt API: ${response.status}`);
-            const text = (await response.json()).choices?.[0]?.message?.content;
-            if (typeof text !== 'string' || !text.trim()) throw new Error('Пустая инструкция от модели');
-            if (!dialog.isConnected) return;
-            dialog.querySelector('[data-instruction]').value = text.trim(); status.textContent = 'Инструкция готова; проверьте её перед отправкой.';
-        } catch (error) { status.textContent = error.message; }
-        finally { improve.disabled = false; }
-    });
-    dialog.querySelector('[data-generate]').addEventListener('click', async event => {
-        const button = event.currentTarget; button.disabled = true; status.textContent = 'Подготовка инструкции...';
-        try {
-            if (!outfit.imageData) throw new Error('У исходного наряда нет изображения');
-            const capabilities = getImageCapabilities();
-            if (capabilities.novelai || (getSettings().apiType === 'naistera' && isNaisteraNovelAIModel(getSettings().naisteraModel))) throw new Error('Для адаптации фото выберите vision image-to-image модель Gemini или Chat/Router. Текущий NovelAI использует только текст.');
-            const body = dialog.querySelector('[data-body]').value.trim();
-            const extra = dialog.querySelector('[data-instruction]').value.trim();
-            const mode = dialog.querySelector('[data-mode]').value;
-            const transfer = buildTransferDirective(outfit.transferRules, person.name);
-            if (!target && !body) throw new Error('Добавьте референс или описание целевого телосложения.');
-            const prompt = `Create a neutral full-body clothing reference image. Adapt the SOURCE outfit to the TARGET character's exact body proportions. ${mode === 'character' ? 'Show the target character wearing it with their own face.' : 'Hide or neutralize the face; show the garment clearly. This overrides face-copy instructions.'} TARGET appearance: ${body || 'use the supplied target reference'}. ${extra}. ${transfer} Use a plain background, front-facing standing pose, no dramatic lighting.`;
-            const refData = { imageRefs: [{ data: outfit.imageData, mimeType: detectMimeType(outfit.imageData), name: person.name, type: 'clothing', description: 'SOURCE outfit: ' + (outfit.description || outfit.name) }, ...(target ? [{ data: target, mimeType: detectMimeType(target), name: person.name, type: 'face', description: body }] : [])], textOnlyClothing: [], textDirectives: [body, transfer].filter(Boolean), warnings: [] };
-            result = await generateImageWithRetry(prompt, '', text => { status.textContent = text; }, { refData, signal: controller.signal });
-            if (controller.signal.aborted) return;
-            dialog.querySelector('[data-result]').src = result; dialog.querySelector('[data-save]').disabled = false; status.textContent = 'Готово. Проверьте результат и сохраните новым элементом.';
-        } catch (error) { status.textContent = error.message; }
-        finally { button.disabled = false; }
-    });
-    dialog.querySelector('[data-save]').addEventListener('click', async event => {
-        if (!result) return;
-        event.currentTarget.disabled = true;
-        try {
-            const imageData = result.startsWith('data:') ? result.split(',')[1] : await imageUrlToBase64(result);
-            if (!imageData) throw new Error('Не удалось скачать результат; попробуйте сохранить ещё раз.');
-            const item = makeAdaptedOutfit(outfit, person, imageData, dialog.querySelector('[data-mode]').value);
-            if (person.kind === 'npc') person.record.outfits.push(item);
-            else getSettings().wardrobeItems.push(item);
-            saveSettings(); onSave(); dialog.close();
-        } catch (error) { status.textContent = error.message; dialog.querySelector('[data-save]').disabled = false; }
-    });
-}
-
-function makeAdaptedOutfit(outfit, person, imageData, mode) {
-    return { id: `adapted_${Date.now()}_${Math.random().toString(36).slice(2)}`, name: `${outfit.name || 'Наряд'} — под ${person.name}`, imageData,
-        target: person.kind, ownerId: person.id, description: outfit.description || '', transferRules: normalizeTransferRules(outfit.transferRules),
-        adaptedFrom: outfit.id, adaptationMode: mode, createdAt: Date.now() };
-}
-
-function renderFusionThemeEditor(container) {
-    const settings = getSettings(), theme = settings.fusionTheme || {};
-    container.innerHTML = '<div class="iig-theme-fields"></div><button type="button" data-reset>Сбросить тему</button><div class="iig-theme-preview">Предпросмотр Fusion</div>';
-    const fields = { background: 'Фон', card: 'Карточки', text: 'Текст', accent: 'Акцент', button: 'Кнопки', border: 'Рамки' };
-    const parent = container.querySelector('.iig-theme-fields');
-    for (const [key, label] of Object.entries(fields)) {
-        const input = document.createElement('label'); input.innerHTML = `${label}<input type="color" data-theme="${key}">`; input.querySelector('input').value = theme[key] || ({ background: '#1a1a1e', card: '#24242b', text: '#e8e0e0', accent: '#ffb6c1', button: '#34343d', border: '#55515a' }[key]);
-        input.querySelector('input').addEventListener('input', event => { settings.fusionTheme[key] = event.target.value; saveSettings(); applyFusionTheme(); }); parent.appendChild(input);
-    }
-    for (const [key, label, fallback] of [['radius', 'Скругление', 12], ['spacing', 'Плотность / отступ', 12]]) {
-        const labelEl = document.createElement('label'); labelEl.textContent = label;
-        const input = document.createElement('input'); input.type = 'range'; input.min = '0'; input.max = '24'; input.value = theme[key] ?? fallback;
-        input.addEventListener('input', () => { settings.fusionTheme[key] = Number(input.value); saveSettings(); applyFusionTheme(); }); labelEl.appendChild(input); parent.appendChild(labelEl);
-    }
-    const reset = () => { settings.fusionTheme = {}; saveSettings(); renderFusionThemeEditor(container); applyFusionTheme(); };
-    container.querySelector('[data-reset]').addEventListener('click', reset);
-}
-
-function applyFusionTheme() {
-    const theme = getSettings().fusionTheme || {}, root = document.documentElement;
-    for (const key of ['background', 'card', 'text', 'accent', 'button', 'border']) root.style.setProperty(`--iig-${key}`, theme[key] || '');
-    for (const key of ['radius', 'spacing']) root.style.setProperty(`--iig-${key}`, Number.isFinite(theme[key]) ? `${Math.max(0, Math.min(24, theme[key]))}px` : '');
 }

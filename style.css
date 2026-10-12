@@ -2,53 +2,6 @@
    Inline Image Generation v3.0 — Styles
    ============================================================ */
 
-/* Fusion variables deliberately scoped to our own roots. */
-:is(.iig-settings, .iig-fusion-dialog, .iig-image-editor, #iig-wardrobe-modal, .iig-prompt-panel) {
-    color: var(--iig-text, var(--SmartThemeBodyColor, #eee));
-    background: var(--iig-background, var(--SmartThemeBlurTintColor, #202024));
-    border-color: var(--iig-border, var(--SmartThemeBorderColor, #555));
-    border-radius: var(--iig-radius, 12px);
-}
-.iig-fusion-layout { display: grid; grid-template-columns: 145px minmax(0, 1fr); gap: 12px; }
-.iig-fusion-layout > nav { display: flex; flex-direction: column; gap: 6px; align-self: start; position: sticky; top: 0; }
-.iig-fusion-page[hidden], .iig-fusion-cards article[hidden] { display: none !important; }
-.iig-fusion-page { min-width: 0; }
-.iig-fusion-dialog { width: min(820px, 94vw); max-height: 90dvh; overflow: auto; padding: var(--iig-spacing, 16px); }
-.iig-fusion-dialog::backdrop { background: #0009; }
-.iig-fusion-dialog header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
-:is(.iig-fusion-dialog, .iig-fusion-fields, #iig-wardrobe-content) label { display: block; margin: 6px 0; }
-:is(.iig-fusion-dialog, .iig-fusion-fields, #iig-wardrobe-content) :is(input:not([type="checkbox"]):not([type="color"]), select, textarea) { width: 100%; min-width: 0; box-sizing: border-box; }
-:is(.iig-fusion-dialog, .iig-fusion-layout, .iig-prompt-panel, #iig-wardrobe-content) :is(button, select, input, textarea) {
-    color: var(--iig-text, var(--SmartThemeBodyColor, #eee));
-    background: var(--iig-button, var(--SmartThemeBlurTintColor, #303035));
-    border: 1px solid var(--iig-border, var(--SmartThemeBorderColor, #666));
-    border-radius: var(--iig-radius, 6px); padding: 6px; margin: 3px 2px;
-}
-:is(.iig-fusion-dialog, .iig-fusion-layout) button[aria-pressed="true"] { border-color: var(--iig-accent, #ffb6c1); box-shadow: inset 0 -2px var(--iig-accent, #ffb6c1); }
-:is(.iig-fusion-dialog, .iig-fusion-layout, .iig-prompt-panel) :disabled { opacity: .45; cursor: not-allowed; }
-.iig-fusion-fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 8px; }
-.iig-fusion-warning, .iig-fusion-status { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; border-left: 3px solid var(--iig-accent, #ffb6c1); padding: 8px; }
-.iig-fusion-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 10px; }
-.iig-fusion-cards article, .iig-theme-preview { background: var(--iig-card, var(--SmartThemeBlurTintColor, #303035)); padding: var(--iig-spacing, 12px); border: 1px solid var(--iig-border, #555); border-radius: var(--iig-radius, 10px); overflow-wrap: anywhere; }
-.iig-fusion-preview { display: block; width: 100%; max-height: 280px; object-fit: contain; }
-.iig-fusion-preview[hidden] { display: none; }
-.iig-fusion-faq { margin-bottom: 10px; }
-.iig-fusion-layout .iig-collapsible-content { max-height: none; }
-.iig-fusion-layout .iig-collapsible.collapsed .iig-collapsible-content { max-height: 0; }
-.iig-theme-fields { display: flex; flex-wrap: wrap; gap: 8px; }
-.iig-theme-fields input { width: 48px; }
-.iig-image-dimensions { font-size: 11px; overflow-wrap: anywhere; }
-.iig-tag-blocks { display: flex; flex-direction: column; gap: 8px; margin: 8px 0; }
-.iig-tag-blocks .iig-prompt-panel { margin: 0; }
-#iig-float-btn.iig-at-input { position: relative; inset: auto; flex-shrink: 0; align-self: center; z-index: auto; }
-@media (max-width: 700px) {
-    .iig-fusion-layout { grid-template-columns: minmax(0, 1fr); }
-    .iig-fusion-layout > nav { position: static; flex-direction: row; flex-wrap: wrap; }
-    .iig-fusion-layout > nav button { flex: 1 1 auto; }
-    .iig-settings .flex-row { flex-wrap: wrap; }
-    .iig-fusion-dialog { width: 96vw; padding: 10px; }
-}
-
 /* ---- UTILITY ---- */
 
 /* Reference preview / crop dialog. Native dialog stays above ST popups. */

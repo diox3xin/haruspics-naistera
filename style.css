@@ -1155,6 +1155,86 @@ body.iig-mode-inline .mes_text .iig-image-wrapper {
     .iig-wardrobe-grid { grid-template-columns: repeat(auto-fill, minmax(90px, 1fr)); gap: 8px; }
 }
 
+/* ---- Reference generator tab ---- */
+.iig-refgen {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    color: var(--iig-wr-text);
+    font-size: 12px;
+}
+
+.iig-refgen textarea { width: 100%; resize: vertical; font-size: 12px; }
+.iig-refgen .menu_button { margin: 0; align-self: flex-start; }
+.iig-refgen .menu_button[disabled] { opacity: 0.5; pointer-events: none; }
+
+.iig-refgen-slots {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
+}
+
+.iig-refgen-slot {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 8px;
+    border: 1px solid color-mix(in srgb, var(--iig-wr-border) 50%, transparent);
+    border-radius: 8px;
+}
+
+.iig-refgen-slot-label { font-weight: 600; }
+
+.iig-refgen-slot img,
+.iig-refgen-slot-empty {
+    width: 100%;
+    aspect-ratio: 3 / 4;
+    object-fit: cover;
+    border-radius: 6px;
+}
+
+.iig-refgen-slot-empty {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border: 2px dashed color-mix(in srgb, var(--iig-wr-border) 60%, transparent);
+    font-size: 24px;
+    color: color-mix(in srgb, var(--iig-wr-text) 35%, transparent);
+}
+
+.iig-refgen-slot-actions { display: flex; gap: 6px; }
+.iig-refgen-slot-actions .menu_button { flex: 1; }
+.iig-refgen-slot-actions .iig-refgen-clear { flex: 0 0 auto; }
+
+.iig-refgen-flags {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 4px 10px;
+    padding: 8px;
+    border-radius: 6px;
+    background: color-mix(in srgb, var(--iig-wr-text) 3%, transparent);
+}
+
+.iig-refgen-status {
+    min-height: 16px;
+    font-style: italic;
+    color: color-mix(in srgb, var(--iig-wr-text) 70%, transparent);
+}
+
+.iig-refgen-result {
+    display: block;
+    width: 100%;
+    max-width: 360px;
+    margin: 0 auto;
+    border-radius: 8px;
+    border: 1px solid var(--iig-wr-accent);
+}
+
+@media (max-width: 600px) {
+    .iig-refgen-slots,
+    .iig-refgen-flags { grid-template-columns: 1fr; }
+}
+
 .iig-no-outfits {
     text-align: center;
     padding: 24px;

@@ -147,6 +147,11 @@ const defaultSettings = Object.freeze({
     promptGenModel: '',
     promptGenMaxTokens: 700,
     promptGenTemperature: 0.7,
+    // ===== Reference Generator =====
+    refGenSource: 'main', // 'main' | 'custom'
+    refGenEndpoint: '',
+    refGenApiKey: '',
+    refGenModel: '',
     // ===== NEW: Collapsed sections state =====
     collapsedSections: {},
 });
@@ -1673,6 +1678,147 @@ function updateWardrobeInjection() {
     } catch (error) {
         iigLog('ERROR', 'Error updating wardrobe injection:', error);
     }
+}
+
+// ============================================================
+// REFERENCE GENERATOR (body-type / outfit reference sheets)
+// ============================================================
+
+const REF_GEN_FLAG_DEFAULTS = Object.freeze({
+    ignoreTattoos: true,
+    bodyFromDescription: true,
+    noHairTransfer: false,
+    noAccessoriesTransfer: false,
+});
+
+function normalizeRefGenFlags(flags = {}) {
+    const out = {};
+    for (const key of Object.keys(REF_GEN_FLAG_DEFAULTS)) {
+        out[key] = typeof flags?.[key] === 'boolean' ? flags[key] : REF_GEN_FLAG_DEFAULTS[key];
+    }
+    return out;
+}
+
+/** Builds the final editable prompt from the generator state. Pure: no settings or DOM access. */
+function buildReferenceGenPrompt(state = {}) {
+    const flags = normalizeRefGenFlags(state.flags);
+    const name = String(state.name || '').trim() || 'the character';
+    const description = String(state.refinedDescription || state.description || '').trim();
+    const lines = [
+        `Full-body character reference sheet of ${name}: single figure, front view, neutral standing A-pose, plain light-grey background, even studio lighting, no props, no text.`,
+    ];
+    if (state.hasCharacterRef) lines.push('Keep the face and identity from the CHARACTER reference image.');
+    if (state.hasOutfitRef) lines.push('Dress the character in the outfit from the OUTFIT reference image. Copy only the clothing, not the face or body of the person wearing it.');
+    if (description) lines.push(`Appearance and body: ${description}`);
+    if (flags.bodyFromDescription) lines.push('Body type, height and proportions MUST follow the text description, not the reference images.');
+    if (flags.ignoreTattoos) lines.push('Do NOT transfer tattoos, piercings, scars or body markings from any reference image.');
+    if (flags.noHairTransfer) lines.push('Do NOT copy the hairstyle or hair color from the outfit reference.');
+    if (flags.noAccessoriesTransfer) lines.push('Do NOT copy jewelry, bags, hats, glasses or other accessories from the outfit reference.');
+    return lines.join('\n');
+}
+
+async function refineReferenceDescription(text, signal) {
+    const settings = getSettings();
+    const source = String(text || '').trim();
+    if (!source) throw new Error('Сначала введите описание');
+    const endpoint = settings.promptGenEndpoint || settings.endpoint;
+    const apiKey = settings.promptGenApiKey || settings.apiKey;
+    const model = settings.promptGenModel;
+    if (!endpoint || !apiKey || !model) throw new Error('Для AI-уточнения настройте модель промпта (раздел «Генерация промпта»)');
+    const response = await fetch(buildOpenAIUrl(endpoint, 'chat/completions'), {
+        method: 'POST',
+        headers: buildAuthHeaders(apiKey, { 'Content-Type': 'application/json' }),
+        body: JSON.stringify({
+            model,
+            temperature: 0.4,
+            max_tokens: 400,
+            messages: [{
+                role: 'user',
+                content: 'Rewrite the following character appearance notes into a concise English description for an image model. Focus on body type, height, proportions, skin tone, face, hair and clothing details if present. 2-5 sentences, no preamble, no markdown.\n\n' + source,
+            }],
+        }),
+        signal,
+    });
+    if (!response.ok) throw new Error(`Prompt API (${response.status}): ${(await response.text().catch(() => '')).slice(0, 300)}`);
+    const result = await response.json();
+    const refined = result.choices?.[0]?.message?.content?.trim();
+    if (!refined) throw new Error('Модель вернула пустой ответ');
+    return refined;
+}
+
+function buildRefGenImageRefs(state = {}) {
+    const refs = [];
+    const name = String(state.name || '').trim() || 'Character';
+    if (state.characterImage) refs.push({ type: 'face', name, data: state.characterImage, mimeType: detectMimeType(state.characterImage) });
+    if (state.outfitImage) refs.push({ type: 'clothing', name, outfitName: 'outfit', description: 'copy the outfit only, not the face or body', data: state.outfitImage, mimeType: detectMimeType(state.outfitImage) });
+    return refs;
+}
+
+async function imageResultToBase64(result) {
+    let value = String(result || '');
+    if (/^https?:\/\//i.test(value)) {
+        const blob = await (await fetch(value)).blob();
+        value = await new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onloadend = () => resolve(String(reader.result || ''));
+            reader.onerror = reject;
+            reader.readAsDataURL(blob);
+        });
+    }
+    const base64 = value.startsWith('data:') ? value.split(',')[1] : value;
+    if (!base64) throw new Error('Не удалось прочитать картинку из ответа');
+    return base64;
+}
+
+/** Generates the reference via the main image API or the custom one. Returns raw base64. */
+async function generateReferenceImage(state, onStatus, signal) {
+    const settings = getSettings();
+    const prompt = String(state.finalPrompt || '').trim() || buildReferenceGenPrompt(state);
+    const imageRefs = buildRefGenImageRefs(state);
+
+    if (settings.refGenSource === 'custom') {
+        if (!settings.refGenEndpoint || !settings.refGenApiKey || !settings.refGenModel) {
+            throw new Error('Заполните endpoint, ключ и модель генератора референсов');
+        }
+        onStatus?.('Генерация (свой API)...');
+        const content = [{ type: 'text', text: prompt }];
+        for (const ref of imageRefs) content.push({ type: 'image_url', image_url: { url: `data:${ref.mimeType};base64,${ref.data}` } });
+        const response = await fetch(buildOpenAIUrl(settings.refGenEndpoint, 'chat/completions'), {
+            method: 'POST',
+            headers: buildAuthHeaders(settings.refGenApiKey, { 'Content-Type': 'application/json' }),
+            body: JSON.stringify({ model: settings.refGenModel, messages: [{ role: 'user', content }], modalities: ['image', 'text'] }),
+            signal,
+        });
+        if (!response.ok) throw new Error(`API (${response.status}): ${(await response.text().catch(() => '')).slice(0, 300)}`);
+        const image = parseImageFromApiResponse(await response.json());
+        if (!image) throw new Error('В ответе нет картинки');
+        return imageResultToBase64(image);
+    }
+
+    if (['novelai', 'novelai-direct'].includes(settings.apiType) && imageRefs.length) {
+        toastr.warning('NovelAI не принимает картинки-референсы: будет использован только текст', 'Генератор');
+    }
+    const refData = { imageRefs, textOnlyClothing: [], textDirectives: [], warnings: [] };
+    const result = await generateImageWithRetry(prompt, '', onStatus, { refData, negativePrompt: '', aspectRatio: '2:3', signal });
+    return imageResultToBase64(result);
+}
+
+/** Saves the generated reference as a wardrobe item, keeping description and prompt for later edits. */
+function saveGeneratedReference(state, resizedImage) {
+    if (!resizedImage) throw new Error('Сначала сгенерируйте картинку');
+    const target = state.target === 'user' ? 'user' : 'char';
+    const name = String(state.itemName || '').trim() || `Референс ${String(state.name || '').trim() || ''}`.trim();
+    const item = addWardrobeItem(name, resizedImage, target, state.category || 'full');
+    item.description = String(state.refinedDescription || state.description || '').trim();
+    item.refGen = {
+        sourceDescription: String(state.description || ''),
+        refinedDescription: String(state.refinedDescription || ''),
+        finalPrompt: String(state.finalPrompt || ''),
+        flags: normalizeRefGenFlags(state.flags),
+        createdAt: Date.now(),
+    };
+    saveSettings();
+    return item;
 }
 
 // ============================================================
@@ -5839,6 +5985,30 @@ function createSettingsUI() {
                         </div>
                     </div>
 
+                    <!-- ======= SECTION: Reference Generator API ======= -->
+                    <div class="iig-collapsible" data-section-id="refgen">
+                        <div class="iig-collapsible-header">
+                            <i class="fa-solid fa-chevron-down iig-collapse-icon"></i>
+                            <span>🧬 API для генератора референсов</span>
+                        </div>
+                        <div class="iig-collapsible-content">
+                            <p class="hint">Альтернативный API для генерации референсов тел и образов. В гардеробе можно переключаться между основным API и этим. Для AI-уточнения описаний используется модель промптов (раздел «Генерация промпта»).</p>
+                            <div class="flex-row">
+                                <label>Эндпоинт</label>
+                                <input type="text" id="iig_refgen_endpoint" class="text_pole flex1" value="${settings.refGenEndpoint || ''}" placeholder="https://api.example.com/v1">
+                            </div>
+                            <div class="flex-row">
+                                <label>API ключ</label>
+                                <input type="password" id="iig_refgen_api_key" class="text_pole flex1" value="${settings.refGenApiKey || ''}">
+                                <div class="menu_button iig-key-toggle" id="iig_refgen_key_toggle"><i class="fa-solid fa-eye"></i></div>
+                            </div>
+                            <div class="flex-row">
+                                <label>Модель</label>
+                                <input type="text" id="iig_refgen_model" class="text_pole flex1" value="${settings.refGenModel || ''}" placeholder="gpt-4o">
+                            </div>
+                        </div>
+                    </div>
+
                     <!-- ======= SECTION: NPC ======= -->
                     <div class="iig-collapsible" data-section-id="npc">
                         <div class="iig-collapsible-header">
@@ -6260,6 +6430,17 @@ function bindSettingsEvents() {
         else { input.type = 'password'; icon.classList.replace('fa-eye-slash', 'fa-eye'); }
     });
 
+    // Reference generator API settings
+    document.getElementById('iig_refgen_endpoint')?.addEventListener('input', e => { settings.refGenEndpoint = e.target.value; saveSettings(); });
+    document.getElementById('iig_refgen_api_key')?.addEventListener('input', e => { settings.refGenApiKey = e.target.value; saveSettings(); });
+    document.getElementById('iig_refgen_model')?.addEventListener('input', e => { settings.refGenModel = e.target.value; saveSettings(); });
+    document.getElementById('iig_refgen_key_toggle')?.addEventListener('click', () => {
+        const input = document.getElementById('iig_refgen_api_key');
+        const icon = document.querySelector('#iig_refgen_key_toggle i');
+        if (input?.type === 'password') { input.type = 'text'; icon?.classList.replace('fa-eye', 'fa-eye-slash'); }
+        else if (input) { input.type = 'password'; icon?.classList.replace('fa-eye-slash', 'fa-eye'); }
+    });
+
     document.getElementById('iig_wardrobe_desc_model')?.addEventListener('change', (e) => { settings.wardrobeDescModel = e.target.value; saveSettings(); });
 
     document.getElementById('iig_refresh_desc_models')?.addEventListener('click', async (e) => {
@@ -6486,6 +6667,21 @@ let iigFloatingBtn = null;
 let iigWardrobeModal = null;
 let iigCurrentWardrobeTab = 'char';
 let iigWardrobeFilter = { category: 'all', search: '' };
+let iigRefGenState = {
+    target: 'char',
+    name: '',
+    characterImage: null,
+    outfitImage: null,
+    description: '',
+    refinedDescription: '',
+    finalPrompt: '',
+    flags: { ...REF_GEN_FLAG_DEFAULTS },
+    resultImage: null,
+    itemName: '',
+    category: 'full',
+    busy: false,
+    status: '',
+};
 
 function createFloatingWardrobeButton() {
     // Remove existing button if any
@@ -6586,6 +6782,9 @@ function openWardrobeModal() {
             <div class="iig-wardrobe-tab" data-tab="user">
                 <i class="fa-solid fa-user-pen"></i> Юзер
             </div>
+            <div class="iig-wardrobe-tab" data-tab="gen">
+                <i class="fa-solid fa-wand-magic-sparkles"></i> Генератор
+            </div>
         </div>
         <div class="iig-wardrobe-content" id="iig-wardrobe-content"></div>
     `;
@@ -6632,6 +6831,11 @@ function renderQuickWardrobeList() {
     const content = document.getElementById('iig-wardrobe-content');
     if (!content) return;
     
+    if (iigCurrentWardrobeTab === 'gen') {
+        renderReferenceGenerator(content);
+        return;
+    }
+
     const settings = getSettings();
     const target = iigCurrentWardrobeTab;
     const allItems = settings.wardrobeItems?.filter(i => i.target === target) || [];
@@ -6751,4 +6955,171 @@ function bindWardrobeCards(container, target, activeItem) {
     container.querySelector('.iig-footer-clear')?.addEventListener('click', () => {
         if (activeItem) toggleItem(activeItem.id);
     });
+}
+
+function renderReferenceGenerator(content) {
+    const settings = getSettings();
+    const s = iigRefGenState;
+    s.flags = normalizeRefGenFlags(s.flags);
+    const src = data => `data:${detectMimeType(data)};base64,${data}`;
+    const slot = (key, label) => `
+        <div class="iig-refgen-slot">
+            <div class="iig-refgen-slot-label">${label}</div>
+            ${s[key] ? `<img src="${src(s[key])}" alt="${label}">` : '<div class="iig-refgen-slot-empty"><i class="fa-solid fa-image" aria-hidden="true"></i></div>'}
+            <div class="iig-refgen-slot-actions">
+                <button type="button" class="menu_button iig-refgen-upload" data-slot="${key}">Загрузить</button>
+                ${s[key] ? `<button type="button" class="menu_button iig-refgen-clear" data-slot="${key}" aria-label="Убрать">✕</button>` : ''}
+            </div>
+        </div>`;
+    const flag = (key, label) => `<label class="checkbox_label"><input type="checkbox" class="iig-refgen-flag" data-flag="${key}" ${s.flags[key] ? 'checked' : ''}> <span>${label}</span></label>`;
+    const outfits = (settings.wardrobeItems || []).filter(i => i.imageData);
+    const disabled = s.busy ? 'disabled' : '';
+
+    content.innerHTML = `
+        <div class="iig-refgen">
+            <div class="flex-row">
+                <label for="iig_refgen_source">API</label>
+                <select id="iig_refgen_source" class="flex1">
+                    <option value="main" ${settings.refGenSource !== 'custom' ? 'selected' : ''}>Основной API картинок</option>
+                    <option value="custom" ${settings.refGenSource === 'custom' ? 'selected' : ''}>Свой API (настройки расширения)</option>
+                </select>
+            </div>
+            <div class="flex-row">
+                <label for="iig_refgen_name">Имя</label>
+                <input id="iig_refgen_name" class="text_pole flex1" value="${escapeHtml(s.name)}" placeholder="Имя персонажа">
+            </div>
+            <div class="iig-refgen-slots">${slot('characterImage', 'Персонаж')}${slot('outfitImage', 'Одежда')}</div>
+            ${outfits.length ? `<select id="iig_refgen_pick_outfit" class="text_pole" aria-label="Взять одежду из гардероба">
+                <option value="">— одежда из гардероба —</option>
+                ${outfits.map(i => `<option value="${escapeHtml(i.id)}">${escapeHtml(i.name)}</option>`).join('')}
+            </select>` : ''}
+            <input type="file" id="iig_refgen_file" accept="image/*" hidden>
+            <label for="iig_refgen_desc">Описание (тело, внешность)</label>
+            <textarea id="iig_refgen_desc" class="text_pole" rows="3" placeholder="Например: высокая, атлетичная, широкие плечи...">${escapeHtml(s.description)}</textarea>
+            <button type="button" class="menu_button iig-refgen-refine" ${disabled}><i class="fa-solid fa-robot"></i> AI-уточнение</button>
+            <label for="iig_refgen_refined">Уточнённое описание</label>
+            <textarea id="iig_refgen_refined" class="text_pole" rows="3" placeholder="Появится после AI-уточнения, можно править">${escapeHtml(s.refinedDescription)}</textarea>
+            <div class="iig-refgen-flags">
+                ${flag('ignoreTattoos', 'Игнорировать тату и пирсинг')}
+                ${flag('bodyFromDescription', 'Тип тела из описания')}
+                ${flag('noHairTransfer', 'Не переносить волосы')}
+                ${flag('noAccessoriesTransfer', 'Не переносить аксессуары')}
+            </div>
+            <button type="button" class="menu_button iig-refgen-build" ${disabled}><i class="fa-solid fa-hammer"></i> Собрать промпт</button>
+            <label for="iig_refgen_prompt">Итоговый промпт</label>
+            <textarea id="iig_refgen_prompt" class="text_pole" rows="5">${escapeHtml(s.finalPrompt)}</textarea>
+            <button type="button" class="menu_button iig-refgen-generate" ${disabled}><i class="fa-solid fa-image"></i> Сгенерировать</button>
+            <div class="iig-refgen-status" role="status" aria-live="polite">${escapeHtml(s.status)}</div>
+            ${s.resultImage ? `
+            <img class="iig-refgen-result" src="${src(s.resultImage)}" alt="Сгенерированный референс">
+            <div class="flex-row">
+                <input id="iig_refgen_item_name" class="text_pole flex1" value="${escapeHtml(s.itemName)}" placeholder="Название в гардеробе" aria-label="Название в гардеробе">
+                <select id="iig_refgen_target" aria-label="Чей гардероб">
+                    <option value="char" ${s.target !== 'user' ? 'selected' : ''}>Персонаж</option>
+                    <option value="user" ${s.target === 'user' ? 'selected' : ''}>Юзер</option>
+                </select>
+            </div>
+            <button type="button" class="menu_button iig-refgen-save" ${disabled}><i class="fa-solid fa-floppy-disk"></i> Сохранить в гардероб</button>` : ''}
+        </div>`;
+    bindReferenceGenerator(content);
+}
+
+function getRefGenPromptState(s = iigRefGenState) {
+    return { ...s, hasCharacterRef: Boolean(s.characterImage), hasOutfitRef: Boolean(s.outfitImage) };
+}
+
+function bindReferenceGenerator(content) {
+    const settings = getSettings();
+    const s = iigRefGenState;
+    const $ = selector => content.querySelector(selector);
+    // Re-render only if the generator tab is still on screen (the modal may be closed mid-request).
+    const rerender = () => {
+        if (iigCurrentWardrobeTab === 'gen' && document.getElementById('iig-wardrobe-content')) renderQuickWardrobeList();
+    };
+    const runBusy = async (status, task) => {
+        if (s.busy) return;
+        s.busy = true;
+        s.status = status;
+        rerender();
+        try {
+            await task(text => { s.status = text; const el = document.querySelector('.iig-refgen-status'); if (el) el.textContent = text; });
+            s.status = '';
+        } catch (error) {
+            s.status = `Ошибка: ${error.message}`;
+            toastr.error(error.message, 'Генератор референсов');
+        } finally {
+            s.busy = false;
+            rerender();
+        }
+    };
+
+    if (!s.name) {
+        const context = SillyTavern.getContext();
+        const name = context.characters?.[context.characterId]?.name || '';
+        if (name) { s.name = name; const input = $('#iig_refgen_name'); if (input) input.value = name; }
+    }
+
+    $('#iig_refgen_source')?.addEventListener('change', event => {
+        settings.refGenSource = event.target.value === 'custom' ? 'custom' : 'main';
+        saveSettings();
+    });
+
+    // Text fields update state only; no re-render, so typing is not interrupted.
+    const bindText = (selector, key) => $(selector)?.addEventListener('input', event => { s[key] = event.target.value; });
+    bindText('#iig_refgen_name', 'name');
+    bindText('#iig_refgen_desc', 'description');
+    bindText('#iig_refgen_refined', 'refinedDescription');
+    bindText('#iig_refgen_prompt', 'finalPrompt');
+    bindText('#iig_refgen_item_name', 'itemName');
+    $('#iig_refgen_target')?.addEventListener('change', event => { s.target = event.target.value === 'user' ? 'user' : 'char'; });
+
+    content.querySelectorAll('.iig-refgen-flag').forEach(box => {
+        box.addEventListener('change', () => { s.flags = { ...normalizeRefGenFlags(s.flags), [box.dataset.flag]: box.checked }; });
+    });
+
+    const fileInput = $('#iig_refgen_file');
+    let pendingSlot = null;
+    content.querySelectorAll('.iig-refgen-upload').forEach(button => {
+        button.addEventListener('click', () => { pendingSlot = button.dataset.slot; fileInput?.click(); });
+    });
+    fileInput?.addEventListener('change', async () => {
+        const file = fileInput.files?.[0];
+        if (!file || !pendingSlot) return;
+        try {
+            s[pendingSlot] = await resizeImageBase64(await readLibraryFileAsBase64(file), 1024);
+            rerender();
+        } catch (error) {
+            toastr.error(`Не удалось загрузить картинку: ${error.message}`);
+        } finally {
+            fileInput.value = '';
+        }
+    });
+    content.querySelectorAll('.iig-refgen-clear').forEach(button => {
+        button.addEventListener('click', () => { s[button.dataset.slot] = null; rerender(); });
+    });
+    $('#iig_refgen_pick_outfit')?.addEventListener('change', event => {
+        const item = (settings.wardrobeItems || []).find(i => i.id === event.target.value);
+        if (!item?.imageData) return;
+        s.outfitImage = item.imageData;
+        rerender();
+    });
+
+    $('.iig-refgen-refine')?.addEventListener('click', () => runBusy('AI-уточнение...', async () => {
+        s.refinedDescription = await refineReferenceDescription(s.description);
+    }));
+    $('.iig-refgen-build')?.addEventListener('click', () => {
+        s.finalPrompt = buildReferenceGenPrompt(getRefGenPromptState());
+        rerender();
+    });
+    $('.iig-refgen-generate')?.addEventListener('click', () => runBusy('Генерация...', async onStatus => {
+        if (!String(s.finalPrompt || '').trim()) s.finalPrompt = buildReferenceGenPrompt(getRefGenPromptState());
+        s.resultImage = await generateReferenceImage(getRefGenPromptState(), onStatus);
+        if (!s.itemName) s.itemName = `Референс ${s.name || ''}`.trim();
+    }));
+    $('.iig-refgen-save')?.addEventListener('click', () => runBusy('Сохранение...', async () => {
+        const resized = await resizeImageBase64(s.resultImage, 512);
+        const item = saveGeneratedReference(s, resized);
+        updateWardrobeInjection();
+        toastr.success(`Сохранено в гардероб: ${item.name}`, 'Генератор референсов');
+    }));
 }

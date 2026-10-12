@@ -611,26 +611,44 @@ body.iig-mode-inline .mes_text .iig-image-wrapper {
    ============================================================ */
 
 .iig-collapsible {
-    border: 1px solid rgba(255, 255, 255, 0.05);
-    border-radius: 8px;
-    margin-bottom: 8px;
+    border: 1px solid color-mix(in srgb, var(--iig-accent) 15%, transparent);
+    border-radius: 10px;
+    margin-bottom: 10px;
     overflow: hidden;
-    background: rgba(255, 255, 255, 0.01);
+    background: color-mix(in srgb, var(--iig-accent) 2%, var(--iig-surface));
+    transition: border-color 0.2s, box-shadow 0.2s;
 }
+
+.iig-collapsible:hover {
+    border-color: color-mix(in srgb, var(--iig-accent) 25%, transparent);
+}
+
+.iig-collapsible:not(.collapsed) {
+    border-color: var(--iig-accent);
+    box-shadow: 0 2px 12px color-mix(in srgb, var(--iig-accent) 10%, transparent);
+}
+
 
 .iig-collapsible-header {
     display: flex;
     align-items: center;
-    gap: 8px;
-    padding: 8px 12px;
+    gap: 10px;
+    padding: 10px 14px;
     cursor: pointer;
     user-select: none;
-    transition: background 0.15s;
+    transition: background 0.2s;
+    background: color-mix(in srgb, var(--iig-accent) 3%, transparent);
 }
 
 .iig-collapsible-header:hover {
-    background: rgba(255, 182, 193, 0.04);
+    background: color-mix(in srgb, var(--iig-accent) 8%, transparent);
 }
+
+.iig-collapsible:not(.collapsed) .iig-collapsible-header {
+    background: color-mix(in srgb, var(--iig-accent) 12%, transparent);
+    border-bottom: 1px solid color-mix(in srgb, var(--iig-accent) 20%, transparent);
+}
+
 
 .iig-collapsible-header span {
     font-size: 12px;
@@ -917,10 +935,13 @@ body.iig-mode-inline .mes_text .iig-image-wrapper {
     gap: 0;
     padding: 0;
     border-bottom: 1px solid color-mix(in srgb, var(--iig-wr-border) 60%, transparent);
+    overflow-x: auto;
+    scrollbar-width: thin;
 }
 
 .iig-wardrobe-tab {
-    flex: 1;
+    flex: 1 0 auto;
+    min-width: 90px;
     display: flex;
     align-items: center;
     justify-content: center;
@@ -953,6 +974,10 @@ body.iig-mode-inline .mes_text .iig-image-wrapper {
     gap: 8px;
     align-items: center;
     margin-bottom: 10px;
+}
+
+.iig-wardrobe-add {
+    flex-shrink: 0;
 }
 
 .iig-wardrobe-search {
@@ -1100,10 +1125,36 @@ body.iig-mode-inline .mes_text .iig-image-wrapper {
     display: flex;
     align-items: center;
     justify-content: center;
-    font-size: 11px;
+    font-size: 12px;
+    pointer-events: none;
 }
 
-/* ---- "Worn now" footer ---- */
+.iig-card-delete {
+    position: absolute;
+    bottom: 6px;
+    right: 6px;
+    width: 28px;
+    height: 28px;
+    padding: 0;
+    border: 1px solid color-mix(in srgb, var(--iig-wr-border) 70%, transparent);
+    border-radius: 50%;
+    background: color-mix(in srgb, var(--iig-wr-bg) 90%, transparent);
+    color: color-mix(in srgb, var(--iig-wr-text) 70%, transparent);
+    font-size: 11px;
+    cursor: pointer;
+    transition: background 0.15s, color 0.15s, border-color 0.15s;
+    backdrop-filter: blur(4px);
+}
+
+.iig-card-delete:hover,
+.iig-card-delete:focus-visible {
+    background: color-mix(in srgb, #dc3545 90%, transparent);
+    color: white;
+    border-color: #dc3545;
+    outline: none;
+}
+
+/* ---- Wardrobe footer with active outfit description ---- */
 .iig-wardrobe-footer {
     position: sticky;
     bottom: -12px;
@@ -1145,6 +1196,34 @@ body.iig-mode-inline .mes_text .iig-image-wrapper {
     opacity: 0.6;
 }
 
+.iig-wardrobe-description {
+    margin: 8px 0 0;
+    padding: 8px 10px;
+    background: color-mix(in srgb, var(--iig-wr-text) 3%, transparent);
+    border: 1px solid color-mix(in srgb, var(--iig-wr-border) 40%, transparent);
+    border-radius: 6px;
+}
+
+.iig-wardrobe-description label {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--iig-wr-text);
+    margin-bottom: 5px;
+}
+
+.iig-wardrobe-description textarea {
+    width: 100%;
+    resize: vertical;
+    font-size: 12px;
+    background: var(--iig-wr-bg);
+    border: 1px solid color-mix(in srgb, var(--iig-wr-border) 50%, transparent);
+    color: var(--iig-wr-text);
+}
+
+
 .iig-footer-clear {
     margin: 0 !important;
     padding: 4px 8px !important;
@@ -1163,6 +1242,39 @@ body.iig-mode-inline .mes_text .iig-image-wrapper {
     gap: 8px;
     color: var(--iig-wr-text);
     font-size: 12px;
+}
+
+.iig-refgen-help {
+    margin-bottom: 4px;
+    padding: 8px 10px;
+    background: color-mix(in srgb, var(--iig-wr-accent) 8%, transparent);
+    border: 1px solid color-mix(in srgb, var(--iig-wr-accent) 25%, transparent);
+    border-radius: 6px;
+    font-size: 11px;
+}
+
+.iig-refgen-help summary {
+    cursor: pointer;
+    font-weight: 600;
+    color: var(--iig-wr-text);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    user-select: none;
+}
+
+.iig-refgen-help summary:hover {
+    color: var(--iig-wr-accent);
+}
+
+.iig-refgen-help ol {
+    margin: 8px 0 0;
+    padding-left: 20px;
+    line-height: 1.5;
+}
+
+.iig-refgen-help li {
+    margin-bottom: 4px;
 }
 
 .iig-refgen textarea { width: 100%; resize: vertical; font-size: 12px; }

@@ -111,6 +111,8 @@ const defaultSettings = Object.freeze({
     wardrobeSendMode: 'both', // 'both', 'text', 'none'
     activeWardrobeChar: null,
     activeWardrobeUser: null,
+    // Active outfit per RPG character: { [rpgCharacterId]: wardrobeItemId }
+    activeWardrobeRpg: {},
     injectWardrobeToChat: true,
     // Hex only: values are bound to <input type="color">
     wardrobeTheme: {
@@ -333,6 +335,7 @@ function getSettings() {
         if (!Object.hasOwn(item, 'description')) item.description = '';
         if (!Object.hasOwn(item, 'category')) item.category = 'full';
     }
+    if (!s.activeWardrobeRpg || typeof s.activeWardrobeRpg !== 'object' || Array.isArray(s.activeWardrobeRpg)) s.activeWardrobeRpg = {};
     if (!Array.isArray(s.styleGalleryItems)) s.styleGalleryItems = [];
     if (!Array.isArray(s.activeStyleIds)) s.activeStyleIds = [];
     for (const item of s.styleGalleryItems) {
@@ -528,7 +531,13 @@ function removeRpgCharacter(charId) {
     if (!profile) return;
     
     profile.rpgCharacters = profile.rpgCharacters.filter(char => char.id !== charId);
+    // Outfits of a removed RPG character are unreachable from any tab, so drop them with it.
+    if (settings.activeWardrobeRpg) delete settings.activeWardrobeRpg[charId];
+    if (Array.isArray(settings.wardrobeItems)) {
+        settings.wardrobeItems = settings.wardrobeItems.filter(item => item.target !== `rpg:${charId}`);
+    }
     saveSettings();
+    if (typeof updateWardrobeInjection === 'function') updateWardrobeInjection();
 }
 
 function updateRpgCharacter(charId, updates = {}) {
@@ -590,15 +599,21 @@ async function collectRpgCharacterReferences(prompt, settings = getSettings()) {
     const profile = getCharacterProfile('char', key, settings, false);
     
     if (!profile || !profile.rpgMode || profile.rpgCharacters.length === 0) {
-        return { refs: [], descriptions: [] };
+        return { refs: [], descriptions: [], outfits: [] };
     }
     
     const refs = [];
     const descriptions = [];
+    // Active wardrobe outfits of RPG characters mentioned in the prompt
+    const outfits = [];
     
     for (const char of profile.rpgCharacters) {
         if (!char.name) continue;
         if (!nameAppearsInPrompt(char.name, prompt)) continue;
+        
+        const outfitId = settings.activeWardrobeRpg?.[char.id];
+        const outfit = outfitId ? (settings.wardrobeItems || []).find(i => i.id === outfitId) : null;
+        if (outfit) outfits.push({ name: char.name, outfit });
         
         if (char.appearance) {
             descriptions.push(`[RPG CHARACTER "${char.name}" APPEARANCE]: ${char.appearance}`);
@@ -615,7 +630,7 @@ async function collectRpgCharacterReferences(prompt, settings = getSettings()) {
         }
     }
     
-    return { refs, descriptions };
+    return { refs, descriptions, outfits };
 }
 
 function getCharacterLibraryKey(character, index = 0) {
@@ -1337,10 +1352,23 @@ async function generateHairstyleDescription(itemId) {
     return description;
 }
 
+// Wardrobe targets: 'char', 'user' or 'rpg:<rpgCharacterId>' (RPG characters of the current bot).
+function isRpgWardrobeTarget(target) {
+    return typeof target === 'string' && target.startsWith('rpg:') && target.length > 4;
+}
+
+function getActiveWardrobeId(target, settings = getSettings()) {
+    if (isRpgWardrobeTarget(target)) return settings.activeWardrobeRpg?.[target.slice(4)] || null;
+    return settings[target === 'char' ? 'activeWardrobeChar' : 'activeWardrobeUser'] || null;
+}
+
 function removeWardrobeItem(itemId) {
     const settings = getSettings();
     if (settings.activeWardrobeChar === itemId) settings.activeWardrobeChar = null;
     if (settings.activeWardrobeUser === itemId) settings.activeWardrobeUser = null;
+    for (const [rpgId, activeId] of Object.entries(settings.activeWardrobeRpg || {})) {
+        if (activeId === itemId) delete settings.activeWardrobeRpg[rpgId];
+    }
     settings.wardrobeItems = settings.wardrobeItems.filter(i => i.id !== itemId);
     saveSettings();
     updateWardrobeInjection();
@@ -1348,16 +1376,32 @@ function removeWardrobeItem(itemId) {
 
 function setActiveWardrobe(itemId, target) {
     const settings = getSettings();
-    const key = target === 'char' ? 'activeWardrobeChar' : 'activeWardrobeUser';
-    settings[key] = settings[key] === itemId ? null : itemId;
+    if (isRpgWardrobeTarget(target)) {
+        const rpgId = target.slice(4);
+        if (!settings.activeWardrobeRpg || typeof settings.activeWardrobeRpg !== 'object') settings.activeWardrobeRpg = {};
+        if (settings.activeWardrobeRpg[rpgId] === itemId || !itemId) delete settings.activeWardrobeRpg[rpgId];
+        else settings.activeWardrobeRpg[rpgId] = itemId;
+    } else {
+        const key = target === 'char' ? 'activeWardrobeChar' : 'activeWardrobeUser';
+        settings[key] = settings[key] === itemId ? null : itemId;
+    }
     saveSettings();
     updateWardrobeInjection();
 }
 
 function getActiveWardrobeItem(target) {
     const settings = getSettings();
-    const activeId = settings[target === 'char' ? 'activeWardrobeChar' : 'activeWardrobeUser'];
+    const activeId = getActiveWardrobeId(target, settings);
     return activeId ? (settings.wardrobeItems.find(i => i.id === activeId) || null) : null;
+}
+
+/** RPG characters of the current bot that can wear wardrobe items (RPG mode on, named). */
+function getCurrentRpgWardrobeTargets(settings = getSettings()) {
+    const profile = getCharacterProfile('char', getCurrentCharacterLibraryKey(), settings, false);
+    if (!profile?.rpgMode || !Array.isArray(profile.rpgCharacters)) return [];
+    return profile.rpgCharacters
+        .filter(c => c?.id && String(c.name || '').trim())
+        .map(c => ({ target: `rpg:${c.id}`, id: c.id, name: String(c.name).trim() }));
 }
 
 function updateWardrobeItemDescription(itemId, description) {
@@ -1626,6 +1670,11 @@ function updateWardrobeInjection() {
             parts.push(`[${userName} is currently wearing: ${userItem.description}]`);
         }
 
+        for (const rpg of getCurrentRpgWardrobeTargets(settings)) {
+            const rpgItem = getActiveWardrobeItem(rpg.target);
+            if (rpgItem?.description) parts.push(`[${rpg.name} is currently wearing: ${rpgItem.description}]`);
+        }
+
         const depth = settings.wardrobeInjectionDepth || 1;
         if (typeof context.setExtensionPrompt === 'function') {
             context.setExtensionPrompt(INJECTION_KEY, parts.join('\n'), 1, depth);
@@ -1761,7 +1810,7 @@ async function generateReferenceImage(state, onStatus, signal) {
 /** Saves the generated reference as a wardrobe item, keeping description and prompt for later edits. */
 function saveGeneratedReference(state, resizedImage) {
     if (!resizedImage) throw new Error('Сначала сгенерируйте картинку');
-    const target = state.target === 'user' ? 'user' : 'char';
+    const target = state.target === 'user' || isRpgWardrobeTarget(state.target) ? state.target : 'char';
     const name = String(state.itemName || '').trim() || `Референс ${String(state.name || '').trim() || ''}`.trim();
     const item = addWardrobeItem(name, resizedImage, target, state.category || 'full');
     item.description = String(state.refinedDescription || state.description || '').trim();
@@ -1900,6 +1949,18 @@ const FAQ_HINTS = Object.freeze({
     vision: {
         '#iig_wardrobe_desc_endpoint': 'API для vision-описаний (GPT-4o, Claude 3.5 Sonnet и т.д.).',
         '#iig_wardrobe_desc_prompt': 'Инструкция для vision модели: что описывать на картинке outfit.',
+    },
+    refgen: {
+        _section: 'Отдельный API для вкладки «Генератор» в гардеробе. Если поля пустые, используется основной API. В самой вкладке источник переключается между «основной» и «этот».',
+        '#iig_refgen_endpoint': 'URL OpenAI-совместимого API для референсов (например, https://api.example.com/v1).',
+        '#iig_refgen_api_key': 'Ключ этого API. Хранится в настройках SillyTavern, кнопка с глазом показывает его.',
+        '#iig_refgen_model': 'Модель для картинок-референсов. AI-уточнение описания идёт через модель из «Генерации промпта».',
+    },
+    wardrobe_user: {
+        _section: 'Одежда юзера. Для RPG-персонажей наряды добавляются кнопкой «+» прямо в гардеробе, на их вкладке.',
+    },
+    hairstyle_mode: {
+        _section: 'Что отправлять в генерацию для причёсок: картинку с текстом, только текст или ничего.',
     },
     npc: {
         _section: 'Дополнительные персонажи (NPC). Если их имя упомянуто в промпте, система отправит их лица как референсы.',
@@ -2158,22 +2219,26 @@ async function collectReferenceImages(prompt) {
     // ===== STEP 2: Collect clothing references =====
 
     const textOnlyProvider = ['novelai', 'novelai-direct'].includes(settings.apiType);
+    const wardrobeMode = settings.wardrobeSendMode || 'both';
+    const pushOutfit = (name, outfit) => {
+        if (!outfit || wardrobeMode === 'none') return;
+        if (outfit.imageData && wardrobeMode === 'both' && !textOnlyProvider) {
+            clothingRefs.push({
+                data: outfit.imageData, mimeType: detectMimeType(outfit.imageData),
+                name, outfitName: outfit.name, description: outfit.description || '', type: 'clothing'
+            });
+        } else if (outfit.description?.trim()) {
+            textOnlyClothing.push({ charName: name, outfitName: outfit.name, description: outfit.description });
+        } else {
+            warnings.push(`Одежда "${outfit.name}" для ${name} не отправлена: добавьте текстовое описание.`);
+        }
+    };
+    // RPG characters mentioned in the prompt wear their own active outfits
+    for (const { name, outfit } of (rpgRefs.outfits || [])) pushOutfit(name, outfit);
+
     for (const target of ['char', 'user']) {
         const name = target === 'char' ? (charName || 'Character') : (userName || 'User');
-        const outfit = getActiveWardrobeItem(target);
-        const wardrobeMode = settings.wardrobeSendMode || 'both';
-        if (outfit && wardrobeMode !== 'none') {
-            if (outfit.imageData && wardrobeMode === 'both' && !textOnlyProvider) {
-                clothingRefs.push({
-                    data: outfit.imageData, mimeType: detectMimeType(outfit.imageData),
-                    name, outfitName: outfit.name, description: outfit.description || '', type: 'clothing'
-                });
-            } else if (outfit.description?.trim()) {
-                textOnlyClothing.push({ charName: name, outfitName: outfit.name, description: outfit.description });
-            } else {
-                warnings.push(`Одежда "${outfit.name}" для ${name} не отправлена: добавьте текстовое описание.`);
-            }
-        }
+        pushOutfit(name, getActiveWardrobeItem(target));
 
         const hairstyle = getActiveHairstyleItem(target);
         const hairMode = settings.hairstyleSendMode || 'both';
@@ -6418,9 +6483,12 @@ function updateFloatingButtonBadge() {
     const settings = getSettings();
     let activeCount = 0;
     
-    // Count active outfits
+    // Count active outfits (bot, user and RPG characters of the current bot)
     if (settings.activeWardrobeChar) activeCount++;
     if (settings.activeWardrobeUser) activeCount++;
+    for (const rpg of getCurrentRpgWardrobeTargets(settings)) {
+        if (getActiveWardrobeId(rpg.target, settings)) activeCount++;
+    }
     
     // Remove existing badge
     const existingBadge = iigFloatingBtn.querySelector('.iig-bar-count');
@@ -6470,15 +6538,10 @@ function openWardrobeModal() {
             </div>
         </div>
         <div class="iig-wardrobe-tabs">
-            <div class="iig-wardrobe-tab iig-tab-active" data-tab="char">
-                <i class="fa-solid fa-user"></i> Персонаж
-            </div>
-            <div class="iig-wardrobe-tab" data-tab="user">
-                <i class="fa-solid fa-user-pen"></i> Юзер
-            </div>
-            <div class="iig-wardrobe-tab" data-tab="gen">
-                <i class="fa-solid fa-wand-magic-sparkles"></i> Генератор
-            </div>
+            ${buildWardrobeTabs().map(tab => `
+            <div class="iig-wardrobe-tab ${tab.id === iigCurrentWardrobeTab ? 'iig-tab-active' : ''}" data-tab="${escapeHtml(tab.id)}" role="tab" tabindex="0" aria-selected="${tab.id === iigCurrentWardrobeTab}">
+                <i class="fa-solid ${tab.icon}" aria-hidden="true"></i> ${escapeHtml(tab.label)}
+            </div>`).join('')}
         </div>
         <div class="iig-wardrobe-content" id="iig-wardrobe-content"></div>
     `;
@@ -6494,12 +6557,18 @@ function openWardrobeModal() {
     });
     
     modal.querySelectorAll('.iig-wardrobe-tab').forEach(tab => {
-        tab.addEventListener('click', () => {
+        const select = () => {
             iigCurrentWardrobeTab = tab.dataset.tab;
             modal.querySelectorAll('.iig-wardrobe-tab').forEach(t => {
-                t.classList.toggle('iig-tab-active', t.dataset.tab === iigCurrentWardrobeTab);
+                const active = t.dataset.tab === iigCurrentWardrobeTab;
+                t.classList.toggle('iig-tab-active', active);
+                t.setAttribute('aria-selected', String(active));
             });
             renderQuickWardrobeList();
+        };
+        tab.addEventListener('click', select);
+        tab.addEventListener('keydown', e => {
+            if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); select(); }
         });
     });
     
@@ -6521,6 +6590,18 @@ function closeWardrobeModal() {
     iigWardrobeModal = null;
 }
 
+/** Tabs: bot, user, one per RPG character of the current bot, generator. Resets a stale RPG tab. */
+function buildWardrobeTabs(settings = getSettings()) {
+    const tabs = [
+        { id: 'char', label: 'Персонаж', icon: 'fa-user' },
+        { id: 'user', label: 'Юзер', icon: 'fa-user-pen' },
+        ...getCurrentRpgWardrobeTargets(settings).map(rpg => ({ id: rpg.target, label: rpg.name, icon: 'fa-dice-d20' })),
+        { id: 'gen', label: 'Генератор', icon: 'fa-wand-magic-sparkles' },
+    ];
+    if (!tabs.some(tab => tab.id === iigCurrentWardrobeTab)) iigCurrentWardrobeTab = 'char';
+    return tabs;
+}
+
 function renderQuickWardrobeList() {
     const content = document.getElementById('iig-wardrobe-content');
     if (!content) return;
@@ -6533,7 +6614,7 @@ function renderQuickWardrobeList() {
     const settings = getSettings();
     const target = iigCurrentWardrobeTab;
     const allItems = settings.wardrobeItems?.filter(i => i.target === target) || [];
-    const activeId = target === 'char' ? settings.activeWardrobeChar : settings.activeWardrobeUser;
+    const activeId = getActiveWardrobeId(target, settings);
     const activeItem = allItems.find(i => i.id === activeId) || null;
     const items = filterWardrobeItems(allItems, iigWardrobeFilter);
     const imgSrc = item => `data:${detectMimeType(item.imageData)};base64,${item.imageData}`;
@@ -6548,13 +6629,15 @@ function renderQuickWardrobeList() {
                         <label><input type="radio" name="iig_wardrobe_cat" value="${key}" ${iigWardrobeFilter.category === key ? 'checked' : ''}> ${escapeHtml(label)}</label>`).join('')}
                 </div>
             </details>
+            <button type="button" class="menu_button iig-wardrobe-add" title="Добавить одежду" aria-label="Добавить одежду"><i class="fa-solid fa-plus" aria-hidden="true"></i></button>
+            <input type="file" class="iig-wardrobe-add-file" accept="image/*" hidden>
         </div>`;
 
     const body = items.length === 0
         ? `<div class="iig-no-outfits">
                 <i class="fa-solid fa-shirt" aria-hidden="true"></i>
                 <p>${allItems.length === 0 ? 'Нет нарядов в гардеробе' : 'Ничего не найдено'}</p>
-                ${allItems.length === 0 ? '<small>Добавьте одежду в настройках расширения</small>' : ''}
+                ${allItems.length === 0 ? '<small>Нажмите «+», чтобы добавить картинку одежды</small>' : ''}
            </div>`
         : `<div class="iig-wardrobe-grid">${items.map(item => `
             <div class="iig-wardrobe-card ${item.id === activeId ? 'iig-card-active' : ''}" data-id="${escapeHtml(item.id)}" role="button" tabindex="0" aria-pressed="${item.id === activeId}" title="${item.id === activeId ? 'Снять' : 'Надеть'}">
@@ -6566,6 +6649,7 @@ function renderQuickWardrobeList() {
                     <div class="iig-wardrobe-card-category">${escapeHtml(WARDROBE_CATEGORIES[item.category] || WARDROBE_CATEGORIES.full)}</div>
                 </div>
                 ${item.id === activeId ? '<div class="iig-card-check" aria-hidden="true"><i class="fa-solid fa-check"></i></div>' : ''}
+                <button type="button" class="iig-card-delete" title="Удалить" aria-label="Удалить ${escapeHtml(item.name)}"><i class="fa-solid fa-trash" aria-hidden="true"></i></button>
             </div>`).join('')}
            </div>`;
 
@@ -6577,11 +6661,40 @@ function renderQuickWardrobeList() {
                    <span class="iig-footer-name">${escapeHtml(activeItem.name)}</span>
                    <button type="button" class="menu_button iig-footer-clear" title="Снять" aria-label="Снять одежду"><i class="fa-solid fa-xmark"></i></button>`
                 : '<span class="iig-footer-name iig-footer-empty">ничего</span>'}
-        </div>`;
+        </div>
+        ${activeItem ? `
+        <div class="iig-wardrobe-description">
+            <label for="iig_wardrobe_desc_${escapeHtml(activeItem.id)}"><i class="fa-solid fa-align-left"></i> Описание для промпта:</label>
+            <textarea id="iig_wardrobe_desc_${escapeHtml(activeItem.id)}" class="text_pole" rows="3" placeholder="Описание одежды, которое будет передано в промпт">${escapeHtml(activeItem.description || '')}</textarea>
+        </div>` : ''}`;
 
     content.innerHTML = toolbar + body + footer;
     bindWardrobeToolbar(content);
     bindWardrobeCards(content, target, activeItem);
+    bindWardrobeAdd(content, target);
+}
+
+/** "+" in the wardrobe: upload an outfit image for the current target (bot, user or RPG character). */
+function bindWardrobeAdd(container, target) {
+    const button = container.querySelector('.iig-wardrobe-add');
+    const input = container.querySelector('.iig-wardrobe-add-file');
+    button?.addEventListener('click', () => input?.click());
+    input?.addEventListener('change', async () => {
+        const file = input.files?.[0];
+        if (!file) return;
+        try {
+            const resized = await resizeImageBase64(await readLibraryFileAsBase64(file), 512);
+            const name = file.name.replace(/\.[^.]+$/, '').trim() || 'Outfit';
+            const category = iigWardrobeFilter.category in WARDROBE_CATEGORIES ? iigWardrobeFilter.category : 'full';
+            const item = addWardrobeItem(name, resized, target, category);
+            toastr.success(`Добавлено: ${item.name}. Описание можно задать в настройках или через генератор.`, 'Гардероб');
+            renderQuickWardrobeList();
+        } catch (error) {
+            toastr.error(`Не удалось добавить: ${error.message}`, 'Гардероб');
+        } finally {
+            input.value = '';
+        }
+    });
 }
 
 function filterWardrobeItems(items, filter) {
@@ -6639,6 +6752,15 @@ function bindWardrobeCards(container, target, activeItem) {
         img?.addEventListener('keydown', event => {
             if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); event.stopPropagation(); img.click(); }
         });
+        card.querySelector('.iig-card-delete')?.addEventListener('click', event => {
+            event.stopPropagation();
+            const item = settings.wardrobeItems.find(i => i.id === itemId);
+            if (!item || !confirm(`Удалить «${item.name}» из гардероба?`)) return;
+            removeWardrobeItem(itemId);
+            updateFloatingButtonBadge();
+            renderQuickWardrobeList();
+            toastr.info(`Удалено: ${item.name}`, 'Гардероб');
+        });
         card.addEventListener('click', () => toggleItem(itemId));
         card.addEventListener('keydown', event => {
             if (event.target !== card) return;
@@ -6649,6 +6771,14 @@ function bindWardrobeCards(container, target, activeItem) {
     container.querySelector('.iig-footer-clear')?.addEventListener('click', () => {
         if (activeItem) toggleItem(activeItem.id);
     });
+
+    const descArea = container.querySelector(`#iig_wardrobe_desc_${CSS.escape(activeItem?.id || '')}`);
+    if (descArea && activeItem) {
+        descArea.addEventListener('blur', () => {
+            updateWardrobeItemDescription(activeItem.id, descArea.value);
+            toastr.info('Описание сохранено', 'Гардероб');
+        });
+    }
 }
 
 function renderReferenceGenerator(content) {
@@ -6671,6 +6801,17 @@ function renderReferenceGenerator(content) {
 
     content.innerHTML = `
         <div class="iig-refgen">
+            <details class="iig-refgen-help">
+                <summary title="Как пользоваться генератором"><i class="fa-solid fa-circle-question" aria-hidden="true"></i> Как это работает?</summary>
+                <ol>
+                    <li><b>API</b>: основной API картинок или свой (раздел «API для генератора референсов» в настройках).</li>
+                    <li><b>Персонаж / Одежда</b>: загрузите фото лица и одежды или выберите одежду из гардероба.</li>
+                    <li><b>Описание</b>: тип тела и внешность. «AI-уточнение» перепишет его через модель промптов, результат можно править.</li>
+                    <li><b>Флажки</b>: что не переносить с картинок (тату, волосы, аксессуары).</li>
+                    <li><b>Собрать промпт</b>, при необходимости поправьте текст, затем <b>Сгенерировать</b>.</li>
+                    <li>Выберите, чей это гардероб (персонаж, юзер или RPG-персонаж), и <b>сохраните</b>. Описание и промпт сохранятся вместе с картинкой.</li>
+                </ol>
+            </details>
             <div class="flex-row">
                 <label for="iig_refgen_source">API</label>
                 <select id="iig_refgen_source" class="flex1">
@@ -6709,8 +6850,9 @@ function renderReferenceGenerator(content) {
             <div class="flex-row">
                 <input id="iig_refgen_item_name" class="text_pole flex1" value="${escapeHtml(s.itemName)}" placeholder="Название в гардеробе" aria-label="Название в гардеробе">
                 <select id="iig_refgen_target" aria-label="Чей гардероб">
-                    <option value="char" ${s.target !== 'user' ? 'selected' : ''}>Персонаж</option>
+                    <option value="char" ${s.target === 'char' ? 'selected' : ''}>Персонаж</option>
                     <option value="user" ${s.target === 'user' ? 'selected' : ''}>Юзер</option>
+                    ${getCurrentRpgWardrobeTargets(settings).map(rpg => `<option value="${escapeHtml(rpg.target)}" ${s.target === rpg.target ? 'selected' : ''}>RPG: ${escapeHtml(rpg.name)}</option>`).join('')}
                 </select>
             </div>
             <button type="button" class="menu_button iig-refgen-save" ${disabled}><i class="fa-solid fa-floppy-disk"></i> Сохранить в гардероб</button>` : ''}
@@ -6765,7 +6907,7 @@ function bindReferenceGenerator(content) {
     bindText('#iig_refgen_refined', 'refinedDescription');
     bindText('#iig_refgen_prompt', 'finalPrompt');
     bindText('#iig_refgen_item_name', 'itemName');
-    $('#iig_refgen_target')?.addEventListener('change', event => { s.target = event.target.value === 'user' ? 'user' : 'char'; });
+    $('#iig_refgen_target')?.addEventListener('change', event => { s.target = event.target.value; });
 
     content.querySelectorAll('.iig-refgen-flag').forEach(box => {
         box.addEventListener('change', () => { s.flags = { ...normalizeRefGenFlags(s.flags), [box.dataset.flag]: box.checked }; });

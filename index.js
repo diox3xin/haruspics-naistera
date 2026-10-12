@@ -140,6 +140,8 @@ const defaultSettings = Object.freeze({
     promptGenModel: '',
     promptGenMaxTokens: 700,
     promptGenTemperature: 0.7,
+    // Stream the image prompt token by token into the message panel
+    promptGenStream: false,
     // ===== Reference Generator =====
     refGenSource: 'main', // 'main' | 'custom'
     refGenEndpoint: '',
@@ -804,7 +806,36 @@ function getPromptGenerationContext(message, instruction) {
     ].join('\n\n');
 }
 
-async function generateImagePromptForMessage(messageId, signal) {
+/**
+ * Reads an OpenAI-compatible SSE stream (data: {...choices[0].delta.content}).
+ * Calls onChunk(fullTextSoFar) on every delta; returns the full text.
+ */
+async function readChatCompletionStream(response, onChunk) {
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let text = '';
+    while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop();
+        for (const raw of lines) {
+            const line = raw.trim();
+            if (!line.startsWith('data:')) continue;
+            const data = line.slice(5).trim();
+            if (data === '[DONE]') return text;
+            try {
+                const delta = JSON.parse(data).choices?.[0]?.delta?.content;
+                if (delta) { text += delta; onChunk?.(text); }
+            } catch { /* partial or keep-alive line */ }
+        }
+    }
+    return text;
+}
+
+async function generateImagePromptForMessage(messageId, signal, onChunk = null) {
     const context = SillyTavern.getContext();
     const message = context.chat?.[messageId];
     if (!message) throw new Error('Сообщение не найдено');
@@ -825,12 +856,16 @@ async function generateImagePromptForMessage(messageId, signal) {
             temperature: Math.max(0, Math.min(2, Number(settings.promptGenTemperature) || 0.7)),
             max_tokens: Math.max(64, Math.min(4000, Number(settings.promptGenMaxTokens) || 700)),
             messages: [{ role: 'user', content: getPromptGenerationContext(message, instruction) }],
+            ...(onChunk ? { stream: true } : {}),
         }),
         signal,
     });
     if (!response.ok) throw new Error(`Prompt API (${response.status}): ${(await response.text().catch(() => '')).slice(0, 500)}`);
-    const result = await response.json();
-    const prompt = result.choices?.[0]?.message?.content?.trim();
+    // Some proxies ignore stream:true and answer with plain JSON
+    const isStream = onChunk && response.body && /event-stream/i.test(response.headers.get('content-type') || '');
+    const prompt = isStream
+        ? (await readChatCompletionStream(response, onChunk)).trim()
+        : (await response.json()).choices?.[0]?.message?.content?.trim();
     if (!prompt) throw new Error('Модель промпта вернула пустой ответ');
 
     if (!message.extra || typeof message.extra !== 'object') message.extra = {};
@@ -3794,7 +3829,7 @@ function renderPromptPanel(panel, messageId) {
     const instruction = getPromptInstructions().find(item => item.id === state.instructionId) || getActivePromptInstruction();
     panel.innerHTML = `${state.imagePath ? `<img class="iig-prompt-result-image" src="${escapeHtml(state.imagePath)}" alt="${escapeHtml(state.prompt || 'Generated image')}">` : ''}
         <div class="iig-prompt-panel-head"><strong><i class="fa-solid fa-wand-magic-sparkles"></i> Image prompt</strong><span class="iig-prompt-status"></span></div>
-        <div class="iig-prompt-panel-controls"><span class="iig-prompt-selection">${escapeHtml(instruction.name)}</span><button type="button" class="menu_button iig-prompt-generate"><i class="fa-solid fa-wand-magic-sparkles"></i> Промпт</button><button type="button" class="menu_button iig-image-from-prompt"><i class="fa-solid fa-image"></i> Картинка</button></div>
+        <div class="iig-prompt-panel-controls"><span class="iig-prompt-selection">${escapeHtml(instruction.name)}</span><button type="button" class="menu_button iig-prompt-stream-toggle${getSettings().promptGenStream ? ' iig-stream-on' : ''}" title="Стриминг промпта" aria-pressed="${!!getSettings().promptGenStream}"><i class="fa-solid fa-bolt" aria-hidden="true"></i> Стрим</button><button type="button" class="menu_button iig-prompt-generate"><i class="fa-solid fa-wand-magic-sparkles"></i> Промпт</button><button type="button" class="menu_button iig-prompt-cancel" hidden title="Отменить генерацию промпта"><i class="fa-solid fa-stop" aria-hidden="true"></i> Стоп</button><button type="button" class="menu_button iig-image-from-prompt"><i class="fa-solid fa-image"></i> Картинка</button></div>
         <textarea class="iig-prompt-value" rows="3" placeholder="Здесь появится prompt картинки..."></textarea>
         <div class="iig-prompt-meta"><span>Стиль: ${escapeHtml(state.style || buildEffectiveStyle('') || 'не выбран')}</span><span>Негатив: ${escapeHtml(state.negativePrompt || getActiveNegativePrompt() || 'не выбран')}</span></div>`;
     const textarea = panel.querySelector('.iig-prompt-value');
@@ -3810,24 +3845,53 @@ function renderPromptPanel(panel, messageId) {
         };
         await context.saveChat();
     });
+    const cancelButton = panel.querySelector('.iig-prompt-cancel');
+    // Re-rendered panel while a request is running: keep the stop button visible
+    if (cancelButton) cancelButton.hidden = !activePromptAbortControllers.has(messageId);
+    cancelButton?.addEventListener('click', () => {
+        activePromptAbortControllers.get(messageId)?.abort();
+    });
+    panel.querySelector('.iig-prompt-stream-toggle')?.addEventListener('click', event => {
+        const settings = getSettings();
+        settings.promptGenStream = !settings.promptGenStream;
+        saveSettings();
+        // Global setting: sync every visible panel
+        document.querySelectorAll('.iig-prompt-stream-toggle').forEach(btn => {
+            btn.classList.toggle('iig-stream-on', settings.promptGenStream);
+            btn.setAttribute('aria-pressed', String(settings.promptGenStream));
+        });
+        toastr.info(settings.promptGenStream ? 'Стриминг промпта включён' : 'Стриминг промпта выключен');
+    });
     panel.querySelector('.iig-prompt-generate')?.addEventListener('click', async event => {
         const button = event.currentTarget;
         if (activePromptAbortControllers.has(messageId)) return;
         const controller = new AbortController();
         activePromptAbortControllers.set(messageId, controller);
         button.classList.add('disabled');
+        if (cancelButton) cancelButton.hidden = false;
         const status = panel.querySelector('.iig-prompt-status');
         if (status) status.textContent = 'Создание prompt...';
+        const onChunk = getSettings().promptGenStream
+            ? text => { textarea.value = text; textarea.scrollTop = textarea.scrollHeight; }
+            : null;
         try {
-            const result = await generateImagePromptForMessage(messageId, controller.signal);
+            await generateImagePromptForMessage(messageId, controller.signal, onChunk);
             renderPromptPanel(panel, messageId);
             toastr.success('Промпт картинки создан');
         } catch (error) {
-            if (status) status.textContent = error.message;
-            toastr.error(`Промпт: ${error.message}`);
+            if (error?.name === 'AbortError') {
+                // Restore the saved prompt instead of the half-streamed text
+                textarea.value = message.extra?.iig_prompt_block?.prompt || '';
+                if (status) status.textContent = 'Отменено';
+                toastr.info('Генерация промпта отменена');
+            } else {
+                if (status) status.textContent = error.message;
+                toastr.error(`Промпт: ${error.message}`);
+            }
         } finally {
             activePromptAbortControllers.delete(messageId);
             button.classList.remove('disabled');
+            if (cancelButton) cancelButton.hidden = true;
         }
     });
     panel.querySelector('.iig-image-from-prompt')?.addEventListener('click', async event => {

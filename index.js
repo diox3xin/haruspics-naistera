@@ -3926,7 +3926,13 @@ function openReferenceImageEditor(imageData, title = 'Просмотр и обр
         });
         img.onload = () => { save.disabled = false; reset(); };
         img.onerror = () => { status.textContent = 'Не удалось открыть изображение. Выберите другой файл.'; };
-        document.body.appendChild(dialog);
+        // Mount inside the wardrobe modal when it is open, so the editor belongs to that window.
+        // Overlay click handler checks e.target === overlay, and keydown is stopped above,
+        // so interacting with the editor never closes the wardrobe.
+        const host = (typeof iigWardrobeModal !== 'undefined' && iigWardrobeModal?.isConnected)
+            ? (iigWardrobeModal.querySelector('#iig-wardrobe-modal') || iigWardrobeModal)
+            : document.body;
+        host.appendChild(dialog);
         dialog.showModal();
         img.src = `data:${detectMimeType(imageData)};base64,${imageData}`;
     });
@@ -6130,19 +6136,34 @@ function createFloatingWardrobeButton() {
     iigFloatingBtn?.remove();
     iigWardrobeModal?.remove();
     
-    // Create floating button
+    // Left part of the chat input bar (hamburger / extensions wand live here)
+    const leftSendForm = document.getElementById('leftSendForm');
+
     iigFloatingBtn = document.createElement('div');
-    iigFloatingBtn.id = 'iig-float-btn';
-    iigFloatingBtn.innerHTML = '<i class="fa-solid fa-shirt"></i>';
     iigFloatingBtn.title = 'Гардероб';
-    
-    // Update badge with active outfits count
-    updateFloatingButtonBadge();
-    
+    iigFloatingBtn.setAttribute('role', 'button');
+    iigFloatingBtn.setAttribute('tabindex', '0');
+    iigFloatingBtn.setAttribute('aria-label', 'Гардероб');
     iigFloatingBtn.addEventListener('click', toggleWardrobeModal);
-    document.body.appendChild(iigFloatingBtn);
-    
-    iigLog('INFO', 'Floating wardrobe button created');
+    iigFloatingBtn.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleWardrobeModal(); }
+    });
+
+    if (leftSendForm) {
+        // Same pattern as SillyTavern's own #options_button
+        iigFloatingBtn.id = 'iig-wardrobe-btn';
+        iigFloatingBtn.className = 'fa-solid fa-shirt interactable';
+        leftSendForm.appendChild(iigFloatingBtn);
+        iigLog('INFO', 'Wardrobe button added to input bar');
+    } else {
+        // Fallback for themes without #leftSendForm
+        iigFloatingBtn.id = 'iig-float-btn';
+        iigFloatingBtn.innerHTML = '<i class="fa-solid fa-shirt"></i>';
+        document.body.appendChild(iigFloatingBtn);
+        iigLog('WARN', '#leftSendForm not found, using floating wardrobe button');
+    }
+
+    updateFloatingButtonBadge();
 }
 
 function updateFloatingButtonBadge() {
@@ -6164,6 +6185,7 @@ function updateFloatingButtonBadge() {
         const badge = document.createElement('span');
         badge.className = 'iig-bar-count';
         badge.textContent = activeCount;
+        badge.setAttribute('aria-label', `${activeCount} активных нарядов`);
         iigFloatingBtn.appendChild(badge);
     }
     

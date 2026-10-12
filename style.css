@@ -747,6 +747,41 @@
     text-align: center;
 }
 
+/* Wardrobe button inside the chat input bar */
+#iig-wardrobe-btn {
+    position: relative;
+    cursor: pointer;
+    opacity: 0.7;
+    transition: opacity 0.15s ease, color 0.15s ease;
+}
+
+#iig-wardrobe-btn:hover,
+#iig-wardrobe-btn:focus-visible {
+    opacity: 1;
+}
+
+#iig-wardrobe-btn.iig-float-active {
+    color: #ffb6c1;
+    opacity: 1;
+}
+
+#iig-wardrobe-btn .iig-bar-count {
+    position: absolute;
+    top: -4px;
+    right: -6px;
+    background: #ffb6c1;
+    color: #1a1a1e;
+    font-family: sans-serif;
+    font-size: 9px;
+    font-weight: 700;
+    line-height: 1.4;
+    padding: 0 4px;
+    border-radius: 10px;
+    min-width: 14px;
+    text-align: center;
+    pointer-events: none;
+}
+
 /* Quick Wardrobe Modal */
 #iig-wardrobe-modal-overlay {
     position: fixed;

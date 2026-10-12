@@ -6437,9 +6437,9 @@ function openWardrobeModal() {
         });
     });
     
-    // Close on Escape
+    // Close on Escape (but not if a native modal dialog is currently open)
     const escHandler = (e) => {
-        if (e.key === 'Escape') {
+        if (e.key === 'Escape' && !document.querySelector('dialog[open]')) {
             closeWardrobeModal();
             document.removeEventListener('keydown', escHandler);
         }

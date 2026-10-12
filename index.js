@@ -1743,6 +1743,151 @@ function renderPresetSelect() {
 }
 
 // ============================================================
+// FAQ / HELP HINTS
+// ============================================================
+
+const FAQ_HINTS = Object.freeze({
+    display_mode: {
+        '#iig_image_display_mode': 'Инлайн: картинка между абзацами. Внешние блоки: картинки внутри HTML-артефактов.',
+        '#iig_inject_image_mode': 'Если prompt.md уже в пресете — выключите, чтобы не дублировать инструкцию.',
+        '#iig_image_mode_depth': 'На сколько сообщений от конца чата вставлять инструкцию (0 = после последнего).',
+    },
+    api: {
+        '#iig_api_type': 'OpenAI-совместимые, Gemini (через nano-banana), Naistera, NovelAI.',
+        '#iig_endpoint': 'URL API (например, https://api.openai.com/v1 или локальный прокси).',
+        '#iig_model': 'Имя модели (dall-e-3, flux-1.1-pro и т.д.).',
+        '#iig_aspect_ratio': 'Соотношение сторон. Тег в промпте имеет приоритет.',
+        '#iig_image_size': 'Разрешение. 1K, 2K или 4K (поддержка зависит от модели).',
+    },
+    prompt_generator: {
+        '#iig_prompt_gen_endpoint': 'Endpoint модели, которая генерирует prompt картинки из сообщения.',
+        '#iig_prompt_instruction_select': 'Шаблон инструкции (обычная картинка, комикс и т.д.).',
+        '#iig_prompt_gen_max_tokens': 'Максимальная длина prompt (64–4000).',
+    },
+    style: {
+        '#iig_default_style': 'Стиль по умолчанию (например, "anime", "3d render"). Можно оставить пустым.',
+        '#iig_style_prompt': 'Текст, который добавится к prompt при выборе этого стиля.',
+    },
+    avatars: {
+        '#iig_auto_detect_names': 'Авто-поиск имён в промпте и отправка их лиц как референсов.',
+        '#iig_send_char_avatar': 'Отправлять лицо персонажа как референс во все промпты (даже если имя не упомянуто).',
+        '#iig_send_user_avatar': 'Отправлять лицо юзера как референс во все промпты.',
+    },
+    wardrobe_char: {
+        '#iig_wardrobe_char_name': 'Название outfit (пальто, летнее платье и т.д.).',
+        '#iig_wardrobe_char_file': 'Загрузить картинку outfit. Система опишет её через vision API.',
+    },
+    wardrobe_inject: {
+        '#iig_inject_wardrobe': 'Вставлять описание активной одежды в промпт чата.',
+        '#iig_wardrobe_send_mode': 'Что отправлять в генерацию картинок: фото одежды с текстом или только текст.',
+        '#iig_wardrobe_injection_depth': 'На сколько сообщений от конца чата вставлять описание одежды.',
+    },
+    wardrobe_theme: {
+        _section: 'Цвета модального окна гардероба (фон, текст, акцент, рамки). Работает через CSS-переменные.',
+    },
+    vision: {
+        '#iig_wardrobe_desc_endpoint': 'API для vision-описаний (GPT-4o, Claude 3.5 Sonnet и т.д.).',
+        '#iig_wardrobe_desc_prompt': 'Инструкция для vision модели: что описывать на картинке outfit.',
+    },
+    npc: {
+        _section: 'Дополнительные персонажи (NPC). Если их имя упомянуто в промпте, система отправит их лица как референсы.',
+    },
+    character_library: {
+        _section: 'Профили персонажей и юзера. Включают лицо, описание внешности и RPG-режим с несколькими телами.',
+    },
+    errors: {
+        '#iig_max_retries': 'Сколько раз повторять запрос при ошибке сети (0 = не повторять).',
+        '#iig_retry_delay': 'Задержка между попытками (мс).',
+        '#iig_request_timeout': 'Таймаут запроса (сек). Увеличьте для медленных моделей.',
+    },
+});
+
+let activeFaqSection = null;
+
+function clearFaqHints() {
+    document.querySelectorAll('.iig-faq-hint').forEach(hint => hint.remove());
+    document.querySelectorAll('.iig-faq-highlight').forEach(el => el.classList.remove('iig-faq-highlight'));
+    document.querySelectorAll('.iig-faq-btn.iig-faq-active').forEach(btn => {
+        btn.classList.remove('iig-faq-active');
+        btn.setAttribute('aria-pressed', 'false');
+    });
+}
+
+function toggleFaqHints(sectionId, button) {
+    const section = button?.closest('.iig-collapsible');
+    const wasActive = activeFaqSection === sectionId;
+    clearFaqHints();
+    activeFaqSection = null;
+    if (wasActive || !section) return;
+
+    const hints = FAQ_HINTS[sectionId];
+    if (!hints) return;
+    activeFaqSection = sectionId;
+    button.classList.add('iig-faq-active');
+    button.setAttribute('aria-pressed', 'true');
+
+    // Hints are only visible inside an expanded section.
+    if (section.classList.contains('collapsed')) section.classList.remove('collapsed');
+
+    const content = section.querySelector('.iig-collapsible-content');
+    if (hints._section && content) {
+        const badge = document.createElement('div');
+        badge.className = 'iig-faq-hint iig-faq-section-hint';
+        badge.setAttribute('role', 'note');
+        badge.textContent = hints._section;
+        content.insertBefore(badge, content.firstChild);
+    }
+
+    for (const [selector, text] of Object.entries(hints)) {
+        if (selector === '_section') continue;
+        const target = section.querySelector(selector);
+        if (!target) continue;
+        target.classList.add('iig-faq-highlight');
+        const badge = document.createElement('div');
+        badge.className = 'iig-faq-hint';
+        badge.setAttribute('role', 'note');
+        badge.textContent = text;
+        const row = target.closest('.flex-row, .checkbox_label') || target;
+        row.insertAdjacentElement('afterend', badge);
+    }
+}
+
+function closeFaqHints() {
+    if (!activeFaqSection) return false;
+    clearFaqHints();
+    activeFaqSection = null;
+    return true;
+}
+
+let faqEscBound = false;
+
+function initFaqButtons() {
+    document.querySelectorAll('#extensions_settings .iig-collapsible-header').forEach(header => {
+        const sectionId = header.closest('.iig-collapsible')?.dataset.sectionId;
+        if (!sectionId || !FAQ_HINTS[sectionId] || header.querySelector('.iig-faq-btn')) return;
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'iig-faq-btn';
+        button.dataset.sectionId = sectionId;
+        button.title = 'Подсказки по разделу';
+        button.setAttribute('aria-label', button.title);
+        button.setAttribute('aria-pressed', 'false');
+        button.innerHTML = '<i class="fa-solid fa-circle-question" aria-hidden="true"></i>';
+        // Do not let the click (or Enter/Space) toggle the section collapse.
+        button.addEventListener('click', event => {
+            event.stopPropagation();
+            toggleFaqHints(sectionId, button);
+        });
+        header.appendChild(button);
+    });
+    if (faqEscBound) return;
+    faqEscBound = true;
+    document.addEventListener('keydown', event => {
+        if (event.key === 'Escape' && closeFaqHints()) event.stopPropagation();
+    });
+}
+
+// ============================================================
 // COLLAPSIBLE SECTIONS
 // ============================================================
 
@@ -5730,6 +5875,7 @@ function createSettingsUI() {
 
     bindSettingsEvents();
     initCollapsibleSections();
+    initFaqButtons();
     updateCharAvatarPreview();
     renderPresetSelect();
 }

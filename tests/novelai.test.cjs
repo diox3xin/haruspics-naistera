@@ -124,11 +124,12 @@ test('collector forwards library and wardrobe descriptions, not images, to offic
     const context = vm.createContext({
         getSettings: () => settings,
         SillyTavern: { getContext: () => ({ characters: [{ name: 'Hero' }], characterId: 0, name1: 'User' }) },
-        collectCharacterLibraryReferences: async (kind) => ({
+        collectCharacterProfileReferences: async (kind) => ({
             descriptions: [`${kind} library description`],
             refs: [{ data: 'LIBRARY_IMAGE', type: 'face' }],
             hasPrimary: true,
         }),
+        collectRpgCharacterReferences: async () => ({ descriptions: [], refs: [] }),
         getActiveWardrobeItem: (kind) => kind === 'char'
             ? { imageData: 'WARDROBE_IMAGE', description: 'green jacket', name: 'Jacket' }
             : null,

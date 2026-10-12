@@ -90,6 +90,13 @@ const defaultSettings = Object.freeze({
     aspectRatio: '1:1',
     imageSize: '1K',
     npcReferences: [],
+    // Character profiles v2 (replace characterReferenceLibrary), keyed per bot / per persona.
+    // Profile: { avatarSource: 'card'|'custom', customAvatarData, appearance, rpgMode, rpgCharacters: [{ id, name, avatarData, appearance }] }
+    characterProfiles: {
+        characters: {},
+        users: {},
+    },
+    // DEPRECATED: old library, migrated into characterProfiles on load
     characterReferenceLibrary: {
         characters: {},
         users: {},
@@ -361,6 +368,208 @@ function formatNaisteraDescription(value) {
         return Object.values(value).filter(Boolean).join(' ');
     }
     return String(value);
+}
+
+// ============================================================
+// CHARACTER PROFILES V2 (replaces characterReferenceLibrary)
+// ============================================================
+
+function makeCharacterProfile(raw = {}) {
+    const rpgCharacters = Array.isArray(raw.rpgCharacters) ? raw.rpgCharacters : [];
+    return {
+        avatarSource: raw.avatarSource === 'custom' ? 'custom' : 'card',
+        customAvatarData: String(raw.customAvatarData || ''),
+        appearance: String(raw.appearance || '').trim(),
+        rpgMode: Boolean(raw.rpgMode),
+        rpgCharacters: rpgCharacters.map(char => ({
+            id: String(char?.id || `rpg_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`),
+            name: String(char?.name || '').trim(),
+            avatarData: String(char?.avatarData || ''),
+            appearance: String(char?.appearance || '').trim(),
+        })).filter(char => char.name),
+    };
+}
+
+function getCharacterProfile(kind, key, settings = getSettings(), create = false) {
+    if (!settings.characterProfiles || typeof settings.characterProfiles !== 'object') {
+        settings.characterProfiles = { characters: {}, users: {} };
+    }
+    const bucket = kind === 'user' ? settings.characterProfiles.users : settings.characterProfiles.characters;
+    const normalizedKey = String(key || '').trim();
+    if (!normalizedKey) return null;
+    
+    if (!bucket[normalizedKey] && create) {
+        bucket[normalizedKey] = makeCharacterProfile();
+    }
+    if (!bucket[normalizedKey]) return null;
+    bucket[normalizedKey] = makeCharacterProfile(bucket[normalizedKey]);
+    return bucket[normalizedKey];
+}
+
+function migrateOldCharacterLibrary(settings = getSettings()) {
+    if (settings._characterProfilesMigrated) return;
+    
+    const oldLib = settings.characterReferenceLibrary;
+    if (!oldLib || typeof oldLib !== 'object') {
+        settings._characterProfilesMigrated = true;
+        return;
+    }
+    
+    if (!settings.characterProfiles) settings.characterProfiles = { characters: {}, users: {} };
+    
+    // Migrate all user entries
+    for (const [key, entry] of Object.entries(oldLib.users || {})) {
+        if (!settings.characterProfiles.users[key]) {
+            settings.characterProfiles.users[key] = {
+                avatarSource: entry?.primary?.imageData ? 'custom' : 'card',
+                customAvatarData: String(entry?.primary?.imageData || ''),
+                appearance: String(entry?.primary?.description || '').trim(),
+                rpgMode: false,
+                rpgCharacters: [],
+            };
+        }
+    }
+    
+    // Migrate all character entries
+    for (const [key, entry] of Object.entries(oldLib.characters || {})) {
+        if (!settings.characterProfiles.characters[key]) {
+            settings.characterProfiles.characters[key] = {
+                avatarSource: entry?.primary?.imageData ? 'custom' : 'card',
+                customAvatarData: String(entry?.primary?.imageData || ''),
+                appearance: String(entry?.primary?.description || '').trim(),
+                rpgMode: false,
+                rpgCharacters: [],
+            };
+        }
+    }
+    
+    settings._characterProfilesMigrated = true;
+    saveSettings();
+    iigLog('INFO', 'Migrated old character library to profiles v2');
+}
+
+
+function addRpgCharacter(name, avatarData = '', appearance = '') {
+    const settings = getSettings();
+    const context = SillyTavern.getContext();
+    const key = getCurrentCharacterLibraryKey();
+    const profile = getCharacterProfile('char', key, settings, true);
+    
+    const normalized = String(name || '').trim();
+    if (!normalized) throw new Error('Имя персонажа не может быть пустым');
+    
+    const exists = profile.rpgCharacters.some(
+        char => char.name.toLowerCase() === normalized.toLowerCase()
+    );
+    if (exists) throw new Error(`Персонаж "${normalized}" уже существует`);
+    
+    const newChar = {
+        id: `rpg_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`,
+        name: normalized,
+        avatarData: String(avatarData || ''),
+        appearance: String(appearance || '').trim(),
+    };
+    
+    profile.rpgCharacters.push(newChar);
+    saveSettings();
+    return newChar.id;
+}
+
+function removeRpgCharacter(charId) {
+    const settings = getSettings();
+    const key = getCurrentCharacterLibraryKey();
+    const profile = getCharacterProfile('char', key, settings, false);
+    if (!profile) return;
+    
+    profile.rpgCharacters = profile.rpgCharacters.filter(char => char.id !== charId);
+    saveSettings();
+}
+
+function updateRpgCharacter(charId, updates = {}) {
+    const settings = getSettings();
+    const key = getCurrentCharacterLibraryKey();
+    const profile = getCharacterProfile('char', key, settings, false);
+    if (!profile) throw new Error('Профиль не найден');
+    
+    const char = profile.rpgCharacters.find(c => c.id === charId);
+    if (!char) throw new Error('Персонаж не найден');
+    
+    if (updates.name !== undefined) char.name = String(updates.name || '').trim();
+    if (updates.avatarData !== undefined) char.avatarData = String(updates.avatarData || '');
+    if (updates.appearance !== undefined) char.appearance = String(updates.appearance || '').trim();
+    
+    saveSettings();
+}
+
+async function collectCharacterProfileReferences(kind, settings = getSettings()) {
+    migrateOldCharacterLibrary(settings);
+    
+    const entity = getCurrentLibraryEntity(kind, settings);
+    const profile = getCharacterProfile(kind, entity.key, settings, false);
+    
+    if (!profile) return { refs: [], descriptions: [], hasPrimary: false };
+    
+    const refs = [];
+    const descriptions = [];
+    
+    // Add appearance description
+    if (profile.appearance) {
+        const label = kind === 'user' ? 'USER' : `CHARACTER "${entity.title}"`;
+        descriptions.push(`[${label} APPEARANCE]: ${profile.appearance}`);
+    }
+    
+    // Add custom avatar if selected
+    if (profile.avatarSource === 'custom' && profile.customAvatarData) {
+        refs.push({
+            data: profile.customAvatarData,
+            mimeType: detectMimeType(profile.customAvatarData),
+            name: entity.title,
+            description: profile.appearance,
+            type: 'face',
+        });
+    }
+    
+    return {
+        refs,
+        descriptions,
+        hasPrimary: profile.avatarSource === 'custom' && Boolean(profile.customAvatarData),
+    };
+}
+
+async function collectRpgCharacterReferences(prompt, settings = getSettings()) {
+    migrateOldCharacterLibrary(settings);
+    
+    const context = SillyTavern.getContext();
+    const key = getCurrentCharacterLibraryKey();
+    const profile = getCharacterProfile('char', key, settings, false);
+    
+    if (!profile || !profile.rpgMode || profile.rpgCharacters.length === 0) {
+        return { refs: [], descriptions: [] };
+    }
+    
+    const refs = [];
+    const descriptions = [];
+    
+    for (const char of profile.rpgCharacters) {
+        if (!char.name) continue;
+        if (!nameAppearsInPrompt(char.name, prompt)) continue;
+        
+        if (char.appearance) {
+            descriptions.push(`[RPG CHARACTER "${char.name}" APPEARANCE]: ${char.appearance}`);
+        }
+        
+        if (char.avatarData) {
+            refs.push({
+                data: char.avatarData,
+                mimeType: detectMimeType(char.avatarData),
+                name: char.name,
+                description: char.appearance,
+                type: 'face',
+            });
+        }
+    }
+    
+    return { refs, descriptions };
 }
 
 function getCharacterLibraryKey(character, index = 0) {
@@ -1506,9 +1715,13 @@ async function collectReferenceImages(prompt) {
     const charName = context.characters?.[context.characterId]?.name || null;
     const userName = context.name1 || null;
 
-    const characterLibrary = await collectCharacterLibraryReferences('char', settings);
-    const userLibrary = await collectCharacterLibraryReferences('user', settings);
+    const characterLibrary = await collectCharacterProfileReferences('char', settings);
+    const userLibrary = await collectCharacterProfileReferences('user', settings);
     textDirectives.push(...characterLibrary.descriptions, ...userLibrary.descriptions);
+
+    // RPG characters (multi-character bots)
+    const rpgRefs = await collectRpgCharacterReferences(prompt, settings);
+    textDirectives.push(...rpgRefs.descriptions);
 
     // ===== STEP 1: Collect face references (HIGHEST PRIORITY) =====
 
@@ -1534,6 +1747,12 @@ async function collectReferenceImages(prompt) {
     const needUserAvatar = !['novelai', 'novelai-direct'].includes(settings.apiType) && !userLibrary.hasPrimary && ((useNaisteraRefs ? settings.naisteraSendUserAvatar : settings.sendUserAvatar) ||
         (settings.autoDetectNames && userName && nameAppearsInPrompt(userName, prompt)));
     if (userLibrary.refs.length > 0) faceRefs.push(...userLibrary.refs);
+
+    // RPG character face refs (NovelAI receives text descriptions only)
+    if (!['novelai', 'novelai-direct'].includes(settings.apiType) && rpgRefs.refs.length > 0) {
+        faceRefs.push(...rpgRefs.refs);
+        iigLog('INFO', `Face refs: ${rpgRefs.refs.length} RPG character(s) added`);
+    }
 
     if (needUserAvatar) {
         const userAvatar = await getUserAvatarBase64();
@@ -4615,6 +4834,160 @@ function libraryPreviewHtml(src, fallback = 'fa-user') {
         : `<span><i class="fa-solid ${fallback}"></i></span>`;
 }
 
+function profileCardHtml(kind, entity, profile, cardPreview) {
+    const customPreview = profile.customAvatarData ? `data:${detectMimeType(profile.customAvatarData)};base64,${profile.customAvatarData}` : '';
+    const preview = profile.avatarSource === 'custom' ? customPreview : cardPreview;
+    const label = kind === 'user' ? 'Персона' : 'Бот';
+    return `
+        <div class="iig-profile-card" data-profile-kind="${kind}">
+            <div class="iig-profile-head">
+                <div class="iig-library-editor-avatar">${libraryPreviewHtml(preview, kind === 'user' ? 'fa-user' : 'fa-user-pen')}</div>
+                <div><h4>${escapeHtml(entity.title)}</h4><small>${label}</small></div>
+            </div>
+            <div class="flex-row">
+                <label>Референс</label>
+                <select class="flex1 iig-profile-source">
+                    <option value="card" ${profile.avatarSource === 'card' ? 'selected' : ''}>Обложка карточки</option>
+                    <option value="custom" ${profile.avatarSource === 'custom' ? 'selected' : ''}>Загруженный реф</option>
+                </select>
+            </div>
+            <div class="flex-row ${profile.avatarSource === 'custom' ? '' : 'hidden'}">
+                <input type="file" class="iig-profile-file" accept="image/*" hidden>
+                <button type="button" class="menu_button iig-profile-upload"><i class="fa-solid fa-upload"></i> ${profile.customAvatarData ? 'Заменить реф' : 'Загрузить реф'}</button>
+                ${profile.customAvatarData ? '<button type="button" class="menu_button iig-profile-clear"><i class="fa-solid fa-trash"></i> Убрать</button>' : ''}
+            </div>
+            <textarea class="text_pole iig-profile-appearance" rows="3" placeholder="Описание внешности: волосы, глаза, телосложение, приметы...">${escapeHtml(profile.appearance)}</textarea>
+        </div>`;
+}
+
+function rpgCharactersHtml(profile) {
+    const rows = profile.rpgCharacters.map(char => `
+        <div class="iig-rpg-row" data-rpg-id="${escapeHtml(char.id)}">
+            <div class="iig-library-editor-avatar">${libraryPreviewHtml(char.avatarData ? `data:${detectMimeType(char.avatarData)};base64,${char.avatarData}` : '', 'fa-user')}</div>
+            <div class="flex1">
+                <input type="text" class="text_pole iig-rpg-name" value="${escapeHtml(char.name)}" placeholder="Имя как в промпте">
+                <textarea class="text_pole iig-rpg-appearance" rows="2" placeholder="Описание внешности...">${escapeHtml(char.appearance)}</textarea>
+            </div>
+            <div class="iig-rpg-actions">
+                <input type="file" class="iig-rpg-file" accept="image/*" hidden>
+                <button type="button" class="menu_button iig-rpg-upload" title="Загрузить реф"><i class="fa-solid fa-image"></i></button>
+                <button type="button" class="menu_button iig-rpg-remove" title="Удалить"><i class="fa-solid fa-trash"></i></button>
+            </div>
+        </div>`).join('');
+    return `
+        <div class="iig-profile-card">
+            <label class="checkbox_label"><input type="checkbox" id="iig_rpg_mode" ${profile.rpgMode ? 'checked' : ''}><span>RPG-режим: несколько персонажей в одной карточке</span></label>
+            <p class="hint">Реф и описание персонажа отправляются, только если его имя встречается в промпте картинки (без учёта регистра, целым словом). Имя должно совпадать с тем, как модель пишет его в промпте.</p>
+            <div class="${profile.rpgMode ? '' : 'hidden'}">
+                ${rows || '<div class="iig-library-empty">Персонажей пока нет</div>'}
+                <div class="flex-row">
+                    <input type="text" id="iig_rpg_new_name" class="text_pole flex1" placeholder="Имя нового персонажа">
+                    <button type="button" class="menu_button" id="iig_rpg_add"><i class="fa-solid fa-plus"></i> Добавить</button>
+                </div>
+            </div>
+        </div>`;
+}
+
+async function readProfileImage(file) {
+    const raw = await readLibraryFileAsBase64(file);
+    return await resizeImageBase64(raw, 768);
+}
+
+function renderCharacterProfiles() {
+    const settings = getSettings();
+    const container = document.getElementById('iig_character_library');
+    if (!container) return;
+    migrateOldCharacterLibrary(settings);
+
+    const context = SillyTavern.getContext();
+    const character = context.characters?.[context.characterId];
+    const charEntity = getCurrentLibraryEntity('char', settings);
+    const userEntity = getCurrentLibraryEntity('user', settings);
+    const charProfile = character ? getCharacterProfile('char', charEntity.key, settings, true) : null;
+    const userProfile = getCharacterProfile('user', userEntity.key, settings, true);
+    userEntity.title = context.name1 || userEntity.title;
+
+    const charPreview = character?.avatar ? `/thumbnail?type=avatar&file=${encodeURIComponent(character.avatar)}` : '';
+    const userPreview = settings.userAvatarFile ? `/thumbnail?type=persona&file=${encodeURIComponent(settings.userAvatarFile)}` : '';
+
+    container.innerHTML = `
+        <div class="iig-profiles">
+            ${charProfile ? profileCardHtml('char', charEntity, charProfile, charPreview) : '<div class="iig-library-empty">Откройте чат с персонажем, чтобы настроить бота.</div>'}
+            ${profileCardHtml('user', userEntity, userProfile, userPreview)}
+            ${charProfile ? rpgCharactersHtml(charProfile) : ''}
+        </div>`;
+
+    bindCharacterProfileEvents(container, { char: charProfile, user: userProfile });
+}
+
+function bindCharacterProfileEvents(container, profiles) {
+    container.querySelectorAll('.iig-profile-card[data-profile-kind]').forEach(card => {
+        const profile = profiles[card.dataset.profileKind];
+        if (!profile) return;
+        card.querySelector('.iig-profile-source')?.addEventListener('change', event => {
+            profile.avatarSource = event.target.value === 'custom' ? 'custom' : 'card';
+            saveSettings();
+            renderCharacterProfiles();
+        });
+        card.querySelector('.iig-profile-upload')?.addEventListener('click', () => card.querySelector('.iig-profile-file')?.click());
+        card.querySelector('.iig-profile-file')?.addEventListener('change', async event => {
+            const file = event.target.files?.[0];
+            if (!file) return;
+            profile.customAvatarData = await readProfileImage(file);
+            saveSettings();
+            renderCharacterProfiles();
+        });
+        card.querySelector('.iig-profile-clear')?.addEventListener('click', () => {
+            profile.customAvatarData = '';
+            saveSettings();
+            renderCharacterProfiles();
+        });
+        card.querySelector('.iig-profile-appearance')?.addEventListener('input', event => {
+            profile.appearance = event.target.value;
+            saveSettings();
+        });
+    });
+    bindRpgCharacterEvents(container, profiles.char);
+}
+
+function bindRpgCharacterEvents(container, charProfile) {
+    if (!charProfile) return;
+    container.querySelector('#iig_rpg_mode')?.addEventListener('change', event => {
+        charProfile.rpgMode = event.target.checked;
+        saveSettings();
+        renderCharacterProfiles();
+    });
+    container.querySelector('#iig_rpg_add')?.addEventListener('click', () => {
+        try {
+            addRpgCharacter(container.querySelector('#iig_rpg_new_name')?.value);
+            renderCharacterProfiles();
+        } catch (error) {
+            toastr.warning(error.message);
+        }
+    });
+    container.querySelectorAll('.iig-rpg-row').forEach(row => {
+        const id = row.dataset.rpgId;
+        row.querySelector('.iig-rpg-name')?.addEventListener('change', event => {
+            const name = event.target.value.trim();
+            if (!name) { toastr.warning('Имя не может быть пустым'); renderCharacterProfiles(); return; }
+            updateRpgCharacter(id, { name });
+        });
+        row.querySelector('.iig-rpg-appearance')?.addEventListener('input', event => updateRpgCharacter(id, { appearance: event.target.value }));
+        row.querySelector('.iig-rpg-upload')?.addEventListener('click', () => row.querySelector('.iig-rpg-file')?.click());
+        row.querySelector('.iig-rpg-file')?.addEventListener('change', async event => {
+            const file = event.target.files?.[0];
+            if (!file) return;
+            updateRpgCharacter(id, { avatarData: await readProfileImage(file) });
+            renderCharacterProfiles();
+        });
+        row.querySelector('.iig-rpg-remove')?.addEventListener('click', () => {
+            if (!confirm('Удалить персонажа?')) return;
+            removeRpgCharacter(id);
+            renderCharacterProfiles();
+        });
+    });
+}
+
 async function renderCharacterLibraryV2() {
     const settings = getSettings();
     const container = document.getElementById('iig_character_library');
@@ -5162,14 +5535,14 @@ function createSettingsUI() {
                         </div>
                     </div>
 
-                    <!-- ======= SECTION: Character Library ======= -->
+                    <!-- ======= SECTION: Character Profiles ======= -->
                     <div class="iig-collapsible" data-section-id="character_library">
                         <div class="iig-collapsible-header">
                             <i class="fa-solid fa-chevron-down iig-collapse-icon"></i>
-                            <span>📚 Библиотека персонажей</span>
+                            <span>👤 Профили персонажей</span>
                         </div>
                         <div class="iig-collapsible-content">
-                            <p class="hint">Хранит основной reference, дополнительные изображения и текстовые описания. Naistera получает изображения и текст; официальный NovelAI через стандартный сервер SillyTavern получает только текст.</p>
+                            <p class="hint">Выбор источника аватара (обложка карточки или загруженный реф) и описание внешности для бота и персоны. RPG-режим позволяет добавить несколько персонажей в одну карточку бота — их рефы и описания отправляются, только если имя встречается в промпте.</p>
                             <div id="iig_character_library"></div>
                         </div>
                     </div>
@@ -5704,7 +6077,7 @@ function bindSettingsEvents() {
     renderStyleGallery();
     renderNegativeGallery();
     renderPromptInstructionEditor();
-    renderCharacterLibraryV2();
+    renderCharacterProfiles();
 }
 
 // ============================================================

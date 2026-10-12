@@ -96,6 +96,11 @@ const defaultSettings = Object.freeze({
         characters: {},
         users: {},
     },
+    // Image display mode: 'inline' (plain image tag right in the text) or 'extblocks' (images inside HTML/CSS artifacts)
+    imageDisplayMode: 'inline',
+    // Inject the mode instruction into the chat prompt (off by default: many users keep prompt.md in their preset)
+    injectImageModeInstruction: false,
+    imageModeInjectionDepth: 1,
     // DEPRECATED: old library, migrated into characterProfiles on load
     characterReferenceLibrary: {
         characters: {},
@@ -1574,6 +1579,55 @@ async function generateNpcOutfitDescription(npcIndex, outfitId) {
     iigLog('INFO', `Generated NPC outfit for "${npc.name}" / "${outfit.name}": ${description.substring(0, 100)}...`);
     return description;
 }
+const IMAGE_TAG_FORMAT = `<img data-iig-instruction='{"style":"[STYLE]","prompt":"[DESC]","aspect_ratio":"[RATIO]","image_size":"[SIZE]"}' src="[IMG:GEN]">`;
+
+const IMAGE_TAG_RULES = [
+    'Single quotes wrap the attribute, double quotes inside JSON. Never reverse this.',
+    '[DESC]: detailed English prompt (characters, action, environment, lighting, camera). ALWAYS start each character description with the character\'s name, exactly as it is spelled in the character list.',
+    '[RATIO]: one of 1:1, 2:3, 3:2, 3:4, 4:3, 4:5, 5:4, 9:16, 16:9, 21:9. [SIZE]: 1K, 2K or 4K.',
+    'src="[IMG:GEN]" marks a NEW image. Never copy paths of already generated images.',
+].join('\n- ');
+
+function normalizeImageDisplayMode(mode) {
+    return mode === 'extblocks' ? 'extblocks' : 'inline';
+}
+
+function buildImageModeInstruction(mode) {
+    if (normalizeImageDisplayMode(mode) === 'extblocks') {
+        return `[Image generation — external blocks mode]
+Embed a visual HTML/CSS artifact (no JavaScript, no markdown code blocks) into the response, thematically tied to the scene. Use a unique wrapper id, mobile-first sizing. Place 1-5 generated images inside the artifact using this exact tag:
+${IMAGE_TAG_FORMAT}
+- ${IMAGE_TAG_RULES}`;
+    }
+    return `[Image generation — inline mode]
+When a scene deserves an illustration, insert the image tag directly into the narrative text, on its own line, between paragraphs. Do NOT wrap it in HTML blocks, artifacts, tables or code blocks. Use this exact tag:
+${IMAGE_TAG_FORMAT}
+- ${IMAGE_TAG_RULES}`;
+}
+
+function updateImageModeInjection() {
+    try {
+        const context = SillyTavern.getContext();
+        const settings = getSettings();
+        if (typeof context.setExtensionPrompt !== 'function') return;
+        const key = MODULE_NAME + '_image_mode';
+        if (!settings.enabled || !settings.injectImageModeInstruction) {
+            context.setExtensionPrompt(key, '', 0, 0);
+            return;
+        }
+        const depth = Math.max(0, Math.min(100, parseInt(settings.imageModeInjectionDepth, 10) || 1));
+        context.setExtensionPrompt(key, buildImageModeInstruction(settings.imageDisplayMode), 1, depth);
+    } catch (error) {
+        iigLog('ERROR', 'Error updating image mode injection:', error);
+    }
+}
+
+function applyImageDisplayMode(mode = getSettings().imageDisplayMode) {
+    const normalized = normalizeImageDisplayMode(mode);
+    document.body?.classList.toggle('iig-mode-inline', normalized === 'inline');
+    document.body?.classList.toggle('iig-mode-extblocks', normalized === 'extblocks');
+}
+
 function updateWardrobeInjection() {
     try {
         const context = SillyTavern.getContext();
@@ -5121,6 +5175,33 @@ function createSettingsUI() {
                         <span>Включить генерацию картинок</span>
                     </label>
 
+                    <!-- ======= SECTION: Display mode ======= -->
+                    <div class="iig-collapsible" data-section-id="display_mode">
+                        <div class="iig-collapsible-header">
+                            <i class="fa-solid fa-chevron-down iig-collapse-icon"></i>
+                            <span>🖼️ Режим отображения</span>
+                        </div>
+                        <div class="iig-collapsible-content">
+                            <div class="flex-row">
+                                <label for="iig_image_display_mode">Режим</label>
+                                <select id="iig_image_display_mode" class="flex1">
+                                    <option value="inline" ${normalizeImageDisplayMode(settings.imageDisplayMode) === 'inline' ? 'selected' : ''}>Инлайн (картинка прямо в тексте)</option>
+                                    <option value="extblocks" ${normalizeImageDisplayMode(settings.imageDisplayMode) === 'extblocks' ? 'selected' : ''}>Внешние блоки (HTML-артефакты)</option>
+                                </select>
+                            </div>
+                            <p class="hint">Инлайн: модель ставит тег картинки между абзацами, без HTML-обёрток. Внешние блоки: модель встраивает картинки в HTML/CSS-артефакты (для ExtBlocks).</p>
+                            <label class="checkbox_label">
+                                <input type="checkbox" id="iig_inject_image_mode" ${settings.injectImageModeInstruction ? 'checked' : ''}>
+                                <span>Добавлять инструкцию режима в промпт</span>
+                            </label>
+                            <p class="hint">Выключите, если инструкция (prompt.md) уже есть в вашем пресете, чтобы не дублировать её.</p>
+                            <div class="flex-row">
+                                <label for="iig_image_mode_depth">Глубина вставки</label>
+                                <input type="number" id="iig_image_mode_depth" class="text_pole" value="${settings.imageModeInjectionDepth || 1}" min="0" max="100" style="width:70px;">
+                            </div>
+                        </div>
+                    </div>
+
                     <!-- ======= SECTION: API ======= -->
                     <div class="iig-collapsible" data-section-id="api">
                         <div class="iig-collapsible-header">
@@ -5669,7 +5750,25 @@ function bindSettingsEvents() {
         document.getElementById('iig_novelai_token_row')?.classList.toggle('hidden', type !== 'novelai-direct');
     };
 
-    document.getElementById('iig_enabled')?.addEventListener('change', (e) => { settings.enabled = e.target.checked; saveSettings(); });
+    document.getElementById('iig_enabled')?.addEventListener('change', (e) => { settings.enabled = e.target.checked; saveSettings(); updateImageModeInjection(); });
+
+    // Image display mode
+    document.getElementById('iig_image_display_mode')?.addEventListener('change', (e) => {
+        settings.imageDisplayMode = normalizeImageDisplayMode(e.target.value);
+        saveSettings();
+        applyImageDisplayMode(settings.imageDisplayMode);
+        updateImageModeInjection();
+    });
+    document.getElementById('iig_inject_image_mode')?.addEventListener('change', (e) => {
+        settings.injectImageModeInstruction = e.target.checked;
+        saveSettings();
+        updateImageModeInjection();
+    });
+    document.getElementById('iig_image_mode_depth')?.addEventListener('input', (e) => {
+        settings.imageModeInjectionDepth = Math.max(0, Math.min(100, parseInt(e.target.value, 10) || 1));
+        saveSettings();
+        updateImageModeInjection();
+    });
 
     // Wardrobe theme colors
     document.querySelectorAll('.iig-wardrobe-theme-input').forEach(input => {
@@ -6179,7 +6278,9 @@ function bindSettingsEvents() {
         observeImageRegenButtons();
         addButtonsToExistingMessages();
         addPromptPanelsToExistingMessages();
+        applyImageDisplayMode();
         updateWardrobeInjection();
+        updateImageModeInjection();
         console.log('[IIG] Inline Image Generation v3.0 loaded');
     });
 
@@ -6189,6 +6290,7 @@ function bindSettingsEvents() {
             addButtonsToExistingMessages();
             addPromptPanelsToExistingMessages();
             updateWardrobeInjection();
+            updateImageModeInjection();
         }, 100);
         setTimeout(updateCharAvatarPreview, 200);
     });

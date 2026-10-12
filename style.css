@@ -508,6 +508,13 @@
     max-width: 100%;
 }
 
+/* Inline mode: image sits on its own line between paragraphs */
+body.iig-mode-inline .mes_text .iig-image-wrapper {
+    display: block;
+    width: fit-content;
+    margin: 8px auto;
+}
+
 #chat .mes_text .iig-image-regen {
     display: flex !important;
     visibility: visible !important;

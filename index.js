@@ -109,6 +109,13 @@ const defaultSettings = Object.freeze({
     activeWardrobeChar: null,
     activeWardrobeUser: null,
     injectWardrobeToChat: true,
+    // Hex only: values are bound to <input type="color">
+    wardrobeTheme: {
+        bgColor: '#1a1a1e',
+        textColor: '#e8e0e0',
+        accentColor: '#ffb6c1',
+        borderColor: '#3a3a40',
+    },
     wardrobeInjectionDepth: 1,
     wardrobeDescEndpoint: '',
     wardrobeDescApiKey: '',
@@ -262,6 +269,35 @@ function escapeHtml(value) {
 // SETTINGS
 // ============================================================
 
+const WARDROBE_THEME_DEFAULTS = Object.freeze({
+    bgColor: '#1a1a1e',
+    textColor: '#e8e0e0',
+    accentColor: '#ffb6c1',
+    borderColor: '#3a3a40',
+});
+
+// Keeps only valid #rrggbb values (expands #rgb); anything else falls back to the default.
+function normalizeWardrobeTheme(raw) {
+    const source = raw && typeof raw === 'object' ? raw : {};
+    const result = {};
+    for (const [key, fallback] of Object.entries(WARDROBE_THEME_DEFAULTS)) {
+        let value = String(source[key] || '').trim().toLowerCase();
+        const short = value.match(/^#([0-9a-f])([0-9a-f])([0-9a-f])$/);
+        if (short) value = `#${short[1]}${short[1]}${short[2]}${short[2]}${short[3]}${short[3]}`;
+        result[key] = /^#[0-9a-f]{6}$/.test(value) ? value : fallback;
+    }
+    return result;
+}
+
+function applyWardrobeTheme(theme = getSettings().wardrobeTheme) {
+    const t = normalizeWardrobeTheme(theme);
+    const root = document.documentElement;
+    root.style.setProperty('--iig-wr-bg', t.bgColor);
+    root.style.setProperty('--iig-wr-text', t.textColor);
+    root.style.setProperty('--iig-wr-accent', t.accentColor);
+    root.style.setProperty('--iig-wr-border', t.borderColor);
+}
+
 function getSettings() {
     const context = SillyTavern.getContext();
     if (!context.extensionSettings[MODULE_NAME]) {
@@ -283,6 +319,7 @@ function getSettings() {
     if (!s.characterReferenceLibrary.users || typeof s.characterReferenceLibrary.users !== 'object') {
         s.characterReferenceLibrary.users = {};
     }
+    s.wardrobeTheme = normalizeWardrobeTheme(s.wardrobeTheme);
     // Migrate wardrobe items without description
     for (const item of (s.wardrobeItems || [])) {
         if (!Object.hasOwn(item, 'description')) item.description = '';
@@ -5443,6 +5480,31 @@ function createSettingsUI() {
                         </div>
                     </div>
 
+                    <!-- ======= SECTION: Wardrobe Theme ======= -->
+                    <div class="iig-collapsible" data-section-id="wardrobe_theme">
+                        <div class="iig-collapsible-header">
+                            <i class="fa-solid fa-chevron-down iig-collapse-icon"></i>
+                            <span>🎨 Оформление гардероба</span>
+                        </div>
+                        <div class="iig-collapsible-content">
+                            <p class="hint">Цвета окна гардероба и кнопки в поле ввода. Изменения применяются сразу.</p>
+                            ${[
+                                ['bgColor', 'Фон'],
+                                ['textColor', 'Текст'],
+                                ['accentColor', 'Акценты и детали'],
+                                ['borderColor', 'Границы'],
+                            ].map(([key, label]) => `
+                            <div class="flex-row">
+                                <label for="iig_wardrobe_theme_${key}">${label}</label>
+                                <input type="color" id="iig_wardrobe_theme_${key}" class="iig-wardrobe-theme-input" data-theme-key="${key}" value="${escapeHtml(settings.wardrobeTheme[key])}">
+                            </div>`).join('')}
+                            <div class="flex-row">
+                                <button type="button" class="menu_button" id="iig_wardrobe_theme_reset"><i class="fa-solid fa-rotate-left"></i> Сбросить цвета</button>
+                                <button type="button" class="menu_button" id="iig_wardrobe_theme_preview"><i class="fa-solid fa-eye"></i> Открыть гардероб</button>
+                            </div>
+                        </div>
+                    </div>
+
                     <!-- ======= SECTION: Hairstyle Char ======= -->
                     <div class="iig-collapsible" data-section-id="hairstyle_char">
                         <div class="iig-collapsible-header">
@@ -5608,6 +5670,24 @@ function bindSettingsEvents() {
     };
 
     document.getElementById('iig_enabled')?.addEventListener('change', (e) => { settings.enabled = e.target.checked; saveSettings(); });
+
+    // Wardrobe theme colors
+    document.querySelectorAll('.iig-wardrobe-theme-input').forEach(input => {
+        input.addEventListener('input', (e) => {
+            settings.wardrobeTheme = normalizeWardrobeTheme({ ...settings.wardrobeTheme, [e.target.dataset.themeKey]: e.target.value });
+            applyWardrobeTheme(settings.wardrobeTheme);
+            saveSettings();
+        });
+    });
+    document.getElementById('iig_wardrobe_theme_reset')?.addEventListener('click', () => {
+        settings.wardrobeTheme = { ...WARDROBE_THEME_DEFAULTS };
+        document.querySelectorAll('.iig-wardrobe-theme-input').forEach(input => {
+            input.value = settings.wardrobeTheme[input.dataset.themeKey];
+        });
+        applyWardrobeTheme(settings.wardrobeTheme);
+        saveSettings();
+    });
+    document.getElementById('iig_wardrobe_theme_preview')?.addEventListener('click', () => openWardrobeModal());
 
     document.getElementById('iig_api_type')?.addEventListener('change', (e) => {
         settings.apiType = e.target.value;
@@ -6117,7 +6197,8 @@ function bindSettingsEvents() {
         await onMessageReceived(messageId);
     });
 
-    // Floating wardrobe button
+    // Wardrobe button in the input bar + theme colors
+    applyWardrobeTheme();
     createFloatingWardrobeButton();
     
     console.log('[IIG] Inline Image Generation v3.0 initialized');

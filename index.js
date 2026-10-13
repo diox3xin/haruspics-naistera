@@ -2797,11 +2797,10 @@ async function generateImageOpenAIChat(prompt, style, refData, options = {}) {
     let imageSize = options.imageSize || settings.imageSize || '1K';
     if (!VALID_IMAGE_SIZES.includes(imageSize)) imageSize = '1K';
 
-    // Random format for Gemini models (nano-banana via Router or direct Gemini API)
+    // Random format for Gemini models: randomize aspect ratio only (image size stays from settings)
     const isGemini = isGeminiModel(settings.model || '') || settings.apiType === 'gemini';
     if (isGemini && settings.geminiRandomFormat) {
         aspectRatio = VALID_ASPECT_RATIOS[Math.floor(Math.random() * VALID_ASPECT_RATIOS.length)];
-        imageSize = VALID_IMAGE_SIZES[Math.floor(Math.random() * VALID_IMAGE_SIZES.length)];
         iigLog('INFO', `Gemini random format (router): ${aspectRatio} ${imageSize}`);
     }
 
@@ -2890,10 +2889,9 @@ async function generateImageGemini(prompt, style, refData, options = {}) {
     let imageSize = options.imageSize || settings.imageSize || '1K';
     if (!VALID_IMAGE_SIZES.includes(imageSize)) imageSize = '1K';
 
-    // Gemini random format: pick random aspect+size per request (model chooses)
+    // Gemini random format: pick random aspect ratio per request (image size stays from settings)
     if (settings.apiType === 'gemini' && settings.geminiRandomFormat) {
         aspectRatio = VALID_ASPECT_RATIOS[Math.floor(Math.random() * VALID_ASPECT_RATIOS.length)];
-        imageSize = VALID_IMAGE_SIZES[Math.floor(Math.random() * VALID_IMAGE_SIZES.length)];
         iigLog('INFO', `Gemini random format: ${aspectRatio} ${imageSize}`);
     }
 
@@ -5512,7 +5510,7 @@ function createSettingsUI() {
                                 <p class="hint">Для Gemini и Router (OpenRouter/CloseRouter). 1K ≈ 1024px, 2K ≈ 2048px, 4K ≈ 4096px по длинной стороне.</p>
                                 <label class="checkbox_label">
                                     <input type="checkbox" id="iig_gemini_random_format" ${settings.geminiRandomFormat ? 'checked' : ''}>
-                                    <span>Случайный формат (aspect+size) при каждом запросе</span>
+                                    <span>Случайный формат (aspect ratio) при каждом запросе</span>
                                 </label>
                             </div>
 

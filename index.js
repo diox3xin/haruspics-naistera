@@ -2424,9 +2424,19 @@ async function generateImageNaistera(prompt, style, refData, options = {}) {
     }
     promptParts.push(prompt);
 
+
+    // Random aspect ratio for nano-banana models in Naistera (respects prompt-specified ratio)
+    let aspectRatio = options.aspectRatio || settings.naisteraAspectRatio || '1:1';
+    const isNaisteraNanaBanana = isGeminiModel(model);
+    if (isNaisteraNanaBanana && settings.geminiRandomFormat && !options.aspectRatio) {
+        const validRatios = ['1:1', '2:3', '3:2', '3:4', '4:3', '4:5', '5:4', '9:16', '16:9', '21:9'];
+        aspectRatio = validRatios[Math.floor(Math.random() * validRatios.length)];
+        iigLog('INFO', `Naistera random format (nano-banana): ${aspectRatio}`);
+    }
+
     const body = {
         prompt: promptParts.join('\n\n'),
-        aspect_ratio: options.aspectRatio || settings.naisteraAspectRatio || '1:1',
+        aspect_ratio: aspectRatio,
         model,
     };
 
@@ -2449,6 +2459,16 @@ async function generateImageNaistera(prompt, style, refData, options = {}) {
     if (settings.naisteraPolling) body.sync = false;
 
     iigLog('INFO', `Naistera request: model=${model}, refs=${body.reference_objects?.length || 0}, polling=${!!settings.naisteraPolling}`);
+
+    // Debug: show ref counts on mobile (temporary diagnostic)
+    const refCount = body.reference_objects?.length || 0;
+    const estimatedSizeKB = refCount > 0 ? Math.round(body.reference_objects.reduce((sum, r) => sum + (r.image?.length || 0), 0) / 1024) : 0;
+    toastr.info(
+        `Refs: ${refCount} objects | ~${estimatedSizeKB}KB`,
+        `Debug Naistera (${model})`,
+        { timeOut: 15000, extendedTimeOut: 10000 }
+    );
+
     const response = await fetch(`${endpoint}/api/generate`, {
         method: 'POST',
         headers: {

@@ -194,7 +194,7 @@ function isImageModel(modelId) {
 }
 
 function isGeminiModel(modelId) {
-    return modelId.toLowerCase().includes('nano-banana');
+    return /nano-banana|gemini|flash-image|imagen/i.test(String(modelId || ''));
 }
 
 function buildGeminiRequestCandidates(baseUrl, model, apiKey) {
@@ -2798,8 +2798,8 @@ async function generateImageOpenAIChat(prompt, style, refData, options = {}) {
     if (!VALID_IMAGE_SIZES.includes(imageSize)) imageSize = '1K';
 
     // Random format for Gemini models (nano-banana via Router or direct Gemini API)
-    const isGeminiModel = /nano-banana/i.test(settings.model || '') || settings.apiType === 'gemini';
-    if (isGeminiModel && settings.geminiRandomFormat) {
+    const isGemini = isGeminiModel(settings.model || '') || settings.apiType === 'gemini';
+    if (isGemini && settings.geminiRandomFormat) {
         aspectRatio = VALID_ASPECT_RATIOS[Math.floor(Math.random() * VALID_ASPECT_RATIOS.length)];
         imageSize = VALID_IMAGE_SIZES[Math.floor(Math.random() * VALID_IMAGE_SIZES.length)];
         iigLog('INFO', `Gemini random format (router): ${aspectRatio} ${imageSize}`);
@@ -2859,10 +2859,14 @@ async function generateImageOpenAIChat(prompt, style, refData, options = {}) {
 
     if (!response.ok) {
         const text = await response.text().catch(() => '');
-        throw new Error(`API Error (${response.status}): ${text}`);
+        throw new Error(`API Error (${response.status}): ${text.slice(0, 500)}`);
     }
 
-    const result = await response.json();
+    const result = await response.json().catch(() => null);
+    if (!result) {
+        const text = await response.clone().text().catch(() => '');
+        throw new Error(`API returned non-JSON response (status ${response.status}): ${text.slice(0, 300) || '(empty body)'}`);
+    }
     const image = parseImageFromApiResponse(result);
     if (!image) throw new Error('No image data in chat/completions response');
     return image;
@@ -3862,7 +3866,7 @@ function renderPromptPanel(panel, messageId) {
     panel.innerHTML = `${state.imagePath ? `<img class="iig-prompt-result-image" src="${escapeHtml(state.imagePath)}" alt="${escapeHtml(state.prompt || 'Generated image')}">` : ''}
         <div class="iig-prompt-panel-head"><strong><i class="fa-solid fa-wand-magic-sparkles"></i> Image prompt</strong><span class="iig-prompt-status"></span>${isExtBlocks ? `<button type="button" class="menu_button iig-prompt-panel-toggle" title="${panelCollapsed ? 'Развернуть панель' : 'Свернуть панель'}" aria-expanded="${!panelCollapsed}"><i class="fa-solid ${panelToggleIcon}" aria-hidden="true"></i></button>` : ''}</div>
         <div class="iig-prompt-panel-body ${panelCollapsed ? 'iig-collapsed-hidden' : ''}">
-        <div class="iig-prompt-panel-controls"><span class="iig-prompt-selection">${escapeHtml(instruction.name)}</span><button type="button" class="menu_button iig-prompt-stream-toggle${settings.promptGenStream ? ' iig-stream-on' : ''}" title="Стриминг промпта" aria-pressed="${!!settings.promptGenStream}"><i class="fa-solid fa-bolt" aria-hidden="true"></i> Стрим</button>${(settings.apiType === 'gemini' || /nano-banana/i.test(settings.model || '')) ? `<button type="button" class="menu_button iig-gemini-format-toggle${settings.geminiRandomFormat ? ' iig-format-on' : ''}" title="Случайный формат Gemini (каждый запрос)" aria-pressed="${!!settings.geminiRandomFormat}"><i class="fa-solid fa-dice" aria-hidden="true"></i> Формат</button>` : ''}<button type="button" class="menu_button iig-prompt-generate"><i class="fa-solid fa-wand-magic-sparkles"></i> Промпт</button><button type="button" class="menu_button iig-prompt-cancel" hidden title="Отменить генерацию промпта"><i class="fa-solid fa-stop" aria-hidden="true"></i> Стоп</button><button type="button" class="menu_button iig-image-from-prompt"><i class="fa-solid fa-image"></i> Картинка</button></div>
+        <div class="iig-prompt-panel-controls"><span class="iig-prompt-selection">${escapeHtml(instruction.name)}</span><button type="button" class="menu_button iig-prompt-stream-toggle${settings.promptGenStream ? ' iig-stream-on' : ''}" title="Стриминг промпта" aria-pressed="${!!settings.promptGenStream}"><i class="fa-solid fa-bolt" aria-hidden="true"></i> Стрим</button>${(settings.apiType === 'gemini' || isGeminiModel(settings.model || '')) ? `<button type="button" class="menu_button iig-gemini-format-toggle${settings.geminiRandomFormat ? ' iig-format-on' : ''}" title="Случайный формат Gemini (каждый запрос)" aria-pressed="${!!settings.geminiRandomFormat}"><i class="fa-solid fa-dice" aria-hidden="true"></i> Формат</button>` : ''}<button type="button" class="menu_button iig-prompt-generate"><i class="fa-solid fa-wand-magic-sparkles"></i> Промпт</button><button type="button" class="menu_button iig-prompt-cancel" hidden title="Отменить генерацию промпта"><i class="fa-solid fa-stop" aria-hidden="true"></i> Стоп</button><button type="button" class="menu_button iig-image-from-prompt"><i class="fa-solid fa-image"></i> Картинка</button></div>
         <textarea class="iig-prompt-value" rows="4" placeholder="Здесь появится prompt картинки..."></textarea>
         ${isExtBlocks ? `<div class="iig-prompt-meta-header"><button type="button" class="menu_button iig-prompt-meta-toggle" title="${metaCollapsed ? 'Показать стиль и негатив' : 'Скрыть стиль и негатив'}" aria-expanded="${!metaCollapsed}"><i class="fa-solid ${metaToggleIcon}" aria-hidden="true"></i> Стиль / негатив</button></div>
         <div class="iig-prompt-meta ${metaCollapsed ? 'iig-collapsed-hidden' : ''}"><span>Стиль: ${escapeHtml(state.style || buildEffectiveStyle('') || 'не выбран')}</span><span>Негатив: ${escapeHtml(state.negativePrompt || getActiveNegativePrompt() || 'не выбран')}</span></div>` : `<div class="iig-prompt-meta"><span>Стиль: ${escapeHtml(state.style || buildEffectiveStyle('') || 'не выбран')}</span><span>Негатив: ${escapeHtml(state.negativePrompt || getActiveNegativePrompt() || 'не выбран')}</span></div>`}
@@ -5506,6 +5510,10 @@ function createSettingsUI() {
                                     </select>
                                 </div>
                                 <p class="hint">Для Gemini и Router (OpenRouter/CloseRouter). 1K ≈ 1024px, 2K ≈ 2048px, 4K ≈ 4096px по длинной стороне.</p>
+                                <label class="checkbox_label">
+                                    <input type="checkbox" id="iig_gemini_random_format" ${settings.geminiRandomFormat ? 'checked' : ''}>
+                                    <span>Случайный формат (aspect+size) при каждом запросе</span>
+                                </label>
                             </div>
 
                         </div>
@@ -6038,6 +6046,7 @@ function bindSettingsEvents() {
     document.getElementById('iig_quality')?.addEventListener('change', (e) => { settings.quality = e.target.value; saveSettings(); });
     document.getElementById('iig_aspect_ratio')?.addEventListener('change', (e) => { settings.aspectRatio = e.target.value; saveSettings(); });
     document.getElementById('iig_image_size')?.addEventListener('change', (e) => { settings.imageSize = e.target.value; saveSettings(); });
+    document.getElementById('iig_gemini_random_format')?.addEventListener('change', (e) => { settings.geminiRandomFormat = e.target.checked; saveSettings(); });
 
     document.getElementById('iig_default_style')?.addEventListener('input', (e) => { settings.defaultStyle = e.target.value; saveSettings(); });
 

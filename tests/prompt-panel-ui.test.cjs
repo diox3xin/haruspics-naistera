@@ -13,14 +13,14 @@ test('Prompt panel has collapse toggles in extblocks mode', () => {
     assert.match(source, /iig-collapsed-hidden/);
 });
 
-test('Gemini format toggle appears for apiType=gemini or nano-banana model', () => {
+test('Gemini format toggle appears for apiType=gemini or Gemini-family model', () => {
     assert.match(source, /iig-gemini-format-toggle/);
     assert.match(source, /geminiRandomFormat/);
-    assert.match(source, /apiType === 'gemini' \|\| \/nano-banana\/i\.test/);
+    assert.match(source, /apiType === 'gemini' \|\| isGeminiModel\(settings\.model/);
 });
 
 test('Gemini random format picks random aspect ratio and image size', () => {
-    assert.match(source, /isGeminiModel && settings\.geminiRandomFormat/);
+    assert.match(source, /isGemini && settings\.geminiRandomFormat/);
     assert.match(source, /VALID_ASPECT_RATIOS\[Math\.floor\(Math\.random\(\)/);
     assert.match(source, /VALID_IMAGE_SIZES\[Math\.floor\(Math\.random\(\)/);
 });

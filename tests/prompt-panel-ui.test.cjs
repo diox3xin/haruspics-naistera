@@ -20,10 +20,14 @@ test('Gemini format toggle appears for apiType=gemini or Gemini-family model', (
 });
 
 test('Gemini random format picks random aspect ratio only (image size stays)', () => {
-    assert.match(source, /isGemini && settings\.geminiRandomFormat/);
+    assert.match(source, /isGemini && settings\.geminiRandomFormat && !options\.aspectRatio/);
     assert.match(source, /VALID_ASPECT_RATIOS\[Math\.floor\(Math\.random\(\)/);
     // image size must NOT be randomized
     assert.doesNotMatch(source, /imageSize = VALID_IMAGE_SIZES\[Math\.floor\(Math\.random\(\)/);
+});
+
+test('Gemini random format respects prompt-specified aspect ratio', () => {
+    assert.match(source, /settings\.apiType === 'gemini' && settings\.geminiRandomFormat && !options\.aspectRatio/);
 });
 
 test('Gemini logs reference breakdown for debugging', () => {

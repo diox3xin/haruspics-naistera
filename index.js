@@ -142,6 +142,12 @@ const defaultSettings = Object.freeze({
     promptGenTemperature: 0.7,
     // Stream the image prompt token by token into the message panel
     promptGenStream: false,
+    // Prompt panel collapsed by default (extblocks mode only)
+    promptPanelCollapsed: false,
+    // Meta (style/negative) collapsed by default (extblocks mode only)
+    promptMetaCollapsed: false,
+    // Random Gemini format per request (aspect+size picked by the model)
+    geminiRandomFormat: false,
     // ===== Reference Generator =====
     refGenSource: 'main', // 'main' | 'custom'
     refGenEndpoint: '',
@@ -2872,11 +2878,22 @@ async function generateImageGemini(prompt, style, refData, options = {}) {
     let imageSize = options.imageSize || settings.imageSize || '1K';
     if (!VALID_IMAGE_SIZES.includes(imageSize)) imageSize = '1K';
 
+    // Gemini random format: pick random aspect+size per request (model chooses)
+    if (settings.apiType === 'gemini' && settings.geminiRandomFormat) {
+        aspectRatio = VALID_ASPECT_RATIOS[Math.floor(Math.random() * VALID_ASPECT_RATIOS.length)];
+        imageSize = VALID_IMAGE_SIZES[Math.floor(Math.random() * VALID_IMAGE_SIZES.length)];
+        iigLog('INFO', `Gemini random format: ${aspectRatio} ${imageSize}`);
+    }
+
     const { imageRefs = [], textOnlyClothing = [], textDirectives = [] } = refData;
 
     // Separate face and clothing refs
     const faceRefs = imageRefs.filter(r => r.type === 'face');
     const clothingImageRefs = imageRefs.filter(r => r.type === 'clothing');
+    const hairstyleRefs = imageRefs.filter(r => r.type === 'hairstyle');
+
+    // Log reference breakdown for debugging "refs not visible" issues
+    iigLog('INFO', `Gemini refs: faces=${faceRefs.length}, clothingImages=${clothingImageRefs.length}, hairstyles=${hairstyleRefs.length}, textClothing=${textOnlyClothing.length}, textDirectives=${textDirectives.length}`);
 
     const parts = [];
 
@@ -2924,7 +2941,7 @@ async function generateImageGemini(prompt, style, refData, options = {}) {
         parts.push({ text: clothingLabel });
     }
 
-    for (const ref of imageRefs.filter(ref => ref.type === 'hairstyle')) {
+    for (const ref of hairstyleRefs) {
         parts.push({ inlineData: { mimeType: ref.mimeType, data: ref.data } });
         parts.push({ text: `[HAIRSTYLE REFERENCE for "${ref.name}"]: Copy only the hair, not the face. ${ref.description || ''}` });
     }
@@ -3826,12 +3843,38 @@ function renderPromptPanel(panel, messageId) {
     const message = context.chat?.[messageId];
     if (!panel || !message) return;
     const state = message.extra?.iig_prompt_block || {};
+    const settings = getSettings();
     const instruction = getPromptInstructions().find(item => item.id === state.instructionId) || getActivePromptInstruction();
+    const isExtBlocks = normalizeImageDisplayMode(settings.imageDisplayMode) === 'extblocks';
+    const panelCollapsed = settings.promptPanelCollapsed && isExtBlocks;
+    const metaCollapsed = settings.promptMetaCollapsed && isExtBlocks;
+    const panelToggleIcon = panelCollapsed ? 'fa-chevron-down' : 'fa-chevron-up';
+    const metaToggleIcon = metaCollapsed ? 'fa-eye-slash' : 'fa-eye';
+
     panel.innerHTML = `${state.imagePath ? `<img class="iig-prompt-result-image" src="${escapeHtml(state.imagePath)}" alt="${escapeHtml(state.prompt || 'Generated image')}">` : ''}
-        <div class="iig-prompt-panel-head"><strong><i class="fa-solid fa-wand-magic-sparkles"></i> Image prompt</strong><span class="iig-prompt-status"></span></div>
-        <div class="iig-prompt-panel-controls"><span class="iig-prompt-selection">${escapeHtml(instruction.name)}</span><button type="button" class="menu_button iig-prompt-stream-toggle${getSettings().promptGenStream ? ' iig-stream-on' : ''}" title="Стриминг промпта" aria-pressed="${!!getSettings().promptGenStream}"><i class="fa-solid fa-bolt" aria-hidden="true"></i> Стрим</button><button type="button" class="menu_button iig-prompt-generate"><i class="fa-solid fa-wand-magic-sparkles"></i> Промпт</button><button type="button" class="menu_button iig-prompt-cancel" hidden title="Отменить генерацию промпта"><i class="fa-solid fa-stop" aria-hidden="true"></i> Стоп</button><button type="button" class="menu_button iig-image-from-prompt"><i class="fa-solid fa-image"></i> Картинка</button></div>
-        <textarea class="iig-prompt-value" rows="3" placeholder="Здесь появится prompt картинки..."></textarea>
-        <div class="iig-prompt-meta"><span>Стиль: ${escapeHtml(state.style || buildEffectiveStyle('') || 'не выбран')}</span><span>Негатив: ${escapeHtml(state.negativePrompt || getActiveNegativePrompt() || 'не выбран')}</span></div>`;
+        <div class="iig-prompt-panel-head"><strong><i class="fa-solid fa-wand-magic-sparkles"></i> Image prompt</strong><span class="iig-prompt-status"></span>${isExtBlocks ? `<button type="button" class="menu_button iig-prompt-panel-toggle" title="${panelCollapsed ? 'Развернуть панель' : 'Свернуть панель'}" aria-expanded="${!panelCollapsed}"><i class="fa-solid ${panelToggleIcon}" aria-hidden="true"></i></button>` : ''}</div>
+        <div class="iig-prompt-panel-body ${panelCollapsed ? 'iig-collapsed-hidden' : ''}">
+        <div class="iig-prompt-panel-controls"><span class="iig-prompt-selection">${escapeHtml(instruction.name)}</span><button type="button" class="menu_button iig-prompt-stream-toggle${settings.promptGenStream ? ' iig-stream-on' : ''}" title="Стриминг промпта" aria-pressed="${!!settings.promptGenStream}"><i class="fa-solid fa-bolt" aria-hidden="true"></i> Стрим</button>${settings.apiType === 'gemini' ? `<button type="button" class="menu_button iig-gemini-format-toggle${settings.geminiRandomFormat ? ' iig-format-on' : ''}" title="Случайный формат Gemini (каждый запрос)" aria-pressed="${!!settings.geminiRandomFormat}"><i class="fa-solid fa-dice" aria-hidden="true"></i> Формат</button>` : ''}<button type="button" class="menu_button iig-prompt-generate"><i class="fa-solid fa-wand-magic-sparkles"></i> Промпт</button><button type="button" class="menu_button iig-prompt-cancel" hidden title="Отменить генерацию промпта"><i class="fa-solid fa-stop" aria-hidden="true"></i> Стоп</button><button type="button" class="menu_button iig-image-from-prompt"><i class="fa-solid fa-image"></i> Картинка</button></div>
+        <textarea class="iig-prompt-value" rows="4" placeholder="Здесь появится prompt картинки..."></textarea>
+        ${isExtBlocks ? `<div class="iig-prompt-meta-header"><button type="button" class="menu_button iig-prompt-meta-toggle" title="${metaCollapsed ? 'Показать стиль и негатив' : 'Скрыть стиль и негатив'}" aria-expanded="${!metaCollapsed}"><i class="fa-solid ${metaToggleIcon}" aria-hidden="true"></i> Стиль / негатив</button></div>
+        <div class="iig-prompt-meta ${metaCollapsed ? 'iig-collapsed-hidden' : ''}"><span>Стиль: ${escapeHtml(state.style || buildEffectiveStyle('') || 'не выбран')}</span><span>Негатив: ${escapeHtml(state.negativePrompt || getActiveNegativePrompt() || 'не выбран')}</span></div>` : `<div class="iig-prompt-meta"><span>Стиль: ${escapeHtml(state.style || buildEffectiveStyle('') || 'не выбран')}</span><span>Негатив: ${escapeHtml(state.negativePrompt || getActiveNegativePrompt() || 'не выбран')}</span></div>`}
+        </div>`;
+
+    // Toggle panel collapse (extblocks only)
+    panel.querySelector('.iig-prompt-panel-toggle')?.addEventListener('click', () => {
+        const settings = getSettings();
+        settings.promptPanelCollapsed = !settings.promptPanelCollapsed;
+        saveSettings();
+        renderPromptPanel(panel, messageId);
+    });
+
+    // Toggle meta (style/negative) collapse (extblocks only)
+    panel.querySelector('.iig-prompt-meta-toggle')?.addEventListener('click', () => {
+        const settings = getSettings();
+        settings.promptMetaCollapsed = !settings.promptMetaCollapsed;
+        saveSettings();
+        renderPromptPanel(panel, messageId);
+    });
     const textarea = panel.querySelector('.iig-prompt-value');
     textarea.value = state.prompt || '';
     textarea.addEventListener('change', async () => {
@@ -3861,6 +3904,17 @@ function renderPromptPanel(panel, messageId) {
             btn.setAttribute('aria-pressed', String(settings.promptGenStream));
         });
         toastr.info(settings.promptGenStream ? 'Стриминг промпта включён' : 'Стриминг промпта выключен');
+    });
+    panel.querySelector('.iig-gemini-format-toggle')?.addEventListener('click', event => {
+        const settings = getSettings();
+        settings.geminiRandomFormat = !settings.geminiRandomFormat;
+        saveSettings();
+        // Global setting: sync every visible panel
+        document.querySelectorAll('.iig-gemini-format-toggle').forEach(btn => {
+            btn.classList.toggle('iig-format-on', settings.geminiRandomFormat);
+            btn.setAttribute('aria-pressed', String(settings.geminiRandomFormat));
+        });
+        toastr.info(settings.geminiRandomFormat ? 'Gemini: рандомный формат включён' : 'Gemini: фиксированный формат');
     });
     panel.querySelector('.iig-prompt-generate')?.addEventListener('click', async event => {
         const button = event.currentTarget;

@@ -29,6 +29,7 @@ function setup(apiType = 'openai-chat', endpoint = 'https://api.openai.com') {
     const context = vm.createContext({
         getSettings: () => config,
         iigLog: () => {},
+        toastr: { info: () => {}, warning: () => {}, error: () => {}, success: () => {} },
         isRouterEndpoint: (ep) => /openrouter|closerouter|rout\.my/i.test(ep || ''),
         buildOpenAIUrl: (base, path) => `${base.replace(/\/$/, '')}/v1/${path}`,
         buildAuthHeaders: (key, headers) => ({ ...headers, 'Authorization': `Bearer ${key}` }),

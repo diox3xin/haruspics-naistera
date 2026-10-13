@@ -2834,6 +2834,17 @@ async function generateImageOpenAIChat(prompt, style, refData, options = {}) {
         });
     }
 
+    // Debug: show ref counts on mobile (temporary diagnostic)
+    const faceCount = imageRefs.filter(r => r.type === 'face').length;
+    const clothingCount = imageRefs.filter(r => r.type === 'clothing').length;
+    const hairstyleCount = imageRefs.filter(r => r.type === 'hairstyle').length;
+    const estimatedSizeKB = Math.round(imageRefs.reduce((sum, r) => sum + (r.data?.length || 0), 0) / 1024);
+    toastr.info(
+        `Refs: ${faceCount} faces, ${clothingCount} clothes, ${hairstyleCount} hair | ~${estimatedSizeKB}KB`,
+        `Debug OpenAI/Router (${settings.model})`,
+        { timeOut: 15000, extendedTimeOut: 10000 }
+    );
+
     const body = {
         model: settings.model,
         messages: [{ role: 'user', content }],
@@ -2906,6 +2917,14 @@ async function generateImageGemini(prompt, style, refData, options = {}) {
 
     // Log reference breakdown for debugging "refs not visible" issues
     iigLog('INFO', `Gemini refs: faces=${faceRefs.length}, clothingImages=${clothingImageRefs.length}, hairstyles=${hairstyleRefs.length}, textClothing=${textOnlyClothing.length}, textDirectives=${textDirectives.length}`);
+
+    // Debug: show ref counts on mobile (temporary diagnostic)
+    const estimatedSizeKB = Math.round(imageRefs.reduce((sum, r) => sum + (r.data?.length || 0), 0) / 1024);
+    toastr.info(
+        `Refs: ${faceRefs.length} faces, ${clothingImageRefs.length} clothes, ${hairstyleRefs.length} hair | ~${estimatedSizeKB}KB`,
+        `Debug Gemini (${settings.model})`,
+        { timeOut: 15000, extendedTimeOut: 10000 }
+    );
 
     const parts = [];
 

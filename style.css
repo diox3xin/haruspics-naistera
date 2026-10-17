@@ -62,7 +62,7 @@
 /* ---- Settings grid cards (wardrobe / hairstyles) ---- */
 .iig-ref-grid {
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(92px, 1fr));
+    grid-template-columns: repeat(auto-fill, minmax(70px, 90px));
     gap: 8px;
     margin: 6px 0;
 }
@@ -1117,7 +1117,7 @@ body.iig-mode-inline .mes_text .iig-image-wrapper {
 /* ---- Wardrobe card grid ---- */
 .iig-wardrobe-grid {
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(110px, 1fr));
+    grid-template-columns: repeat(auto-fill, minmax(95px, 110px));
     gap: 10px;
 }
 
@@ -1221,6 +1221,36 @@ body.iig-mode-inline .mes_text .iig-image-wrapper {
     color: white;
     border-color: #dc3545;
     outline: none;
+}
+
+.iig-card-describe {
+    position: absolute;
+    top: 6px;
+    left: 40px;
+    width: 28px;
+    height: 28px;
+    padding: 0;
+    border: 1px solid color-mix(in srgb, var(--iig-wr-border) 70%, transparent);
+    border-radius: 50%;
+    background: color-mix(in srgb, var(--iig-wr-bg) 90%, transparent);
+    color: color-mix(in srgb, var(--iig-accent) 80%, transparent);
+    font-size: 11px;
+    cursor: pointer;
+    transition: background 0.15s, color 0.15s, border-color 0.15s;
+    backdrop-filter: blur(4px);
+}
+
+.iig-card-describe:hover,
+.iig-card-describe:focus-visible {
+    background: color-mix(in srgb, var(--iig-accent) 90%, transparent);
+    color: white;
+    border-color: var(--iig-accent);
+    outline: none;
+}
+
+.iig-card-describe:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
 }
 
 /* ---- Wardrobe footer with active outfit description ---- */

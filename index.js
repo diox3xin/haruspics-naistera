@@ -1262,7 +1262,7 @@ function addWardrobeItem(name, imageData, target = 'char', category = 'full') {
         createdAt: Date.now()
     };
     settings.wardrobeItems.push(item);
-    saveSettings();
+    // Don't call saveSettings() here to prevent panel collapse - caller will save after render
     return item;
 }
 
@@ -1374,7 +1374,7 @@ function removeWardrobeItem(itemId) {
         if (activeId === itemId) delete settings.activeWardrobeRpg[rpgId];
     }
     settings.wardrobeItems = settings.wardrobeItems.filter(i => i.id !== itemId);
-    saveSettings();
+    // Don't call saveSettings() here to prevent panel collapse - caller will save after render
     updateWardrobeInjection();
 }
 
@@ -1413,7 +1413,7 @@ function updateWardrobeItemDescription(itemId, description) {
     const item = settings.wardrobeItems.find(i => i.id === itemId);
     if (item) {
         item.description = description;
-        saveSettings();
+        // Don't call saveSettings() here to prevent panel collapse - caller will save after render
         updateWardrobeInjection();
     }
 }
@@ -4575,6 +4575,7 @@ function bindReferenceUpload(kind, target) {
         setActiveWardrobe(item.id, target);
         if (nameInput) nameInput.value = '';
         render();
+        saveSettings();
     });
     fileInput?.addEventListener('change', async () => {
         const file = fileInput.files[0];
@@ -4590,6 +4591,7 @@ function bindReferenceUpload(kind, target) {
             if (nameInput) nameInput.value = '';
             render();
             renderQuickWardrobeList();
+            saveSettings();
         } catch (error) { toastr.error(`Не удалось добавить изображение: ${error.message}`); }
         finally { fileInput.value = ''; }
     });
@@ -4619,7 +4621,7 @@ function renderWardrobeGrid(target) {
             item,
             isActive: item.id === activeId,
             onSelect: () => { setActiveWardrobe(item.id, target); renderWardrobeGrid(target); updateFloatingButtonBadge(); },
-            onDelete: () => { removeWardrobeItem(item.id); renderWardrobeGrid(target); updateFloatingButtonBadge(); toastr.info('Одежда удалена'); },
+            onDelete: () => { removeWardrobeItem(item.id); renderWardrobeGrid(target); updateFloatingButtonBadge(); saveSettings(); toastr.info('Одежда удалена'); },
             rerender: () => renderWardrobeGrid(target),
         }));
     }
@@ -4689,12 +4691,14 @@ function renderWardrobeDescriptionPanel(target) {
 
     textarea?.addEventListener('blur', () => {
         updateWardrobeItemDescription(textarea.dataset.wardrobeId, textarea.value);
+        saveSettings();
     });
 
     panel.querySelector('.iig-ward-desc-save')?.addEventListener('click', () => {
         updateWardrobeItemDescription(textarea.dataset.wardrobeId, textarea.value);
         toastr.success('Описание сохранено');
         renderWardrobeGrid(target);
+        saveSettings();
     });
 
     panel.querySelector('.iig-ward-desc-clear')?.addEventListener('click', () => {
@@ -4702,6 +4706,7 @@ function renderWardrobeDescriptionPanel(target) {
         updateWardrobeItemDescription(textarea.dataset.wardrobeId, '');
         toastr.info('Описание очищено');
         renderWardrobeGrid(target);
+        saveSettings();
     });
 
     panel.querySelector('.iig-ward-desc-generate')?.addEventListener('click', async (e) => {
@@ -4720,6 +4725,7 @@ function renderWardrobeDescriptionPanel(target) {
             if (statusEl) { statusEl.textContent = 'Описание сгенерировано!'; statusEl.style.color = '#8f8'; }
             toastr.success('Описание сгенерировано через AI');
             renderWardrobeGrid(target);
+            saveSettings();
         } catch (error) {
             iigLog('ERROR', 'Failed to generate wardrobe description:', error);
             if (statusEl) { statusEl.textContent = `Ошибка: ${error.message}`; statusEl.style.color = '#f88'; }
@@ -6647,6 +6653,7 @@ function renderQuickWardrobeList() {
                     <div class="iig-wardrobe-card-category">${escapeHtml(WARDROBE_CATEGORIES[item.category] || WARDROBE_CATEGORIES.full)}</div>
                 </div>
                 ${item.id === activeId ? '<div class="iig-card-check" aria-hidden="true"><i class="fa-solid fa-check"></i></div>' : ''}
+                ${item.imageData ? `<button type="button" class="iig-card-describe" data-id="${escapeHtml(item.id)}" title="Описать через AI" aria-label="Описать ${escapeHtml(item.name)}"><i class="fa-solid fa-wand-magic-sparkles" aria-hidden="true"></i></button>` : ''}
                 <button type="button" class="iig-card-delete" title="Удалить" aria-label="Удалить ${escapeHtml(item.name)}"><i class="fa-solid fa-trash" aria-hidden="true"></i></button>
             </div>`).join('')}
            </div>`;
@@ -6687,6 +6694,7 @@ function bindWardrobeAdd(container, target) {
             const item = addWardrobeItem(name, resized, target, category);
             toastr.success(`Добавлено: ${item.name}. Описание можно задать в настройках или через генератор.`, 'Гардероб');
             renderQuickWardrobeList();
+            saveSettings();
         } catch (error) {
             toastr.error(`Не удалось добавить: ${error.message}`, 'Гардероб');
         } finally {
@@ -6757,7 +6765,28 @@ function bindWardrobeCards(container, target, activeItem) {
             removeWardrobeItem(itemId);
             updateFloatingButtonBadge();
             renderQuickWardrobeList();
+            saveSettings();
             toastr.info(`Удалено: ${item.name}`, 'Гардероб');
+        });
+        card.querySelector('.iig-card-describe')?.addEventListener('click', async event => {
+            event.stopPropagation();
+            const item = settings.wardrobeItems.find(i => i.id === itemId);
+            if (!item?.imageData) return;
+            const btn = event.currentTarget;
+            btn.disabled = true;
+            btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin" aria-hidden="true"></i>';
+            try {
+                const desc = await generateWardrobeDescription(itemId);
+                updateWardrobeItemDescription(itemId, desc);
+                saveSettings();
+                toastr.success(`Описание сгенерировано для ${item.name}`, 'Гардероб', { timeOut: 4000 });
+                renderQuickWardrobeList();
+            } catch (error) {
+                iigLog('ERROR', `Failed to generate wardrobe description (modal): ${error.message}`);
+                toastr.error(`Ошибка: ${error.message}`, 'Гардероб');
+                btn.disabled = false;
+                btn.innerHTML = '<i class="fa-solid fa-wand-magic-sparkles" aria-hidden="true"></i>';
+            }
         });
         card.addEventListener('click', () => toggleItem(itemId));
         card.addEventListener('keydown', event => {
@@ -6774,6 +6803,7 @@ function bindWardrobeCards(container, target, activeItem) {
     if (descArea && activeItem) {
         descArea.addEventListener('blur', () => {
             updateWardrobeItemDescription(activeItem.id, descArea.value);
+            saveSettings();
             toastr.info('Описание сохранено', 'Гардероб');
         });
     }

@@ -84,8 +84,6 @@ const defaultSettings = Object.freeze({
     sendUserAvatar: false,
     userAvatarFile: '',
     autoDetectNames: true,
-    // Appearance only from reference images + extension profile/NPC descriptions; ignore looks written in the scene text.
-    identityFromRefsOnly: false,
     defaultStyle: '',
     aspectRatio: '1:1',
     imageSize: '1K',
@@ -1964,7 +1962,6 @@ const FAQ_HINTS = Object.freeze({
     },
     avatars: {
         '#iig_auto_detect_names': 'Авто-поиск имён в промпте и отправка их лиц как референсов.',
-        '#iig_identity_refs_only': 'Внешность (лицо, волосы, глаза, кожа, фигура) берётся только с картинок-референсов и из «Описания внешности» в профилях и NPC. Описания внешности в тексте промпта игнорируются. Не действует на NovelAI — он работает только с текстом.',
         '#iig_send_char_avatar': 'Отправлять лицо персонажа как референс во все промпты (даже если имя не упомянуто).',
         '#iig_send_user_avatar': 'Отправлять лицо юзера как референс во все промпты.',
     },
@@ -2292,22 +2289,6 @@ const MAX_IMAGE_REFS = 4;
  * @param {string} prompt - Combined prompt text for name detection
  * @returns {{ imageRefs: Array, textOnlyClothing: Array, warnings: Array }}
  */
-/**
- * «Внешность только из референсов»: the scene prompt is written by the chat model, which often copies looks from the
- * character card / persona. This rule tells the image model to take identity only from the reference images and the
- * APPEARANCE notes coming from extension profiles / NPCs.
- */
-function buildIdentityFromRefsDirective(faceRefs, textDirectives) {
-    const names = new Set(faceRefs.filter(ref => ref.type === 'face' && ref.name).map(ref => ref.name));
-    for (const directive of textDirectives) {
-        const match = String(directive).match(/^\[(?:CHARACTER APPEARANCE for "([^"]+)"|CHARACTER "([^"]+)" APPEARANCE|(USER) APPEARANCE)\]/);
-        if (match) names.add(match[1] || match[2] || 'the user');
-    }
-    if (!names.size) return '';
-    const list = [...names].map(name => `"${name}"`).join(', ');
-    return `[IDENTITY RULE]: The appearance of ${list} (face, hair colour and hairstyle, eye colour, skin tone, body type, apparent age) must come ONLY from their reference images and their APPEARANCE notes. Ignore any physical description of these characters inside the scene text; use the scene text only for action, pose, expression, clothing, setting, lighting and composition.`;
-}
-
 async function collectReferenceImages(prompt) {
     const settings = getSettings();
     const context = SillyTavern.getContext();
@@ -2503,11 +2484,6 @@ async function collectReferenceImages(prompt) {
 
     // Final array: faces first, then clothing images
     const imageRefs = [...faceRefs, ...clothingAsImage];
-
-    if (settings.identityFromRefsOnly) {
-        const directive = buildIdentityFromRefsDirective(faceRefs, textDirectives);
-        if (directive) textDirectives.unshift(directive);
-    }
     iigLog('INFO', `Reference collection: ${faceRefs.length} face(s), ${clothingAsImage.length} clothing image(s), ${textOnlyClothing.length} clothing text(s), ${warnings.length} warning(s). Total image refs: ${imageRefs.length}/${MAX_IMAGE_REFS}`);
 
     return { imageRefs, textOnlyClothing, textDirectives, warnings };
@@ -5847,12 +5823,6 @@ function createSettingsUI() {
                             <p class="hint">Если имя персонажа/юзера найдено в промпте картинки, аватар отправится автоматически.</p>
 
                             <label class="checkbox_label">
-                                <input type="checkbox" id="iig_identity_refs_only" ${settings.identityFromRefsOnly ? 'checked' : ''}>
-                                <span>Внешность только с референсов и профилей</span>
-                            </label>
-                            <p class="hint">Лицо, волосы, глаза и фигура берутся только с аватаров/рефов и из «Описания внешности» в профилях и NPC. Внешность, которую модель чата списала в промпт из карточки или персоны, игнорируется. Не действует на NovelAI.</p>
-
-                            <label class="checkbox_label">
                                 <input type="checkbox" id="iig_send_char_avatar" ${settings.sendCharAvatar ? 'checked' : ''}>
                                 <span>Всегда отправлять аватар персонажа</span>
                             </label>
@@ -6392,7 +6362,6 @@ function bindSettingsEvents() {
     document.getElementById('iig_negative_clear_active')?.addEventListener('click', () => { settings.activeNegativeId = ''; saveSettings(); renderNegativeGallery(); });
 
     document.getElementById('iig_auto_detect_names')?.addEventListener('change', (e) => { settings.autoDetectNames = e.target.checked; saveSettings(); });
-    document.getElementById('iig_identity_refs_only')?.addEventListener('change', (e) => { settings.identityFromRefsOnly = e.target.checked; saveSettings(); });
 
     document.getElementById('iig_send_char_avatar')?.addEventListener('change', (e) => { settings.sendCharAvatar = e.target.checked; saveSettings(); });
 

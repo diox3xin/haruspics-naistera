@@ -155,6 +155,8 @@ const defaultSettings = Object.freeze({
     refGenModel: '',
     // ===== NEW: Collapsed sections state =====
     collapsedSections: {},
+    // Remembered tab / sub-tab / Персонаж-Юзер switch of the tabbed settings panel.
+    settingsUiState: { tab: 'main', sub: {}, target: 'char' },
 });
 
 // ============================================================
@@ -2062,6 +2064,154 @@ function initFaqButtons() {
 }
 
 // ============================================================
+// TABBED SETTINGS LAYOUT
+// ============================================================
+// The settings markup is still a flat list of .iig-collapsible sections (all ids and bindings stay the
+// same). organizeSettingsTabs() moves those sections into tabs → sub-tabs so only one block is visible
+// at a time instead of a long column of collapsible rows.
+// A sub-tab either lists `sections`, or has `byTarget` — then a Персонаж / Юзер switch picks the section.
+
+const SETTINGS_TABS = Object.freeze([
+    { id: 'main', label: 'Основное', icon: 'fa-sliders', subs: [
+        { id: 'api', label: 'API', icon: 'fa-plug', sections: ['api'] },
+        { id: 'display', label: 'Отображение', icon: 'fa-image', sections: ['display_mode'] },
+        { id: 'errors', label: 'Повторы и логи', icon: 'fa-gear', sections: ['errors'] },
+    ] },
+    { id: 'prompt', label: 'Промпт и стиль', icon: 'fa-wand-magic-sparkles', subs: [
+        { id: 'generator', label: 'Генератор промпта', icon: 'fa-wand-magic-sparkles', sections: ['prompt_generator'] },
+        { id: 'style', label: 'Стили и негативы', icon: 'fa-palette', sections: ['style'] },
+    ] },
+    { id: 'wardrobe', label: 'Гардероб', icon: 'fa-shirt', subs: [
+        { id: 'outfits', label: 'Наряды', icon: 'fa-shirt', byTarget: { char: 'wardrobe_char', user: 'wardrobe_user' } },
+        { id: 'hair', label: 'Причёски', icon: 'fa-scissors', byTarget: { char: 'hairstyle_char', user: 'hairstyle_user' } },
+        { id: 'send', label: 'Отправка', icon: 'fa-paper-plane', sections: ['wardrobe_inject', 'hairstyle_mode'] },
+        { id: 'vision', label: 'Описание по фото', icon: 'fa-eye', sections: ['vision'] },
+    ] },
+    { id: 'people', label: 'Персонажи', icon: 'fa-users', subs: [
+        { id: 'profiles', label: 'Профили', icon: 'fa-id-card', sections: ['character_library'] },
+        { id: 'avatars', label: 'Аватары', icon: 'fa-user', sections: ['avatars'] },
+        { id: 'npc', label: 'NPC', icon: 'fa-masks-theater', sections: ['npc'] },
+        { id: 'refgen', label: 'API рефов', icon: 'fa-dna', sections: ['refgen'] },
+    ] },
+]);
+
+const SETTINGS_TARGETS = Object.freeze([
+    { id: 'char', label: 'Персонаж', icon: 'fa-user' },
+    { id: 'user', label: 'Юзер', icon: 'fa-user-pen' },
+]);
+
+function getSettingsUiState(settings = getSettings()) {
+    const state = settings.settingsUiState && typeof settings.settingsUiState === 'object' ? settings.settingsUiState : {};
+    if (!SETTINGS_TABS.some(tab => tab.id === state.tab)) state.tab = SETTINGS_TABS[0].id;
+    if (!state.sub || typeof state.sub !== 'object') state.sub = {};
+    if (!SETTINGS_TARGETS.some(t => t.id === state.target)) state.target = 'char';
+    settings.settingsUiState = state;
+    return state;
+}
+
+function buildSettingsTabButton(cls, id, label, icon, active) {
+    return `<button type="button" class="${cls}${active ? ' iig-active' : ''}" data-id="${escapeHtml(id)}" role="tab" aria-selected="${active}"><i class="fa-solid ${icon}" aria-hidden="true"></i><span>${escapeHtml(label)}</span></button>`;
+}
+
+function organizeSettingsTabs() {
+    const root = document.querySelector('#iig_settings_root .inline-drawer-content');
+    if (!root || root.querySelector('.iig-settings-tabs')) return;
+
+    const sectionById = new Map();
+    root.querySelectorAll(':scope > .iig-collapsible').forEach(section => sectionById.set(section.dataset.sectionId, section));
+
+    const nav = document.createElement('div');
+    nav.className = 'iig-settings-tabs';
+    nav.setAttribute('role', 'tablist');
+    const panes = document.createElement('div');
+    panes.className = 'iig-settings-panes';
+
+    for (const tab of SETTINGS_TABS) {
+        nav.insertAdjacentHTML('beforeend', buildSettingsTabButton('iig-settings-tab', tab.id, tab.label, tab.icon, false));
+        const pane = document.createElement('div');
+        pane.className = 'iig-settings-pane';
+        pane.dataset.tab = tab.id;
+        pane.innerHTML = `
+            <div class="iig-settings-subtabs" role="tablist">${tab.subs.map(sub => buildSettingsTabButton('iig-settings-subtab', sub.id, sub.label, sub.icon, false)).join('')}</div>
+            ${tab.subs.some(sub => sub.byTarget) ? `<div class="iig-settings-target" role="tablist" aria-label="Чей">${SETTINGS_TARGETS.map(t => buildSettingsTabButton('iig-settings-target-btn', t.id, t.label, t.icon, false)).join('')}</div>` : ''}
+            <div class="iig-settings-pane-body"></div>`;
+        const body = pane.querySelector('.iig-settings-pane-body');
+        for (const sub of tab.subs) {
+            const ids = sub.byTarget ? Object.values(sub.byTarget) : sub.sections;
+            for (const id of ids) {
+                const section = sectionById.get(id);
+                if (!section) continue;
+                section.classList.add('iig-in-tab');
+                section.classList.remove('collapsed');
+                section.dataset.tabSub = sub.id;
+                body.appendChild(section);
+                sectionById.delete(id);
+            }
+        }
+        panes.appendChild(pane);
+    }
+
+    // Anything not mapped to a tab (e.g. a section added later) stays visible in «Основное».
+    const leftovers = [...sectionById.values()];
+    root.appendChild(nav);
+    root.appendChild(panes);
+    const mainBody = panes.querySelector('.iig-settings-pane[data-tab="main"] .iig-settings-pane-body');
+    leftovers.forEach(section => mainBody?.appendChild(section));
+
+    nav.addEventListener('click', event => {
+        const button = event.target.closest('.iig-settings-tab');
+        if (!button) return;
+        getSettingsUiState().tab = button.dataset.id;
+        applySettingsTabs();
+        saveSettings();
+    });
+    panes.addEventListener('click', event => {
+        const subButton = event.target.closest('.iig-settings-subtab');
+        const targetButton = event.target.closest('.iig-settings-target-btn');
+        if (!subButton && !targetButton) return;
+        const state = getSettingsUiState();
+        if (subButton) state.sub[subButton.closest('.iig-settings-pane').dataset.tab] = subButton.dataset.id;
+        if (targetButton) state.target = targetButton.dataset.id;
+        applySettingsTabs();
+        saveSettings();
+    });
+
+    applySettingsTabs();
+}
+
+function applySettingsTabs() {
+    const root = document.querySelector('#iig_settings_root');
+    if (!root) return;
+    const state = getSettingsUiState();
+    const setActive = (button, active) => {
+        button.classList.toggle('iig-active', active);
+        button.setAttribute('aria-selected', String(active));
+    };
+
+    for (const tab of SETTINGS_TABS) {
+        const pane = root.querySelector(`.iig-settings-pane[data-tab="${tab.id}"]`);
+        if (!pane) continue;
+        const tabActive = state.tab === tab.id;
+        pane.hidden = !tabActive;
+        const tabButton = root.querySelector(`.iig-settings-tab[data-id="${tab.id}"]`);
+        if (tabButton) setActive(tabButton, tabActive);
+
+        const sub = tab.subs.find(s => s.id === state.sub[tab.id]) || tab.subs[0];
+        pane.querySelectorAll('.iig-settings-subtab').forEach(b => setActive(b, b.dataset.id === sub.id));
+        const targetRow = pane.querySelector('.iig-settings-target');
+        if (targetRow) {
+            targetRow.hidden = !sub.byTarget;
+            targetRow.querySelectorAll('.iig-settings-target-btn').forEach(b => setActive(b, b.dataset.id === state.target));
+        }
+        const visible = new Set(sub.byTarget ? [sub.byTarget[state.target]] : sub.sections);
+        pane.querySelectorAll('.iig-settings-pane-body > .iig-collapsible').forEach(section => {
+            const known = section.classList.contains('iig-in-tab');
+            section.hidden = known ? !visible.has(section.dataset.sectionId) : false;
+        });
+    }
+}
+
+// ============================================================
 // COLLAPSIBLE SECTIONS
 // ============================================================
 
@@ -2070,6 +2220,8 @@ function initCollapsibleSections() {
     document.querySelectorAll('.iig-collapsible-header').forEach(header => {
         const section = header.closest('.iig-collapsible');
         if (!section) return;
+        // Sections inside the tabbed layout are always expanded; the header is just a title + FAQ button.
+        if (section.classList.contains('iig-in-tab')) return;
         const sectionId = section.dataset.sectionId;
 
         // Restore saved state
@@ -4378,6 +4530,13 @@ function getCropRectangle(start, end, width, height) {
     return { x: Math.min(x1, x2), y: Math.min(y1, y2), width: Math.abs(x2 - x1), height: Math.abs(y2 - y1) };
 }
 
+/** Keep clicks inside our own popups from reaching SillyTavern's "click outside closes drawer" handler. */
+function shieldFromDrawerAutoClose(element) {
+    for (const type of ['mousedown', 'mouseup', 'click', 'touchstart', 'touchend', 'pointerup']) {
+        element.addEventListener(type, event => event.stopPropagation());
+    }
+}
+
 // Returns null on cancel; the caller saves only after explicit confirmation.
 function openReferenceImageEditor(imageData, title = 'Просмотр и обрезка') {
     return new Promise(resolve => {
@@ -4453,6 +4612,10 @@ function openReferenceImageEditor(imageData, title = 'Просмотр и обр
         dialog.querySelector('[data-action="cancel"]').addEventListener('click', () => finish(null));
         dialog.addEventListener('cancel', event => { event.preventDefault(); finish(null); });
         dialog.addEventListener('keydown', event => event.stopPropagation());
+        // SillyTavern closes an open (unpinned) top drawer — e.g. the Extensions panel — on any
+        // mousedown/mouseup/touch outside it. The editor is mounted outside the drawer, so without this
+        // pressing «Сохранить» closed the whole extension settings panel.
+        shieldFromDrawerAutoClose(dialog);
         save.addEventListener('click', () => {
             try {
                 if (!crop) { finish(imageData); return; }
@@ -5891,6 +6054,7 @@ function createSettingsUI() {
     container.insertAdjacentHTML('beforeend', html);
 
     bindSettingsEvents();
+    organizeSettingsTabs();
     initCollapsibleSections();
     initFaqButtons();
     updateCharAvatarPreview();
@@ -6646,15 +6810,18 @@ function renderQuickWardrobeList() {
         : `<div class="iig-wardrobe-grid">${items.map(item => `
             <div class="iig-wardrobe-card ${item.id === activeId ? 'iig-card-active' : ''}" data-id="${escapeHtml(item.id)}" role="button" tabindex="0" aria-pressed="${item.id === activeId}" title="${item.id === activeId ? 'Снять' : 'Надеть'}">
                 ${item.imageData
-                    ? `<img class="iig-wardrobe-card-img" src="${imgSrc(item)}" alt="${escapeHtml(item.name)}" title="Открыть / обрезать" tabindex="0">`
+                    ? `<img class="iig-wardrobe-card-img" src="${imgSrc(item)}" alt="${escapeHtml(item.name)}" draggable="false">`
                     : '<div class="iig-wardrobe-card-img iig-card-placeholder"><i class="fa-solid fa-shirt" aria-hidden="true"></i></div>'}
                 <div class="iig-wardrobe-card-body">
                     <div class="iig-wardrobe-card-title">${escapeHtml(item.name)}</div>
                     <div class="iig-wardrobe-card-category">${escapeHtml(WARDROBE_CATEGORIES[item.category] || WARDROBE_CATEGORIES.full)}</div>
                 </div>
                 ${item.id === activeId ? '<div class="iig-card-check" aria-hidden="true"><i class="fa-solid fa-check"></i></div>' : ''}
-                ${item.imageData ? `<button type="button" class="iig-card-describe" data-id="${escapeHtml(item.id)}" title="Описать через AI" aria-label="Описать ${escapeHtml(item.name)}"><i class="fa-solid fa-wand-magic-sparkles" aria-hidden="true"></i></button>` : ''}
-                <button type="button" class="iig-card-delete" title="Удалить" aria-label="Удалить ${escapeHtml(item.name)}"><i class="fa-solid fa-trash" aria-hidden="true"></i></button>
+                <div class="iig-card-tools">
+                    ${item.imageData ? `<button type="button" class="iig-card-tool iig-card-view" title="Открыть картинку / обрезать" aria-label="Открыть картинку ${escapeHtml(item.name)}"><i class="fa-solid fa-magnifying-glass-plus" aria-hidden="true"></i></button>` : ''}
+                    ${item.imageData ? `<button type="button" class="iig-card-tool iig-card-describe" data-id="${escapeHtml(item.id)}" title="Описать через AI" aria-label="Описать ${escapeHtml(item.name)}"><i class="fa-solid fa-wand-magic-sparkles" aria-hidden="true"></i></button>` : ''}
+                    <button type="button" class="iig-card-tool iig-card-delete" title="Удалить" aria-label="Удалить ${escapeHtml(item.name)}"><i class="fa-solid fa-trash" aria-hidden="true"></i></button>
+                </div>
             </div>`).join('')}
            </div>`;
 
@@ -6749,14 +6916,12 @@ function bindWardrobeCards(container, target, activeItem) {
 
     container.querySelectorAll('.iig-wardrobe-card').forEach(card => {
         const itemId = card.dataset.id;
-        const img = card.querySelector('img.iig-wardrobe-card-img');
-        img?.addEventListener('click', event => {
+        // Click anywhere on the card (picture included) = put on / take off.
+        // The picture itself opens only through the dedicated magnifier button.
+        card.querySelector('.iig-card-view')?.addEventListener('click', event => {
             event.stopPropagation();
             const item = settings.wardrobeItems.find(i => i.id === itemId);
             if (item) editSavedReferenceImage(item, renderQuickWardrobeList);
-        });
-        img?.addEventListener('keydown', event => {
-            if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); event.stopPropagation(); img.click(); }
         });
         card.querySelector('.iig-card-delete')?.addEventListener('click', event => {
             event.stopPropagation();

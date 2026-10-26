@@ -1100,9 +1100,34 @@ function getActiveStylePrompts() {
         .map(item => item.prompt.trim());
 }
 
+/**
+ * A tag's "style" is often a short key written by the chat preset (e.g. "milkpic_gouache").
+ * If a style-gallery item is named exactly like that key (or ends with "(key)"), use that item's full prompt,
+ * so the preset's style works even when the model forgets to append the long STYLE paragraph.
+ * Returns { text, itemId } — itemId is set when the key resolved to a gallery item.
+ */
+function resolveTagStyle(tagStyle = '') {
+    const key = String(tagStyle || '').trim();
+    if (!key) return { text: '', itemId: null };
+    const norm = value => String(value || '').trim().toLowerCase();
+    const wanted = norm(key);
+    const item = (getSettings().styleGalleryItems || []).find(entry => {
+        const name = norm(entry?.name);
+        return entry?.prompt?.trim() && (name === wanted || name.endsWith(`(${wanted})`));
+    });
+    return item ? { text: item.prompt.trim(), itemId: item.id } : { text: key, itemId: null };
+}
+
 function buildEffectiveStyle(tagStyle = '') {
     const settings = getSettings();
-    return [settings.defaultStyle, ...getActiveStylePrompts(), tagStyle]
+    const resolved = resolveTagStyle(tagStyle);
+    // Styles switched on in the gallery + the style named by the tag (not twice if it is also switched on).
+    const active = settings.activeStyleIds
+        .filter(id => id !== resolved.itemId)
+        .map(id => settings.styleGalleryItems.find(item => item.id === id))
+        .filter(item => item?.prompt?.trim())
+        .map(item => item.prompt.trim());
+    return [settings.defaultStyle, ...active, resolved.text]
         .map(part => (part || '').trim())
         .filter(Boolean)
         .join(', ');
@@ -3368,7 +3393,10 @@ async function checkFileExists(path) {
     try { return (await fetch(path, { method: 'HEAD' })).ok; } catch (e) { return false; }
 }
 
-const ERROR_IMAGE_PATH = '/scripts/extensions/third-party/sillyimages/error.svg';
+// Resolve error.svg next to this script (the extension folder is haruspics-naistera, not sillyimages).
+const ERROR_IMAGE_PATH = (() => {
+    try { return new URL('./error.svg', import.meta.url).pathname; } catch (_) { return '/scripts/extensions/third-party/haruspics-naistera/error.svg'; }
+})();
 
 async function parseImageTags(text, options = {}) {
     const { checkExistence = false, forceAll = false } = options;
@@ -3944,10 +3972,11 @@ async function regenerateMessageImages(messageId) {
         if (!targetEl) { iigLog('WARN', `No matching element for tag ${index}`); continue; }
 
         const innerImg = targetEl.querySelector?.('img[data-iig-instruction]') || targetEl;
+        let lp = null;
 
         try {
             const instruction = innerImg.getAttribute?.('data-iig-instruction');
-            const lp = createLoadingPlaceholder(`iig-regen-${messageId}-${index}`, () => abortController.abort());
+            lp = createLoadingPlaceholder(`iig-regen-${messageId}-${index}`, () => abortController.abort());
             targetEl.replaceWith(lp);
             const statusEl = lp.querySelector('.iig-status');
 
@@ -3981,6 +4010,8 @@ async function regenerateMessageImages(messageId) {
             toastr.success(`Картинка ${index + 1}/${tags.length} готова`, 'Генерация картинок', { timeOut: 2000 });
         } catch (error) {
             iigLog('ERROR', `Regen failed for tag ${index}: ${error.message}`);
+            // Put the previous picture back; otherwise the «Генерация… / Отмена» placeholder stayed forever.
+            if (lp?.isConnected) lp.replaceWith(targetEl);
             if (abortController.signal.aborted) { toastr.warning('Перегенерация отменена'); break; }
             toastr.error(`Ошибка: ${error.message}`);
         }

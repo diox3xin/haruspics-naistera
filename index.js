@@ -3140,9 +3140,37 @@ function buildNovelAICaptions(prompt, refData = {}) {
     return { base: base.filter(Boolean), characters };
 }
 
+/**
+ * NovelAI draws lettering only from "Text:" at the very END of the base prompt (several texts — one per paragraph).
+ * Prompts often carry "…, text: Hello" inside a character's "|" part, where it lands in the middle of the final string
+ * and comes out as gibberish. Takes every ", text: …" (up to the end of its "|" part) out and returns them separately.
+ */
+function extractNovelAIText(prompt) {
+    const texts = [];
+    const segments = String(prompt || '').split('|').map(segment => {
+        const pieces = segment.split(/(?:^|,)\s*text\s*:\s*/i);
+        for (const piece of pieces.slice(1)) {
+            const text = piece.trim().replace(/[\s,]+$/, '').replace(/^["'«“„]+|["'»”]+$/g, '').trim();
+            if (text && !texts.includes(text)) texts.push(text);
+        }
+        return pieces[0].trim().replace(/[\s,]+$/, '');
+    });
+    return { prompt: segments.join(' | '), texts };
+}
+
+/** A negative with "text" / "letters" makes NovelAI scribble instead of writing the requested words. */
+const NOVELAI_TEXT_BLOCKING_TAGS = new Set(['text', 'letters', 'letter', 'words', 'english text', 'no text', 'speech bubble', 'speech bubbles']);
+function negativeWithoutTextBan(negative) {
+    return String(negative || '').split(',')
+        .filter(tag => !NOVELAI_TEXT_BLOCKING_TAGS.has(tag.trim().toLowerCase().replace(/^[{[(]+|[}\])]+$/g, '')))
+        .join(',').replace(/^\s*,|,\s*$/g, '').trim();
+}
+
 // Both NovelAI routes use text descriptions only, not image references.
 async function generateImageNovelAI(prompt, style, refData = {}, options = {}) {
     const settings = getSettings();
+    const lettering = extractNovelAIText(prompt);
+    prompt = lettering.prompt;
     const captions = buildNovelAICaptions(prompt, refData);
     const parts = [];
     if (style) parts.push(style);
@@ -3153,6 +3181,10 @@ async function generateImageNovelAI(prompt, style, refData = {}, options = {}) {
     const useCharacterPrompts = settings.apiType === 'novelai-direct'
         && novelAISupportsCharacterPrompts(settings.novelaiModel) && captions.characters.length > 0;
     if (!useCharacterPrompts) parts.push(...captions.characters);
+    if (lettering.texts.length) {
+        const latinOnly = lettering.texts.every(text => !/[^\u0000-\u024f\s\p{P}\p{N}]/u.test(text));
+        parts.push('text', ...(latinOnly ? ['english text'] : []));
+    }
 
     const ratio = String(options.aspectRatio || '');
     let width = Number(settings.novelaiWidth);
@@ -3165,12 +3197,14 @@ async function generateImageNovelAI(prompt, style, refData = {}, options = {}) {
             height = Math.round(Math.sqrt(area * h / w) / 64) * 64;
         }
     }
+    const negativeSource = (options.negativePrompt == null
+        ? String(settings.negativeGalleryItems?.find(item => item.id === settings.activeNegativeId)?.prompt || '').trim()
+        : String(options.negativePrompt || '').trim()) || String(settings.novelaiNegativePrompt || '').trim();
     const body = {
-        prompt: parts.filter(Boolean).join(', '),
+        // "Text:" must be the very last thing in the prompt; several texts go one per paragraph.
+        prompt: parts.filter(Boolean).join(', ') + (lettering.texts.length ? `, Text: ${lettering.texts.join('\n\n')}` : ''),
         model: settings.novelaiModel,
-        negative_prompt: (options.negativePrompt == null
-            ? String(settings.negativeGalleryItems?.find(item => item.id === settings.activeNegativeId)?.prompt || '').trim()
-            : String(options.negativePrompt || '').trim()) || String(settings.novelaiNegativePrompt || '').trim(),
+        negative_prompt: lettering.texts.length ? negativeWithoutTextBan(negativeSource) : negativeSource,
         width,
         height,
         steps: Number(settings.novelaiSteps),

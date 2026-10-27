@@ -216,3 +216,30 @@ test('a hairstyle or NPC outfit goes into its owner\'s "|" part, not the scene',
     assert.equal(body.input, 'workroom');
 });
 
+test('speech texts from character parts move to one "Text:" at the very end, and the negative stops banning text', async () => {
+    const { generate, requests } = setup({ ok: false, status: 500, text: async () => '' }, {
+        apiType: 'novelai-direct', novelaiApiKey: 'tok',
+        novelaiNegativePrompt: 'low quality, signature, watermark, text, letters, blurry',
+    });
+    const prompt = 'comic page, workroom, speech bubble | Marta, smiling, text: «Боже мой, мисс Новак!» | Eveline, blushing, text: Пустяки, Марта, всё в порядке';
+    await assert.rejects(generate.call(null, prompt, 'style tags', { people: [], textDirectives: [] }));
+    const body = JSON.parse(requests[0].init.body);
+    assert.equal(body.input, 'style tags, comic page, workroom, speech bubble, text, Text: Боже мой, мисс Новак!\n\nПустяки, Марта, всё в порядке');
+    assert.deepEqual(body.parameters.v4_prompt.caption.char_captions.map(c => c.char_caption), ['Marta, smiling', 'Eveline, blushing']);
+    assert.equal(body.parameters.negative_prompt, 'low quality, signature, watermark, blurry');
+});
+
+test('English text gets the "english text" tag; prompts without text keep the negative as is', async () => {
+    const png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9pZHjTQAAAAASUVORK5CYII=';
+    const first = setup({ ok: true, text: async () => png }, { novelaiNegativePrompt: 'text, blurry' });
+    await first.generate('1girl, sign, text: OPEN', '', {});
+    const withText = JSON.parse(first.requests[0].init.body);
+    assert.equal(withText.prompt, '1girl, sign, text, english text, Text: OPEN');
+    assert.equal(withText.negative_prompt, 'blurry');
+    const second = setup({ ok: true, text: async () => png }, { novelaiNegativePrompt: 'text, blurry' });
+    await second.generate('1girl, context: none', '', {});
+    const plain = JSON.parse(second.requests[0].init.body);
+    assert.equal(plain.prompt, '1girl, context: none');
+    assert.equal(plain.negative_prompt, 'text, blurry');
+});
+

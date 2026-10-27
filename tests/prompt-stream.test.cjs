@@ -39,8 +39,20 @@ test('stream reader joins deltas split across network chunks', async () => {
 });
 
 test('panel has stream toggle and cancel button wired to the abort controller', () => {
-    assert.match(source, /class="menu_button iig-prompt-stream-toggle/);
-    assert.match(source, /class="menu_button iig-prompt-cancel" hidden/);
+    assert.match(source, /class="menu_button iig-pp-pill iig-prompt-stream-toggle/);
+    assert.match(source, /class="menu_button iig-pp-btn iig-prompt-cancel" hidden/);
     assert.match(source, /activePromptAbortControllers\.get\(messageId\)\?\.abort\(\)/);
     assert.match(source, /\.\.\.\(onChunk \? \{ stream: true \} : \{\}\)/);
 });
+
+test('the panel is a one-line card with status, live preview, stop and «Авто»', () => {
+    assert.match(source, /class="iig-pp-summary iig-prompt-panel-toggle"/);
+    assert.match(source, /class="iig-pp-chip iig-prompt-chip"/);
+    assert.match(source, /class="iig-pp-progress"/);
+    assert.match(source, /iig-prompt-auto-toggle/);
+    assert.match(source, /promptAutoGenerate: false/);
+    // Auto runs only for freshly generated replies, marked on MESSAGE_RECEIVED.
+    assert.match(source, /event_types\.MESSAGE_RECEIVED[\s\S]{0,200}pendingAutoPrompts\.add/);
+    assert.match(source, /pendingAutoPrompts\.delete\(Number\(messageId\)\)\) maybeAutoGeneratePrompt/);
+});
+

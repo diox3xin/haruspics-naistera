@@ -14,6 +14,10 @@ const MODULE_NAME = 'inline_image_gen';
 const processingMessages = new Set();
 const activeAbortControllers = new Map();
 const activePromptAbortControllers = new Map();
+// Prompt panels the user opened (others stay a one-line card).
+const expandedPromptPanels = new Set();
+// Bot replies that have just been generated: «Авто» writes their image prompt once they are rendered.
+const pendingAutoPrompts = new Set();
 
 const logBuffer = [];
 const MAX_LOG_ENTRIES = 200;
@@ -147,9 +151,13 @@ const defaultSettings = Object.freeze({
     promptGenStream: false,
     // Prompt panel collapsed by default (extblocks mode only)
     promptPanelCollapsed: false,
+    // Write the image prompt by itself after every new bot reply.
+    promptAutoGenerate: false,
     // Meta (style/negative) collapsed by default (extblocks mode only)
     promptMetaCollapsed: false,
     promptAppearanceOpen: false,
+    // Format of «Описать по аватарке» in profiles: '' = same as «Формат описаний», or 'banana' / 'novelai'.
+    profileDescFormat: '',
     // Random Gemini format per request (aspect+size picked by the model)
     geminiRandomFormat: false,
     // ===== Reference Generator =====
@@ -974,6 +982,7 @@ async function generateImagePromptForMessage(messageId, signal, onChunk = null) 
     message.extra.iig_prompt_block = {
         ...(message.extra.iig_prompt_block || {}),
         instructionId: instruction.id,
+        sourceHash: promptSourceHash(message.mes),
         prompt,
         style: buildEffectiveStyle(cleaned.style),
         negativePrompt: getActiveNegativePrompt(),
@@ -1453,9 +1462,14 @@ function getVisionDescFormat(settings = getSettings()) {
     return settings.wardrobeDescFormat === 'novelai' ? 'novelai' : 'banana';
 }
 
+/** Format for describing the bot / persona appearance in profiles. */
+function getProfileDescFormat(settings = getSettings()) {
+    if (settings.profileDescFormat === 'novelai' || settings.profileDescFormat === 'banana') return settings.profileDescFormat;
+    return getVisionDescFormat(settings);
+}
+
 /** Instruction for the vision model: kind = 'outfit' | 'hairstyle' | 'appearance'. */
-function getVisionPrompt(kind, settings = getSettings()) {
-    const format = getVisionDescFormat(settings);
+function getVisionPrompt(kind, settings = getSettings(), format = getVisionDescFormat(settings)) {
     if (kind === 'outfit') {
         return format === 'novelai'
             ? (String(settings.wardrobeDescPromptNovelAI || '').trim() || defaultSettings.wardrobeDescPromptNovelAI)
@@ -1465,9 +1479,9 @@ function getVisionPrompt(kind, settings = getSettings()) {
 }
 
 /** NovelAI tags come back as one clean comma-separated line (no "Tags:" label, numbering, line breaks or final dot). */
-function cleanVisionAnswer(text, settings = getSettings()) {
+function cleanVisionAnswer(text, settings = getSettings(), format = getVisionDescFormat(settings)) {
     const answer = String(text || '').trim();
-    if (getVisionDescFormat(settings) !== 'novelai') return answer;
+    if (format !== 'novelai') return answer;
     return answer
         .replace(/```[a-z]*|```/gi, '')
         .replace(/^\s*(?:tags?|outfit|hairstyle|appearance)\s*:\s*/i, '')
@@ -1493,18 +1507,18 @@ function getCardAppearanceSource(kind) {
  * Appearance from the avatar picture, optionally together with the card text («+ описание карточки»).
  * Without a picture but with card text the appearance is taken from the text alone.
  */
-async function describeAppearance({ image = '', cardText = '' } = {}) {
+async function describeAppearance({ image = '', cardText = '', format = getProfileDescFormat() } = {}) {
     const settings = getSettings();
     const card = String(cardText || '').trim();
     if (!image && !card) throw new Error('Нет ни картинки, ни описания карточки');
-    let instruction = getVisionPrompt('appearance', settings);
+    let instruction = getVisionPrompt('appearance', settings, format);
     if (card) {
         instruction += image
             ? '\n\nThe text below describes the SAME character. Also use the physical appearance it states (hair, eyes, skin, height, body, scars, tattoos, ears, horns and similar permanent traits), even where the picture does not show them clearly; when the picture and the text disagree about a permanent trait, follow the text. Ignore personality, backstory, clothing and everything that is not physical appearance.'
             : '\n\nThere is no picture: take the physical appearance only from the character text below (hair, eyes, skin, height, body, scars, tattoos, ears, horns and similar permanent traits). Ignore personality, backstory, clothing and everything that is not physical appearance.';
         instruction += `\n<character_text>\n${card}\n</character_text>`;
     }
-    if (image) return await generateVisionDescriptionFromImage(image, instruction);
+    if (image) return await generateVisionDescriptionFromImage(image, instruction, format);
 
     const endpoint = settings.wardrobeDescEndpoint || settings.endpoint;
     const apiKey = settings.wardrobeDescApiKey || settings.apiKey;
@@ -1517,7 +1531,7 @@ async function describeAppearance({ image = '', cardText = '' } = {}) {
     });
     if (!response.ok) throw new Error(`API ошибка (${response.status}): ${(await response.text().catch(() => '?')).slice(0, 300)}`);
     const result = await response.json();
-    const description = cleanVisionAnswer(result.choices?.[0]?.message?.content, settings);
+    const description = cleanVisionAnswer(result.choices?.[0]?.message?.content, settings, format);
     if (!description) throw new Error('Модель вернула пустой ответ');
     return description;
 }
@@ -1677,7 +1691,7 @@ function ensureNpcDefaults(npc) {
     }
 }
 
-async function generateVisionDescriptionFromImage(imageData, promptText) {
+async function generateVisionDescriptionFromImage(imageData, promptText, format = getVisionDescFormat()) {
     const settings = getSettings();
     if (!imageData) throw new Error('Нет данных изображения');
 
@@ -1711,7 +1725,7 @@ async function generateVisionDescriptionFromImage(imageData, promptText) {
     }
 
     const result = await response.json();
-    const description = cleanVisionAnswer(result.choices?.[0]?.message?.content, settings);
+    const description = cleanVisionAnswer(result.choices?.[0]?.message?.content, settings, format);
     if (!description) throw new Error('Модель вернула пустой ответ');
     return description;
 }
@@ -4769,6 +4783,135 @@ function bindPromptAppearance(panel) {
     });
 }
 
+/** Short fingerprint of the reply text: «Авто» does not write a prompt again for a reply that already has one. */
+function promptSourceHash(text) {
+    let hash = 0;
+    for (const char of String(text || '')) hash = (hash * 31 + char.codePointAt(0)) | 0;
+    return String(hash);
+}
+
+function getPromptPanel(messageId) {
+    return document.querySelector(`#chat .mes[mesid="${messageId}"] .iig-prompt-panel`);
+}
+
+/** One line of the prompt for the collapsed card: its start, or — while it is being written — its newest words. */
+function promptPreviewText(text, fromEnd = false) {
+    const value = String(text || '').replace(/\s+/g, ' ').trim();
+    if (value.length <= 220) return value;
+    return fromEnd ? `…${value.slice(-220)}` : value.slice(0, 220);
+}
+
+/** Status chip, one-line preview, Stop button and the running stripe — without rebuilding the panel. */
+function updatePromptPanelChrome(panel, messageId, { status = '', error = false } = {}) {
+    if (!panel) return;
+    const message = SillyTavern.getContext().chat?.[messageId];
+    const prompt = String(message?.extra?.iig_prompt_block?.prompt || '');
+    const writing = activePromptAbortControllers.has(messageId);
+    const drawing = activeAbortControllers.has(messageId);
+    panel.classList.toggle('is-busy', writing || drawing);
+    panel.classList.toggle('has-error', Boolean(error));
+    const chip = panel.querySelector('.iig-prompt-chip');
+    if (chip) {
+        const [text, state] = writing ? ['пишу промпт', 'busy'] : drawing ? ['рисую', 'busy'] : error ? ['ошибка', 'error'] : prompt ? ['готов', 'ready'] : ['пусто', 'empty'];
+        chip.textContent = text;
+        chip.dataset.state = state;
+        chip.title = error ? status : '';
+    }
+    const preview = panel.querySelector('.iig-pp-preview');
+    if (preview && !writing) {
+        preview.textContent = error ? status : (promptPreviewText(prompt) || 'Промпта ещё нет — нажмите «Промпт» или напишите свой');
+        preview.classList.toggle('is-placeholder', !prompt && !error);
+    }
+    const statusLine = panel.querySelector('.iig-prompt-status');
+    if (statusLine && status) statusLine.textContent = status;
+    const cancel = panel.querySelector('.iig-prompt-cancel');
+    if (cancel) cancel.hidden = !(writing || drawing);
+    const generate = panel.querySelector('.iig-prompt-generate');
+    if (generate) generate.hidden = writing;
+    panel.querySelector('.iig-image-from-prompt')?.classList.toggle('disabled', drawing);
+}
+
+function setPromptPanelExpanded(panel, messageId, expanded) {
+    if (expanded) expandedPromptPanels.add(messageId); else expandedPromptPanels.delete(messageId);
+    panel.classList.toggle('is-expanded', expanded);
+    panel.querySelector('.iig-prompt-panel-body')?.classList.toggle('iig-collapsed-hidden', !expanded);
+    panel.querySelectorAll('.iig-prompt-panel-toggle').forEach(button => {
+        button.setAttribute('aria-expanded', String(expanded));
+        button.title = expanded ? 'Свернуть' : 'Развернуть';
+    });
+}
+
+/** Writes the image prompt for a reply; used by the «Промпт» button and by «Авто». */
+async function runPromptGeneration(messageId, { auto = false } = {}) {
+    if (activePromptAbortControllers.has(messageId)) return;
+    const controller = new AbortController();
+    activePromptAbortControllers.set(messageId, controller);
+    const startPanel = getPromptPanel(messageId);
+    updatePromptPanelChrome(startPanel, messageId, { status: 'Пишу промпт…' });
+    const startPreview = startPanel?.querySelector('.iig-pp-preview');
+    if (startPreview) { startPreview.textContent = 'Пишу промпт…'; startPreview.classList.add('is-placeholder'); }
+    const onChunk = getSettings().promptGenStream
+        ? text => {
+            const panel = getPromptPanel(messageId);
+            if (!panel) return;
+            const textarea = panel.querySelector('.iig-prompt-value');
+            if (textarea) { textarea.value = text; textarea.scrollTop = textarea.scrollHeight; }
+            const preview = panel.querySelector('.iig-pp-preview');
+            if (preview) { preview.textContent = promptPreviewText(text, true); preview.classList.remove('is-placeholder'); }
+        }
+        : null;
+    try {
+        await generateImagePromptForMessage(messageId, controller.signal, onChunk);
+        activePromptAbortControllers.delete(messageId);
+        const panel = getPromptPanel(messageId);
+        if (panel) renderPromptPanel(panel, messageId);
+        if (!auto) toastr.success('Промпт картинки готов');
+    } catch (error) {
+        activePromptAbortControllers.delete(messageId);
+        const aborted = error?.name === 'AbortError';
+        const panel = getPromptPanel(messageId);
+        if (panel) {
+            renderPromptPanel(panel, messageId);
+            updatePromptPanelChrome(panel, messageId, aborted ? { status: 'Остановлено' } : { status: error.message, error: true });
+        }
+        if (aborted) toastr.info('Генерация промпта остановлена');
+        else if (!auto) toastr.error(`Промпт: ${error.message}`);
+    } finally {
+        activePromptAbortControllers.delete(messageId);
+    }
+}
+
+/** «Авто»: a new bot reply gets its image prompt once, unless it already has one for this exact text. */
+function maybeAutoGeneratePrompt(messageId) {
+    const settings = getSettings();
+    if (!settings.promptAutoGenerate) return;
+    const message = SillyTavern.getContext().chat?.[messageId];
+    if (!message || message.is_user || message.is_system || !String(message.mes || '').trim()) return;
+    if (message.extra?.iig_prompt_block?.sourceHash === promptSourceHash(message.mes)) return;
+    runPromptGeneration(messageId, { auto: true });
+}
+
+async function runImageFromPrompt(messageId) {
+    if (activeAbortControllers.has(messageId)) return;
+    const controller = new AbortController();
+    activeAbortControllers.set(messageId, controller);
+    updatePromptPanelChrome(getPromptPanel(messageId), messageId, { status: 'Рисую…' });
+    try {
+        await generateImageFromPromptBlock(messageId, getPromptPanel(messageId), controller.signal);
+        activeAbortControllers.delete(messageId);
+        const panel = getPromptPanel(messageId);
+        if (panel) renderPromptPanel(panel, messageId);
+        toastr.success('Картинка по промпту готова');
+    } catch (error) {
+        activeAbortControllers.delete(messageId);
+        const aborted = error?.name === 'AbortError';
+        updatePromptPanelChrome(getPromptPanel(messageId), messageId, aborted ? { status: 'Остановлено' } : { status: error.message, error: true });
+        if (!aborted) toastr.error(`Картинка: ${error.message}`);
+    } finally {
+        activeAbortControllers.delete(messageId);
+    }
+}
+
 function renderPromptPanel(panel, messageId) {
     const context = SillyTavern.getContext();
     const message = context.chat?.[messageId];
@@ -4776,40 +4919,69 @@ function renderPromptPanel(panel, messageId) {
     const state = message.extra?.iig_prompt_block || {};
     const settings = getSettings();
     const instruction = getPromptInstructions().find(item => item.id === state.instructionId) || getActivePromptInstruction();
-    const isExtBlocks = normalizeImageDisplayMode(settings.imageDisplayMode) === 'extblocks';
-    const panelCollapsed = settings.promptPanelCollapsed && isExtBlocks;
-    const metaCollapsed = settings.promptMetaCollapsed && isExtBlocks;
-    const panelToggleIcon = panelCollapsed ? 'fa-chevron-down' : 'fa-chevron-up';
-    const metaToggleIcon = metaCollapsed ? 'fa-eye-slash' : 'fa-eye';
+    const expanded = expandedPromptPanels.has(messageId);
+    const style = state.style || buildEffectiveStyle('') || '';
+    const negative = state.negativePrompt || getActiveNegativePrompt() || '';
+    const showFormat = settings.apiType === 'gemini' || isGeminiModel(settings.model || '');
+    const image = state.imagePath ? escapeHtml(state.imagePath) : '';
 
-    panel.innerHTML = `${state.imagePath ? `<img class="iig-prompt-result-image" src="${escapeHtml(state.imagePath)}" alt="${escapeHtml(state.prompt || 'Generated image')}">` : ''}
-        <div class="iig-prompt-panel-head"><strong><i class="fa-solid fa-wand-magic-sparkles"></i> Image prompt</strong><span class="iig-prompt-status"></span>${isExtBlocks ? `<button type="button" class="menu_button iig-prompt-panel-toggle" title="${panelCollapsed ? 'Развернуть панель' : 'Свернуть панель'}" aria-expanded="${!panelCollapsed}"><i class="fa-solid ${panelToggleIcon}" aria-hidden="true"></i></button>` : ''}</div>
-        <div class="iig-prompt-panel-body ${panelCollapsed ? 'iig-collapsed-hidden' : ''}">
-        <div class="iig-prompt-panel-controls"><span class="iig-prompt-selection">${escapeHtml(instruction.name)}</span><button type="button" class="menu_button iig-prompt-stream-toggle${settings.promptGenStream ? ' iig-stream-on' : ''}" title="Стриминг промпта" aria-pressed="${!!settings.promptGenStream}"><i class="fa-solid fa-bolt" aria-hidden="true"></i> Стрим</button>${(settings.apiType === 'gemini' || isGeminiModel(settings.model || '')) ? `<button type="button" class="menu_button iig-gemini-format-toggle${settings.geminiRandomFormat ? ' iig-format-on' : ''}" title="Случайный формат Gemini (каждый запрос)" aria-pressed="${!!settings.geminiRandomFormat}"><i class="fa-solid fa-dice" aria-hidden="true"></i> Формат</button>` : ''}<button type="button" class="menu_button iig-prompt-generate"><i class="fa-solid fa-wand-magic-sparkles"></i> Промпт</button><button type="button" class="menu_button iig-prompt-cancel" hidden title="Отменить генерацию промпта"><i class="fa-solid fa-stop" aria-hidden="true"></i> Стоп</button><button type="button" class="menu_button iig-image-from-prompt"><i class="fa-solid fa-image"></i> Картинка</button></div>
-        <textarea class="iig-prompt-value" rows="4" placeholder="Здесь появится prompt картинки..."></textarea>
-        ${promptAppearanceHtml(settings)}
-        ${isExtBlocks ? `<div class="iig-prompt-meta-header"><button type="button" class="menu_button iig-prompt-meta-toggle" title="${metaCollapsed ? 'Показать стиль и негатив' : 'Скрыть стиль и негатив'}" aria-expanded="${!metaCollapsed}"><i class="fa-solid ${metaToggleIcon}" aria-hidden="true"></i> Стиль / негатив</button></div>
-        <div class="iig-prompt-meta ${metaCollapsed ? 'iig-collapsed-hidden' : ''}"><span>Стиль: ${escapeHtml(state.style || buildEffectiveStyle('') || 'не выбран')}</span><span>Негатив: ${escapeHtml(state.negativePrompt || getActiveNegativePrompt() || 'не выбран')}</span></div>` : `<div class="iig-prompt-meta"><span>Стиль: ${escapeHtml(state.style || buildEffectiveStyle('') || 'не выбран')}</span><span>Негатив: ${escapeHtml(state.negativePrompt || getActiveNegativePrompt() || 'не выбран')}</span></div>`}
+    panel.classList.add('iig-pp');
+    panel.innerHTML = `
+        <div class="iig-pp-head">
+            <button type="button" class="iig-pp-summary iig-prompt-panel-toggle" aria-expanded="${expanded}" title="${expanded ? 'Свернуть' : 'Развернуть'}">
+                <span class="iig-pp-thumb">${image ? `<img src="${image}" alt="">` : '<i class="fa-solid fa-wand-magic-sparkles" aria-hidden="true"></i>'}</span>
+                <span class="iig-pp-text">
+                    <span class="iig-pp-title">Промпт картинки <span class="iig-pp-chip iig-prompt-chip"></span></span>
+                    <span class="iig-pp-preview"></span>
+                </span>
+            </button>
+            <div class="iig-pp-actions">
+                <button type="button" class="menu_button iig-pp-btn iig-prompt-generate" title="Написать промпт по этому ответу"><i class="fa-solid fa-wand-magic-sparkles" aria-hidden="true"></i><span>Промпт</span></button>
+                <button type="button" class="menu_button iig-pp-btn iig-prompt-cancel" hidden title="Остановить"><i class="fa-solid fa-stop" aria-hidden="true"></i><span>Стоп</span></button>
+                <button type="button" class="menu_button iig-pp-btn iig-image-from-prompt" title="Нарисовать картинку по промпту"><i class="fa-solid fa-image" aria-hidden="true"></i><span>Картинка</span></button>
+                <button type="button" class="iig-pp-chevron iig-prompt-panel-toggle" aria-expanded="${expanded}" title="${expanded ? 'Свернуть' : 'Развернуть'}" aria-label="Развернуть панель промпта"><i class="fa-solid fa-chevron-down" aria-hidden="true"></i></button>
+            </div>
+            <div class="iig-pp-progress" aria-hidden="true"></div>
+        </div>
+        <div class="iig-pp-body iig-prompt-panel-body ${expanded ? '' : 'iig-collapsed-hidden'}">
+            ${image ? `<img class="iig-prompt-result-image" src="${image}" alt="${escapeHtml(state.prompt || 'Картинка')}">` : ''}
+            <div class="iig-pp-toolbar iig-prompt-panel-controls">
+                <span class="iig-pp-instruction iig-prompt-selection" title="Инструкция для модели промпта — выбирается в настройках"><i class="fa-solid fa-scroll" aria-hidden="true"></i> ${escapeHtml(instruction.name)}</span>
+                <span class="iig-pp-toggles">
+                    <button type="button" class="menu_button iig-pp-pill iig-prompt-auto-toggle${settings.promptAutoGenerate ? ' is-on' : ''}" aria-pressed="${!!settings.promptAutoGenerate}" title="Писать промпт самим после каждого нового ответа бота"><i class="fa-solid fa-rotate" aria-hidden="true"></i> Авто</button>
+                    <button type="button" class="menu_button iig-pp-pill iig-prompt-stream-toggle${settings.promptGenStream ? ' iig-stream-on is-on' : ''}" aria-pressed="${!!settings.promptGenStream}" title="Показывать промпт, пока он пишется"><i class="fa-solid fa-bolt" aria-hidden="true"></i> Стрим</button>
+                    ${showFormat ? `<button type="button" class="menu_button iig-pp-pill iig-gemini-format-toggle${settings.geminiRandomFormat ? ' iig-format-on is-on' : ''}" aria-pressed="${!!settings.geminiRandomFormat}" title="Случайный формат Gemini (каждый запрос)"><i class="fa-solid fa-dice" aria-hidden="true"></i> Формат</button>` : ''}
+                </span>
+            </div>
+            <textarea class="text_pole iig-prompt-value" rows="5" placeholder="Нажмите «Промпт» или напишите свой — картинка нарисуется по этому тексту"></textarea>
+            <div class="iig-pp-status iig-prompt-status" role="status"></div>
+            ${promptAppearanceHtml(settings)}
+            <details class="iig-pp-meta" ${settings.promptMetaCollapsed ? '' : 'open'}>
+                <summary class="iig-prompt-meta-toggle">Стиль и негатив</summary>
+                <dl>
+                    <dt>Стиль</dt><dd>${escapeHtml(style || 'не выбран')}</dd>
+                    <dt>Негатив</dt><dd>${escapeHtml(negative || 'не выбран')}</dd>
+                </dl>
+            </details>
         </div>`;
 
-    // Toggle panel collapse (extblocks only)
-    panel.querySelector('.iig-prompt-panel-toggle')?.addEventListener('click', () => {
-        const settings = getSettings();
-        settings.promptPanelCollapsed = !settings.promptPanelCollapsed;
-        saveSettings();
-        renderPromptPanel(panel, messageId);
-    });
+    setPromptPanelExpanded(panel, messageId, expanded);
+    updatePromptPanelChrome(panel, messageId);
 
-    // Toggle meta (style/negative) collapse (extblocks only)
-    panel.querySelector('.iig-prompt-meta-toggle')?.addEventListener('click', () => {
+    panel.querySelectorAll('.iig-prompt-panel-toggle').forEach(button => button.addEventListener('click', () => {
+        setPromptPanelExpanded(panel, messageId, !expandedPromptPanels.has(messageId));
+    }));
+    panel.querySelector('.iig-pp-meta')?.addEventListener('toggle', event => {
         const settings = getSettings();
-        settings.promptMetaCollapsed = !settings.promptMetaCollapsed;
+        const collapsed = !event.currentTarget.open;
+        if (settings.promptMetaCollapsed === collapsed) return;
+        settings.promptMetaCollapsed = collapsed;
         saveSettings();
-        renderPromptPanel(panel, messageId);
     });
     bindPromptAppearance(panel);
+
     const textarea = panel.querySelector('.iig-prompt-value');
-    textarea.value = state.prompt || '';
+    textarea.value = activePromptAbortControllers.has(messageId) ? textarea.value : (state.prompt || '');
     textarea.addEventListener('change', async () => {
         if (!message.extra || typeof message.extra !== 'object') message.extra = {};
         message.extra.iig_prompt_block = {
@@ -4819,86 +4991,42 @@ function renderPromptPanel(panel, messageId) {
             negativePrompt: getActiveNegativePrompt(),
             updatedAt: Date.now(),
         };
+        updatePromptPanelChrome(panel, messageId);
         await context.saveChat();
     });
-    const cancelButton = panel.querySelector('.iig-prompt-cancel');
-    // Re-rendered panel while a request is running: keep the stop button visible
-    if (cancelButton) cancelButton.hidden = !activePromptAbortControllers.has(messageId);
-    cancelButton?.addEventListener('click', () => {
+
+    panel.querySelector('.iig-prompt-cancel')?.addEventListener('click', () => {
         activePromptAbortControllers.get(messageId)?.abort();
+        activeAbortControllers.get(messageId)?.abort();
     });
-    panel.querySelector('.iig-prompt-stream-toggle')?.addEventListener('click', event => {
+    panel.querySelector('.iig-prompt-generate')?.addEventListener('click', () => runPromptGeneration(messageId));
+    panel.querySelector('.iig-image-from-prompt')?.addEventListener('click', () => runImageFromPrompt(messageId));
+
+    const syncToggle = (selector, value, extraClass) => document.querySelectorAll(selector).forEach(button => {
+        button.classList.toggle('is-on', value);
+        if (extraClass) button.classList.toggle(extraClass, value);
+        button.setAttribute('aria-pressed', String(value));
+    });
+    panel.querySelector('.iig-prompt-auto-toggle')?.addEventListener('click', () => {
+        const settings = getSettings();
+        settings.promptAutoGenerate = !settings.promptAutoGenerate;
+        saveSettings();
+        syncToggle('.iig-prompt-auto-toggle', settings.promptAutoGenerate);
+        toastr.info(settings.promptAutoGenerate ? 'Промпт будет писаться сам после каждого нового ответа' : 'Авто-промпт выключен: нажимайте «Промпт» сами');
+    });
+    panel.querySelector('.iig-prompt-stream-toggle')?.addEventListener('click', () => {
         const settings = getSettings();
         settings.promptGenStream = !settings.promptGenStream;
         saveSettings();
-        // Global setting: sync every visible panel
-        document.querySelectorAll('.iig-prompt-stream-toggle').forEach(btn => {
-            btn.classList.toggle('iig-stream-on', settings.promptGenStream);
-            btn.setAttribute('aria-pressed', String(settings.promptGenStream));
-        });
+        syncToggle('.iig-prompt-stream-toggle', settings.promptGenStream, 'iig-stream-on');
         toastr.info(settings.promptGenStream ? 'Стриминг промпта включён' : 'Стриминг промпта выключен');
     });
-    panel.querySelector('.iig-gemini-format-toggle')?.addEventListener('click', event => {
+    panel.querySelector('.iig-gemini-format-toggle')?.addEventListener('click', () => {
         const settings = getSettings();
         settings.geminiRandomFormat = !settings.geminiRandomFormat;
         saveSettings();
-        // Global setting: sync every visible panel
-        document.querySelectorAll('.iig-gemini-format-toggle').forEach(btn => {
-            btn.classList.toggle('iig-format-on', settings.geminiRandomFormat);
-            btn.setAttribute('aria-pressed', String(settings.geminiRandomFormat));
-        });
+        syncToggle('.iig-gemini-format-toggle', settings.geminiRandomFormat, 'iig-format-on');
         toastr.info(settings.geminiRandomFormat ? 'Gemini: рандомный формат включён' : 'Gemini: фиксированный формат');
-    });
-    panel.querySelector('.iig-prompt-generate')?.addEventListener('click', async event => {
-        const button = event.currentTarget;
-        if (activePromptAbortControllers.has(messageId)) return;
-        const controller = new AbortController();
-        activePromptAbortControllers.set(messageId, controller);
-        button.classList.add('disabled');
-        if (cancelButton) cancelButton.hidden = false;
-        const status = panel.querySelector('.iig-prompt-status');
-        if (status) status.textContent = 'Создание prompt...';
-        const onChunk = getSettings().promptGenStream
-            ? text => { textarea.value = text; textarea.scrollTop = textarea.scrollHeight; }
-            : null;
-        try {
-            await generateImagePromptForMessage(messageId, controller.signal, onChunk);
-            renderPromptPanel(panel, messageId);
-            toastr.success('Промпт картинки создан');
-        } catch (error) {
-            if (error?.name === 'AbortError') {
-                // Restore the saved prompt instead of the half-streamed text
-                textarea.value = message.extra?.iig_prompt_block?.prompt || '';
-                if (status) status.textContent = 'Отменено';
-                toastr.info('Генерация промпта отменена');
-            } else {
-                if (status) status.textContent = error.message;
-                toastr.error(`Промпт: ${error.message}`);
-            }
-        } finally {
-            activePromptAbortControllers.delete(messageId);
-            button.classList.remove('disabled');
-            if (cancelButton) cancelButton.hidden = true;
-        }
-    });
-    panel.querySelector('.iig-image-from-prompt')?.addEventListener('click', async event => {
-        const button = event.currentTarget;
-        if (activeAbortControllers.has(messageId)) return;
-        const controller = new AbortController();
-        activeAbortControllers.set(messageId, controller);
-        button.classList.add('disabled');
-        try {
-            await generateImageFromPromptBlock(messageId, panel, controller.signal);
-            renderPromptPanel(panel, messageId);
-            toastr.success('Картинка по prompt создана');
-        } catch (error) {
-            const status = panel.querySelector('.iig-prompt-status');
-            if (status) status.textContent = error.message;
-            toastr.error(`Картинка: ${error.message}`);
-        } finally {
-            activeAbortControllers.delete(messageId);
-            button.classList.remove('disabled');
-        }
     });
 }
 
@@ -4917,6 +5045,7 @@ async function onMessageReceived(messageId) {
     if (!el) return;
     addRegenerateButton(el, messageId);
     ensurePromptPanelForMessage(el, messageId);
+    if (pendingAutoPrompts.delete(Number(messageId))) maybeAutoGeneratePrompt(Number(messageId));
     await processMessageTags(messageId);
     await restoreImageRegenButtons(el, messageId);
 }
@@ -6098,30 +6227,36 @@ function profileCardHtml(kind, entity, profile, cardPreview) {
                 <div class="iig-library-editor-avatar">${libraryPreviewHtml(preview, kind === 'user' ? 'fa-user' : 'fa-user-pen')}</div>
                 <div><h4>${escapeHtml(entity.title)}</h4><small>${label}</small></div>
             </div>
-            <div class="flex-row">
+            <div class="iig-profile-field">
                 <label>Референс</label>
-                <select class="flex1 iig-profile-source">
+                <select class="iig-profile-source">
                     <option value="card" ${profile.avatarSource === 'card' ? 'selected' : ''}>Обложка карточки</option>
                     <option value="custom" ${profile.avatarSource === 'custom' ? 'selected' : ''}>Загруженный реф</option>
                 </select>
-            </div>
-            <div class="flex-row ${profile.avatarSource === 'custom' ? '' : 'hidden'}">
-                <input type="file" class="iig-profile-file" accept="image/*" hidden>
-                <button type="button" class="menu_button iig-profile-upload"><i class="fa-solid fa-upload"></i> ${profile.customAvatarData ? 'Заменить реф' : 'Загрузить реф'}</button>
-                ${profile.customAvatarData ? '<button type="button" class="menu_button iig-profile-clear"><i class="fa-solid fa-trash"></i> Убрать</button>' : ''}
-            </div>
-            <div class="iig-profile-names">
-                <label title="Если имя или любое из этих слов есть в промпте картинки — реф и описание уйдут в генерацию">Имена в промпте</label>
-                <div class="iig-names-row">
-                <input type="text" class="text_pole iig-profile-aliases" value="${escapeHtml(profile.aliases)}" placeholder="${kind === 'user' ? 'Eva, Ева, Evie' : 'Ivan, Vanya, Petrov'}">
-                <button type="button" class="menu_button iig-names-generate iig-profile-aliases-generate" title="Сгенерировать варианты имени и фамилии на русском и английском (модель описаний гардероба или модель чата)" aria-label="Сгенерировать имена"><i class="fa-solid fa-wand-magic-sparkles" aria-hidden="true"></i></button>
+                <div class="iig-profile-buttons ${profile.avatarSource === 'custom' ? '' : 'hidden'}">
+                    <input type="file" class="iig-profile-file" accept="image/*" hidden>
+                    <button type="button" class="menu_button iig-profile-upload"><i class="fa-solid fa-upload" aria-hidden="true"></i> ${profile.customAvatarData ? 'Заменить реф' : 'Загрузить реф'}</button>
+                    ${profile.customAvatarData ? '<button type="button" class="menu_button iig-profile-clear"><i class="fa-solid fa-trash" aria-hidden="true"></i> Убрать</button>' : ''}
                 </div>
             </div>
-            <textarea class="text_pole iig-profile-appearance" rows="3" placeholder="Описание внешности: волосы, глаза, телосложение, приметы...">${escapeHtml(profile.appearance)}</textarea>
-            <div class="iig-profile-describe-row">
-                <button type="button" class="menu_button iig-profile-describe" title="Описать внешность по ${profile.avatarSource === 'custom' ? 'загруженному рефу' : 'аватарке'} через Vision API. Формат (текст или теги NovelAI) — в «Vision API для описаний одежды»."><i class="fa-solid fa-eye" aria-hidden="true"></i> Описать по ${profile.avatarSource === 'custom' ? 'рефу' : 'аватарке'}</button>
-                <label class="checkbox_label iig-profile-use-card" title="Вместе с картинкой учитывать внешность из описания ${kind === 'user' ? 'персоны' : 'карточки'}. Выключено — только по картинке."><input type="checkbox" class="iig-profile-use-card-input" ${profile.describeWithCard ? 'checked' : ''}><span>+ описание ${kind === 'user' ? 'персоны' : 'карточки'}</span></label>
-                <small class="iig-profile-describe-format">${getVisionDescFormat() === 'novelai' ? 'теги NovelAI' : 'текстом'}</small>
+            <div class="iig-profile-field">
+                <label title="Если имя или любое из этих слов есть в промпте картинки — реф и описание уйдут в генерацию">Имена в промпте</label>
+                <div class="iig-names-row">
+                    <input type="text" class="text_pole iig-profile-aliases" value="${escapeHtml(profile.aliases)}" placeholder="${kind === 'user' ? 'Eva, Ева, Evie' : 'Ivan, Vanya, Petrov'}">
+                    <button type="button" class="menu_button iig-names-generate iig-profile-aliases-generate" title="Сгенерировать варианты имени и фамилии на русском и английском (модель описаний гардероба или модель чата)" aria-label="Сгенерировать имена"><i class="fa-solid fa-wand-magic-sparkles" aria-hidden="true"></i></button>
+                </div>
+            </div>
+            <div class="iig-profile-field">
+                <label>Внешность</label>
+                <textarea class="text_pole iig-profile-appearance" rows="3" placeholder="Волосы, глаза, кожа, телосложение, приметы...">${escapeHtml(profile.appearance)}</textarea>
+                <div class="iig-profile-describe-row">
+                    <button type="button" class="menu_button iig-profile-describe" title="Описать внешность по ${profile.avatarSource === 'custom' ? 'загруженному рефу' : 'аватарке'} через Vision API"><i class="fa-solid fa-eye" aria-hidden="true"></i> Описать по ${profile.avatarSource === 'custom' ? 'рефу' : 'аватарке'}</button>
+                    <select class="iig-profile-desc-format" title="Как описывать: предложениями (Nano Banana, GPT…) или тегами Danbooru (NovelAI)" aria-label="Формат описания">
+                        <option value="banana" ${getProfileDescFormat() === 'banana' ? 'selected' : ''}>Текстом · Banana</option>
+                        <option value="novelai" ${getProfileDescFormat() === 'novelai' ? 'selected' : ''}>Тегами · NovelAI</option>
+                    </select>
+                    <label class="checkbox_label iig-profile-use-card" title="Вместе с картинкой учитывать внешность из описания ${kind === 'user' ? 'персоны' : 'карточки'}. Выключено — только по картинке."><input type="checkbox" class="iig-profile-use-card-input" ${profile.describeWithCard ? 'checked' : ''}><span>+ описание ${kind === 'user' ? 'персоны' : 'карточки'}</span></label>
+                </div>
             </div>
         </div>`;
 }
@@ -6220,6 +6355,13 @@ function bindCharacterProfileEvents(container, profiles, owners = {}) {
             profile.aliases = String(event.target.value || '').trim();
             saveSettings();
         });
+        card.querySelector('.iig-profile-desc-format')?.addEventListener('change', event => {
+            const settings = getSettings();
+            settings.profileDescFormat = event.target.value === 'novelai' ? 'novelai' : 'banana';
+            // One setting for both cards (bot and persona).
+            document.querySelectorAll('.iig-profile-desc-format').forEach(select => { select.value = settings.profileDescFormat; });
+            saveSettings();
+        });
         card.querySelector('.iig-profile-use-card-input')?.addEventListener('change', event => {
             profile.describeWithCard = event.target.checked;
             saveSettings();
@@ -6239,7 +6381,7 @@ function bindCharacterProfileEvents(container, profiles, owners = {}) {
                 const cardText = profile.describeWithCard ? getCardAppearanceSource(kind) : '';
                 if (!image && !cardText) throw new Error(kind === 'user' ? 'Не найдена аватарка персоны — выберите её в «Аватары»' : 'Не найдена аватарка бота');
                 if (profile.describeWithCard && !cardText) toastr.info(`Описание ${kind === 'user' ? 'персоны' : 'карточки'} пустое — описываю только по картинке`, 'Профили');
-                const description = await describeAppearance({ image: image ? await resizeImageBase64(image, 768) : '', cardText });
+                const description = await describeAppearance({ image: image ? await resizeImageBase64(image, 768) : '', cardText, format: getProfileDescFormat() });
                 profile.appearance = description;
                 if (textarea) textarea.value = description;
                 document.querySelectorAll(`.iig-prompt-appearance-input[data-kind="${kind}"]`).forEach(input => { input.value = description; });
@@ -7273,7 +7415,8 @@ function bindSettingsEvents() {
         settings.wardrobeDescFormat = e.target.value === 'novelai' ? 'novelai' : 'banana';
         document.getElementById('iig_wardrobe_desc_prompt_row')?.classList.toggle('hidden', settings.wardrobeDescFormat !== 'banana');
         document.getElementById('iig_wardrobe_desc_prompt_novelai_row')?.classList.toggle('hidden', settings.wardrobeDescFormat !== 'novelai');
-        document.querySelectorAll('.iig-profile-describe-format').forEach(label => { label.textContent = settings.wardrobeDescFormat === 'novelai' ? 'теги NovelAI' : 'текстом'; });
+        // Profiles follow this choice until their own format is picked there.
+        if (!settings.profileDescFormat) document.querySelectorAll('.iig-profile-desc-format').forEach(select => { select.value = settings.wardrobeDescFormat; });
         saveSettings();
     });
 
@@ -8035,6 +8178,11 @@ function bindReferenceGenerator(content) {
             if (iigWardrobeModal) openWardrobeModal();
         }, 100);
         setTimeout(updateCharAvatarPreview, 200);
+    });
+
+    // Only freshly generated replies (not old messages rendered on chat load) get an automatic prompt.
+    context.eventSource.on(context.event_types.MESSAGE_RECEIVED, (messageId) => {
+        if (getSettings().promptAutoGenerate && Number.isInteger(Number(messageId))) pendingAutoPrompts.add(Number(messageId));
     });
 
     context.eventSource.makeLast(context.event_types.CHARACTER_MESSAGE_RENDERED, async (messageId) => {

@@ -1489,23 +1489,9 @@ body.iig-mode-inline .mes_text .iig-image-wrapper {
 
 .iig-negative-gallery-grid{display:flex;flex-direction:column;gap:6px;max-height:300px;overflow:auto}.iig-negative-row{display:flex;align-items:center;gap:8px;padding:7px;border:1px solid rgba(255,255,255,.08);border-radius:7px;background:rgba(255,255,255,.03);cursor:pointer}.iig-negative-row.active{border-color:var(--iig-accent);background:rgba(255,182,193,.08)}.iig-negative-row-main{min-width:0;flex:1}.iig-negative-row-main strong{display:block;color:#eee;font-size:11px}.iig-negative-row-main span{display:block;color:#aaa;font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.iig-negative-actions{display:flex;gap:3px}.iig-negative-actions .menu_button{padding:3px 6px}.iig-prompt-instruction-actions{display:flex;gap:6px;flex-wrap:wrap;margin:6px 0}.iig-prompt-instruction-actions button:disabled{opacity:.4;cursor:not-allowed}
 
-.iig-prompt-panel{margin:8px 0;padding:8px;border:1px solid rgba(255,182,193,.2);border-radius:8px;background:rgba(20,18,24,.7);color:#ddd}.iig-prompt-panel-head,.iig-prompt-panel-controls,.iig-prompt-meta{display:flex;align-items:center;gap:7px;flex-wrap:wrap}.iig-prompt-panel-head{justify-content:space-between;font-size:11px}.iig-prompt-status{color:var(--iig-accent);font-size:10px}.iig-prompt-panel-controls{margin:6px 0}.iig-prompt-selection,.iig-prompt-meta{color:#999;font-size:10px}.iig-prompt-panel .iig-prompt-value{width:100%;box-sizing:border-box;margin:4px 0;background:rgba(255,255,255,.04);color:#eee;border:1px solid rgba(255,255,255,.1);border-radius:6px;padding:6px;font-size:11px;resize:vertical}.iig-prompt-result-image{display:block;max-width:min(100%,512px);max-height:512px;margin-top:8px;border-radius:6px;object-fit:contain}.iig-prompt-panel .menu_button{font-size:10px;padding:4px 8px}
-.iig-prompt-stream-toggle{opacity:.6}
-.iig-prompt-stream-toggle.iig-stream-on{opacity:1;color:var(--iig-accent);border-color:var(--iig-accent)}
-.iig-gemini-format-toggle{opacity:.6}
-.iig-gemini-format-toggle.iig-format-on{opacity:1;color:#f59e0b;border-color:#f59e0b}
-.iig-prompt-cancel{color:#ff8a8a;border-color:rgba(220,53,69,.6)}
-.iig-prompt-cancel:hover,.iig-prompt-cancel:focus-visible{color:#fff;background:#dc3545;border-color:#dc3545}
-.iig-prompt-cancel[hidden]{display:none!important}
-.iig-prompt-panel-toggle{margin-left:auto;flex-shrink:0;padding:2px 6px!important;font-size:10px}
-.iig-prompt-panel-body{transition:opacity .15s ease}
 .iig-collapsed-hidden{display:none!important}
-.iig-prompt-meta-header{margin:4px 0}
-.iig-prompt-meta-toggle{font-size:9px;padding:2px 6px;opacity:.7}
-.iig-prompt-meta-toggle:hover{opacity:1;color:var(--iig-accent)}
 
 /* Character/persona reference library */
-.iig-prompt-result-image{display:block;width:auto;max-width:100%;max-height:512px;margin:0 auto 8px;border-radius:6px;object-fit:contain}
 .iig-library-editor-avatar{width:54px;height:54px;flex:0 0 54px;border-radius:7px;overflow:hidden;background:rgba(0,0,0,.25);display:flex;align-items:center;justify-content:center;color:#777}.iig-library-editor-avatar img{width:100%;height:100%;object-fit:cover}.iig-library-empty{color:#888;font-size:11px;padding:14px;text-align:center;border:1px dashed rgba(255,255,255,.12);border-radius:7px}
 
 /* Character profiles (bot / persona / RPG characters) */
@@ -1752,14 +1738,100 @@ body.iig-mode-inline .mes_text .iig-image-wrapper {
     min-width: 0;
 }
 .iig-names-generate:disabled { opacity: .6; cursor: wait; }
-.iig-profile-names { display: flex; flex-direction: column; gap: 3px; margin: 4px 0; }
-.iig-profile-names > label { font-size: 0.85em; opacity: .8; }
-.iig-profile-describe-row { display: flex; align-items: center; gap: 8px; margin-top: 4px; flex-wrap: wrap; }
-.iig-profile-describe-row .menu_button { margin: 0; }
-.iig-profile-describe-format { opacity: .65; }
-.iig-profile-use-card { margin: 0; font-size: 0.9em; }
 .iig-prompt-appearance { margin: 6px 0 2px; }
 .iig-prompt-appearance > summary { cursor: pointer; opacity: .85; font-size: 0.9em; }
 .iig-prompt-appearance-row { display: flex; flex-direction: column; gap: 2px; margin-top: 6px; font-size: 0.85em; }
 .iig-prompt-appearance-row > span { opacity: .75; }
 .iig-prompt-appearance-input { width: 100%; font-size: 0.95em; resize: vertical; }
+/* Profile cards: every field = label on top + control; the describe row keeps one height */
+.iig-profile-field { display: flex; flex-direction: column; gap: 4px; margin-top: 8px; }
+.iig-profile-field > label { margin: 0; font-size: 0.85em; opacity: .8; }
+.iig-profile-field > select,
+.iig-profile-field > .text_pole { width: 100%; margin: 0; box-sizing: border-box; }
+.iig-profile-buttons { display: flex; gap: 6px; flex-wrap: wrap; }
+.iig-profile-buttons .menu_button { margin: 0; }
+.iig-names-row { align-items: stretch; }
+.iig-names-row > input { margin: 0; }
+.iig-names-row > .menu_button { display: inline-flex; align-items: center; justify-content: center; }
+.iig-profile-describe-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 2px; }
+.iig-profile-describe-row > * { margin: 0; min-height: 32px; box-sizing: border-box; }
+.iig-profile-describe-row > .menu_button { display: inline-flex; align-items: center; gap: 6px; padding: 0 12px; white-space: nowrap; }
+.iig-profile-describe-row > select { width: auto; flex: 0 1 170px; min-width: 140px; }
+.iig-profile-use-card { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; font-size: 0.9em; }
+.iig-profile-use-card input { margin: 0; }
+
+/* ===== Image prompt card under bot replies =====
+   Collapsed: one line (thumb, status, first words of the prompt, actions). Expanded: the full editor.
+   Colors come from the SillyTavern theme, the accent from the extension. */
+.iig-prompt-panel.iig-pp {
+    --pp-text: var(--SmartThemeBodyColor, #ece6ef);
+    --pp-muted: color-mix(in srgb, var(--pp-text) 62%, transparent);
+    --pp-line: color-mix(in srgb, var(--iig-accent) 24%, transparent);
+    --pp-surface: color-mix(in srgb, var(--SmartThemeBlurTintColor, #19161e) 90%, var(--iig-accent) 10%);
+    --pp-field: color-mix(in srgb, var(--pp-text) 6%, transparent);
+    position: relative;
+    margin: 10px 0 4px;
+    border: 1px solid var(--pp-line);
+    border-radius: 12px;
+    background: var(--pp-surface);
+    color: var(--pp-text);
+    font-family: inherit;
+    font-size: 13px;
+    line-height: 1.45;
+    overflow: hidden;
+}
+.iig-pp-head { position: relative; display: flex; align-items: center; gap: 10px; padding: 8px; }
+.iig-pp-summary { all: unset; display: flex; align-items: center; gap: 10px; flex: 1 1 auto; min-width: 0; cursor: pointer; border-radius: 8px; }
+.iig-pp-summary:focus-visible, .iig-pp-chevron:focus-visible { outline: 2px solid var(--iig-accent); outline-offset: 2px; }
+.iig-pp-thumb { flex: 0 0 38px; height: 38px; border-radius: 9px; overflow: hidden; display: grid; place-items: center; background: color-mix(in srgb, var(--iig-accent) 16%, transparent); color: var(--iig-accent); font-size: 15px; }
+.iig-pp-thumb img { width: 100%; height: 100%; object-fit: cover; }
+.iig-pp-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.iig-pp-title { display: flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 600; }
+.iig-pp-chip { padding: 1px 8px; border-radius: 999px; font-size: 11px; font-weight: 500; background: var(--pp-field); color: var(--pp-muted); }
+.iig-pp-chip[data-state="ready"] { color: #b9e4c3; background: rgba(120, 200, 140, .14); }
+.iig-pp-chip[data-state="busy"] { color: var(--iig-accent); background: color-mix(in srgb, var(--iig-accent) 16%, transparent); }
+.iig-pp-chip[data-state="error"] { color: #ffb0b0; background: rgba(220, 80, 80, .16); }
+.iig-pp-preview { font-size: 12px; color: var(--pp-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.iig-pp-preview.is-placeholder { font-style: italic; }
+.iig-pp.has-error .iig-pp-preview { color: #ffb0b0; }
+.iig-pp-actions { display: flex; align-items: center; gap: 6px; flex: 0 0 auto; }
+.iig-pp .iig-pp-btn { margin: 0; height: 30px; padding: 0 11px; display: inline-flex; align-items: center; gap: 6px; border-radius: 8px; font-size: 12px; white-space: nowrap; }
+.iig-pp .iig-pp-btn[hidden] { display: none !important; }
+.iig-pp .iig-pp-btn.disabled { opacity: .5; pointer-events: none; }
+.iig-pp .iig-prompt-cancel { color: #ffb0b0; border-color: rgba(220, 80, 80, .5); }
+.iig-pp .iig-prompt-cancel:hover, .iig-pp .iig-prompt-cancel:focus-visible { color: #fff; background: rgba(220, 80, 80, .35); }
+.iig-pp-chevron { all: unset; width: 30px; height: 30px; display: grid; place-items: center; border-radius: 8px; color: var(--pp-muted); cursor: pointer; }
+.iig-pp-chevron:hover { color: var(--pp-text); background: var(--pp-field); }
+.iig-pp-chevron i { transition: transform .2s ease; }
+.iig-pp.is-expanded .iig-pp-chevron i { transform: rotate(180deg); }
+.iig-pp-progress { position: absolute; left: 0; right: 0; bottom: 0; height: 2px; opacity: 0; background: linear-gradient(90deg, transparent, var(--iig-accent), transparent) no-repeat; background-size: 40% 100%; transition: opacity .2s ease; }
+.iig-pp.is-busy .iig-pp-progress { opacity: 1; animation: iig-pp-run 1.2s ease-in-out infinite; }
+.iig-pp.is-busy .iig-pp-thumb > i { animation: iig-pp-pulse 1.2s ease-in-out infinite; }
+@keyframes iig-pp-run { from { background-position: -40% 0; } to { background-position: 140% 0; } }
+@keyframes iig-pp-pulse { 50% { opacity: .35; } }
+@media (prefers-reduced-motion: reduce) {
+    .iig-pp.is-busy .iig-pp-progress, .iig-pp.is-busy .iig-pp-thumb > i { animation: none; }
+    .iig-pp.is-busy .iig-pp-progress { background-size: 100% 100%; }
+}
+.iig-pp-body { display: flex; flex-direction: column; gap: 10px; padding: 0 12px 12px; border-top: 1px solid var(--pp-line); }
+.iig-pp-body .iig-prompt-result-image { display: block; max-width: 100%; max-height: 512px; margin: 10px auto 0; border-radius: 10px; object-fit: contain; }
+.iig-pp-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; padding-top: 10px; }
+.iig-pp-instruction { min-width: 0; font-size: 12px; color: var(--pp-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.iig-pp-toggles { display: flex; gap: 6px; flex-wrap: wrap; }
+.iig-pp .iig-pp-pill { margin: 0; height: 28px; padding: 0 11px; display: inline-flex; align-items: center; gap: 6px; border-radius: 999px; font-size: 12px; opacity: .6; }
+/* the theme styles .menu_button too — the «on» state has to win over it */
+.iig-pp .iig-pp-pill.is-on { opacity: 1; color: var(--iig-accent) !important; border-color: color-mix(in srgb, var(--iig-accent) 65%, transparent) !important; background-color: color-mix(in srgb, var(--iig-accent) 16%, transparent) !important; }
+.iig-pp .iig-prompt-value { width: 100%; min-height: 96px; box-sizing: border-box; margin: 0; padding: 10px 12px; border: 1px solid var(--pp-line); border-radius: 10px; background: var(--pp-field); color: var(--pp-text); font-family: inherit; font-size: 13px; line-height: 1.55; resize: vertical; }
+.iig-pp .iig-prompt-value:focus { outline: none; border-color: color-mix(in srgb, var(--iig-accent) 70%, transparent); }
+.iig-pp-status { font-size: 12px; color: var(--pp-muted); }
+.iig-pp-status:empty { display: none; }
+.iig-pp .iig-prompt-appearance, .iig-pp-meta { margin: 0; padding: 8px 10px; border: 1px solid var(--pp-line); border-radius: 10px; background: color-mix(in srgb, var(--pp-text) 3%, transparent); }
+.iig-pp .iig-prompt-appearance > summary, .iig-pp-meta > summary { cursor: pointer; font-size: 12px; font-weight: 600; color: var(--pp-muted); }
+.iig-pp .iig-prompt-appearance-input { background: var(--pp-field); color: var(--pp-text); border-color: var(--pp-line); font-family: inherit; font-size: 12px; line-height: 1.5; }
+.iig-pp-meta dl { display: grid; grid-template-columns: max-content 1fr; gap: 4px 10px; margin: 8px 0 0; font-size: 12px; }
+.iig-pp-meta dt { color: var(--pp-muted); }
+.iig-pp-meta dd { margin: 0; word-break: break-word; }
+@media (max-width: 600px) {
+    .iig-pp-head { flex-wrap: wrap; }
+    .iig-pp-actions { width: 100%; justify-content: flex-end; }
+}

@@ -343,6 +343,7 @@ function getSettings() {
 
 function saveSettings() {
     const context = SillyTavern.getContext();
+    syncActivePresetFromSettings(context.extensionSettings?.[MODULE_NAME]);
     context.saveSettingsDebounced();
 }
 
@@ -402,7 +403,7 @@ function makeCharacterProfile(raw = {}) {
         avatarSource: raw.avatarSource === 'custom' ? 'custom' : 'card',
         customAvatarData: String(raw.customAvatarData || ''),
         appearance: String(raw.appearance || '').trim(),
-        // Extra names to look for in the image prompt (e.g. "Viktor, Vitya, Gromov"), comma-separated.
+        // Extra names to look for in the image prompt (e.g. "Ivan, Vanya, Petrov"), comma-separated.
         aliases: String(raw.aliases || '').trim(),
         rpgMode: Boolean(raw.rpgMode),
         rpgCharacters: rpgCharacters.map(char => ({
@@ -1894,18 +1895,50 @@ function saveCurrentAsPreset(name) {
     return preset;
 }
 
+const NOVELAI_API_TYPES = Object.freeze(['novelai', 'novelai-direct']);
+
+/**
+ * A preset only owns the provider fields of its own API type: choosing a Gemini/router preset must not touch the
+ * NovelAI negative, size or steps (and the other way round). Common fields (API type, endpoint, key, model…) always apply.
+ */
+function presetFieldApplies(field, apiType) {
+    if (field.startsWith('novelai')) return NOVELAI_API_TYPES.includes(apiType);
+    if (field.startsWith('naistera')) return apiType === 'naistera';
+    return true;
+}
+
 function loadPreset(presetId) {
     const settings = getSettings();
     const preset = settings.apiPresets.find(p => p.id === presetId);
     if (!preset) return false;
     for (const field of PRESET_FIELDS) {
-        if (Object.hasOwn(preset, field)) {
+        if (Object.hasOwn(preset, field) && presetFieldApplies(field, preset.apiType)) {
             settings[field] = preset[field];
         }
     }
     settings.activePresetId = presetId;
     saveSettings();
     return true;
+}
+
+/**
+ * Live presets: while a preset is selected, every edit of its fields is written into it, so nothing «resets»
+ * the next time the preset is chosen (no need to press «Обновить пресет»). Switching to another API type while a
+ * preset is selected detaches the preset instead of rewriting it.
+ */
+function syncActivePresetFromSettings(settings) {
+    if (!settings?.activePresetId || !Array.isArray(settings.apiPresets)) return;
+    const preset = settings.apiPresets.find(p => p.id === settings.activePresetId);
+    if (!preset) { settings.activePresetId = null; return; }
+    if (preset.apiType && settings.apiType !== preset.apiType) {
+        settings.activePresetId = null;
+        const select = typeof document !== 'undefined' ? document.getElementById('iig_preset_select') : null;
+        if (select) select.value = '';
+        return;
+    }
+    for (const field of PRESET_FIELDS) {
+        if (presetFieldApplies(field, preset.apiType)) preset[field] = settings[field];
+    }
 }
 
 function deletePreset(presetId) {
@@ -2278,8 +2311,8 @@ function initCollapsibleSections() {
 // NAME MATCHING (who is in the picture?)
 // ============================================================
 // A reference (face / outfit / appearance text) is sent only for people the image prompt actually mentions.
-// - A name field may hold several names: "Виктор Громов, Витя, Viktor" (separators: , ; | / or new line).
-// - Every name also counts by its separate words ("Громов" alone matches "Виктор Громов"), except titles and
+// - A name field may hold several names: "Иван Петров, Ваня, Ivan" (separators: , ; | / or new line).
+// - Every name also counts by its separate words ("Петров" alone matches "Иван Петров"), except titles and
 //   generic placeholders ("user", "персонаж", "Lord", "капитан"…), which never trigger on their own.
 // - Cyrillic names are also searched in Latin transliteration, because chat models write image prompts in English.
 // - Russian case endings are tolerated ("Ева" also finds "Еву", "Евой").
@@ -2312,7 +2345,7 @@ function transliterateRu(text) {
     return String(text || '').toLowerCase().replace(/[а-яё]/g, letter => RU_TO_LATIN[letter] ?? letter);
 }
 
-/** "Виктор Громов, Витя; Viktor" → ['Виктор Громов', 'Витя', 'Viktor'] */
+/** "Иван Петров, Ваня; Ivan" → ['Иван Петров', 'Ваня', 'Ivan'] */
 function splitNameList(value) {
     const list = Array.isArray(value) ? value : [value];
     return list.flatMap(item => String(item ?? '').split(/[,;|/\n]+/)).map(name => name.trim()).filter(Boolean);
@@ -2321,7 +2354,7 @@ function splitNameList(value) {
 /**
  * All strings that should count as a mention of this person: Map<text, isTransliteration>.
  * Transliterations are matched loosely (see latinSpellingPattern), because «Эвелин Гринвелл» is written
- * "Eveline Grinwell" in English, «Алексей» — "Alexei", «Тихонов» — "Tihonov" or "Tikhonov".
+ * "Eveline Grinwell" in English, «Андрей» — "Andrei", «Ксения» — "Xenia", «Орехов» — "Orehov" or "Orekhov".
  */
 function buildNameVariants(names) {
     const variants = new Map();
@@ -2343,7 +2376,7 @@ function buildNameVariants(names) {
 }
 
 const LATIN_SPELLING_ALTERNATIVES = Object.freeze({
-    shch: '(?:shch|sch|sh)', kh: '(?:kh|h)', ks: '(?:ks|x)', ts: '(?:ts|tz|c)',
+    shch: '(?:shch|sch|sh)', kh: '(?:kh|h)', ks: '(?:ks|x)', ts: '(?:ts|tz|c)', iya: '(?:iya|ia|ija)',
     yu: '(?:yu|iu|ju|u)', ya: '(?:ya|ia|ja)', ey: '(?:ey|ei|ej|y)', v: '[vw]', y: '[yij]',
 });
 
@@ -2351,7 +2384,7 @@ const LATIN_SPELLING_ALTERNATIVES = Object.freeze({
 function latinSpellingPattern(latin) {
     return latin.split(/\s+/).map((word, index, words) => {
         const body = word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-            .replace(/shch|kh|ks|ts|yu|ya|ey|v|y/g, match => LATIN_SPELLING_ALTERNATIVES[match]);
+            .replace(/shch|kh|ks|ts|iya|yu|ya|ey|v|y/g, match => LATIN_SPELLING_ALTERNATIVES[match]);
         return index === words.length - 1 && word.length >= 4 ? `${body}[a-z]{0,2}` : body;
     }).join('\\s+');
 }
@@ -3179,7 +3212,7 @@ function parseImageFromApiResponse(result) {
 
 /**
  * One numbered list that matches the order the images are attached in, so the model knows exactly which picture is whom:
- * "Image 1 = FACE of "Viktor" …, Image 2 = OUTFIT of "Eva" …".
+ * "Image 1 = FACE of "Ivan" …, Image 2 = OUTFIT of "Eva" …".
  */
 function buildReferenceLegend(imageRefs) {
     const lines = imageRefs.map((ref, index) => {
@@ -4555,8 +4588,8 @@ function renderNpcList() {
             <div style="margin-bottom:8px;">
                 <label style="font-size:11px;color:#9a9292;display:block;margin-bottom:3px;">Другие имена (через запятую):</label>
                 <input type="text" class="text_pole npc-aliases-input" data-npc-index="${i}" style="width:100%;font-size:11px;"
-                    placeholder="Lyosha, Tikhonov, Лёша…" value="${escapeHtml(getNpcAliases(npc).join(', '))}">
-                <div style="font-size:10px;color:#7a7272;margin-top:2px;">Реф уходит, если в промпте есть имя, любое из этих слов или их транслит (Тихонов → Tikhonov).</div>
+                    placeholder="Misha, Orekhov, Миша…" value="${escapeHtml(getNpcAliases(npc).join(', '))}">
+                <div style="font-size:10px;color:#7a7272;margin-top:2px;">Реф уходит, если в промпте есть имя, любое из этих слов или их транслит (Орехов → Orekhov).</div>
             </div>
             <div style="margin-bottom:8px;">
                 <label style="font-size:11px;color:#9a9292;display:block;margin-bottom:3px;">Описание внешности:</label>
@@ -5602,7 +5635,7 @@ function profileCardHtml(kind, entity, profile, cardPreview) {
             </div>
             <div class="flex-row">
                 <label title="Если имя или любое из этих слов есть в промпте картинки — реф и описание уйдут в генерацию">Имена в промпте</label>
-                <input type="text" class="text_pole flex1 iig-profile-aliases" value="${escapeHtml(profile.aliases)}" placeholder="${kind === 'user' ? 'Eva, Ева, Evie' : 'Viktor, Vitya, Gromov'}">
+                <input type="text" class="text_pole flex1 iig-profile-aliases" value="${escapeHtml(profile.aliases)}" placeholder="${kind === 'user' ? 'Eva, Ева, Evie' : 'Ivan, Vanya, Petrov'}">
             </div>
             <textarea class="text_pole iig-profile-appearance" rows="3" placeholder="Описание внешности: волосы, глаза, телосложение, приметы...">${escapeHtml(profile.appearance)}</textarea>
         </div>`;
@@ -6052,7 +6085,7 @@ function createSettingsUI() {
                                 <input type="checkbox" id="iig_auto_detect_names" ${settings.autoDetectNames ? 'checked' : ''}>
                                 <span>Авто-определение имён в промпте</span>
                             </label>
-                            <p class="hint">Персонаж, юзер и NPC попадают в картинку (лицо, внешность, наряд), только если их имя есть в промпте. Имена ищутся и транслитом (Виктор → Viktor), дополнительные имена — в профилях и у NPC. «Всегда отправлять» ниже добавляет человека даже без упоминания; для NovelAI эти галочки не действуют.</p>
+                            <p class="hint">Персонаж, юзер и NPC попадают в картинку (лицо, внешность, наряд), только если их имя есть в промпте. Имена ищутся и транслитом (Иван → Ivan), дополнительные имена — в профилях и у NPC. «Всегда отправлять» ниже добавляет человека даже без упоминания; для NovelAI эти галочки не действуют.</p>
 
                             <label class="checkbox_label">
                                 <input type="checkbox" id="iig_send_char_avatar" ${settings.sendCharAvatar ? 'checked' : ''}>

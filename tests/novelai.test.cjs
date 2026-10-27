@@ -159,17 +159,17 @@ test('collector forwards library and wardrobe descriptions, not images, to offic
 });
 test('"|" prompts become separate NovelAI character prompts with each person\'s own tags', async () => {
     const { generate, requests } = setup({ ok: false, status: 500, text: async () => '' }, { apiType: 'novelai-direct', novelaiApiKey: 'tok' });
-    await assert.rejects(generate.call(null, '2girls, cafe | Gretchen, laughing | Eveline, reading', 'gouache', {
+    await assert.rejects(generate.call(null, '2girls, cafe | Marta, laughing | Eveline, reading', 'gouache', {
         people: [
             { name: 'Eveline', names: ['Eveline'], appearance: 'pink hair, freckles' },
-            { name: 'Gretchen', names: ['Gretchen'], appearance: 'black bob' },
+            { name: 'Marta', names: ['Marta'], appearance: 'black bob' },
         ],
         textOnlyClothing: [{ charName: 'Eveline', description: 'lace gloves' }],
         textDirectives: [],
     }));
     const body = JSON.parse(requests[0].init.body);
     const chars = body.parameters.v4_prompt.caption.char_captions.map(c => c.char_caption);
-    assert.deepEqual(chars, ['Gretchen, laughing, black bob', 'Eveline, reading, pink hair, freckles, lace gloves']);
+    assert.deepEqual(chars, ['Marta, laughing, black bob', 'Eveline, reading, pink hair, freckles, lace gloves']);
     assert.equal(body.parameters.characterPrompts.length, 2);
     assert.equal(body.parameters.v4_negative_prompt.caption.char_captions.length, 2);
     assert.equal(body.input, 'gouache, 2girls, cafe');
@@ -179,9 +179,9 @@ test('"|" prompts become separate NovelAI character prompts with each person\'s 
 test('SillyTavern route has no character prompts: tags follow their own segment in one string', async () => {
     const png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9pZHjTQAAAAASUVORK5CYII=';
     const { generate, requests } = setup({ ok: true, text: async () => png });
-    await generate('2girls | Gretchen | Eveline', '', {
-        people: [{ name: 'Eveline', names: ['Eveline'], appearance: 'pink hair' }, { name: 'Gretchen', names: ['Gretchen'], appearance: 'black bob' }],
+    await generate('2girls | Marta | Eveline', '', {
+        people: [{ name: 'Eveline', names: ['Eveline'], appearance: 'pink hair' }, { name: 'Marta', names: ['Marta'], appearance: 'black bob' }],
     });
     const body = JSON.parse(requests[0].init.body);
-    assert.equal(body.prompt, '2girls, Gretchen, black bob, Eveline, pink hair');
+    assert.equal(body.prompt, '2girls, Marta, black bob, Eveline, pink hair');
 });

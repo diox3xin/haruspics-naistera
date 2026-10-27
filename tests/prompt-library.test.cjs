@@ -11,6 +11,7 @@ function load(start, end, settings) {
         MODULE_NAME: 'inline_image_gen',
         structuredClone: value => JSON.parse(JSON.stringify(value)),
         SillyTavern: { getContext: () => ({ extensionSettings: { inline_image_gen: settings }, saveSettingsDebounced() {} }) },
+        syncActivePresetFromSettings: () => {},
     });
     const from = source.indexOf(start);
     const to = source.indexOf(end, from + start.length);

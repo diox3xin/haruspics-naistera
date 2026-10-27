@@ -43,3 +43,15 @@ test('transliteration is matched loosely: Evelin → Eveline, v/w, kh/h, ks/x', 
     assert.equal(context.match(['Орехов'], 'Orehov waits'), true);
     assert.equal(context.match(['Эвелин Гринвелл'], 'Evening in the forest'), false);
 });
+
+test('a name that is also a word or tag counts only when capitalized', () => {
+    const robert = ['Robert Novak', 'Rob', 'Bob', 'Bobby'];
+    assert.equal(context.match(robert, '1girl, Marta, pale pink hair, messy bob, bangs'), false);
+    assert.equal(context.match(robert, 'Bob leans on the counter'), true);
+    assert.equal(context.match(robert, 'BOB, close-up'), true);
+    assert.equal(context.match(['Ivy'], 'old wall covered in ivy'), false);
+    assert.equal(context.match(['Роза'], 'на столе стоит роза'), false);
+    assert.equal(context.match(['Роза'], 'Розу зовут к столу'), true);
+    assert.equal(context.match(['Robert Novak'], 'robert novak, suit'), true);
+});
+

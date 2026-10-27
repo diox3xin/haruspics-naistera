@@ -2447,12 +2447,34 @@ function nameVariantPattern(variant, isTransliteration = false) {
     return escaped;
 }
 
+/**
+ * Names that are also ordinary words or image tags ("messy bob" haircut, "rose", "ivy", "will").
+ * Such a name counts only when it is written with a capital letter: "Bob" is a person, "bob" is a haircut.
+ */
+const NAME_COMMON_WORDS = new Set([
+    'bob', 'rob', 'bill', 'will', 'mark', 'jack', 'max', 'ray', 'art', 'frank', 'dean', 'drew', 'guy', 'gene', 'pat', 'rich',
+    'nick', 'miles', 'chase', 'hunter', 'archer', 'mason', 'cooper', 'cliff', 'chip', 'bud', 'buddy', 'buck', 'colt', 'rex',
+    'rocky', 'rusty', 'dusty', 'sandy', 'penny', 'sunny', 'misty', 'sky', 'skye', 'rain', 'storm', 'snow', 'river', 'reed',
+    'stone', 'dawn', 'eve', 'may', 'june', 'april', 'august', 'summer', 'autumn', 'winter', 'faith', 'hope', 'grace', 'joy',
+    'rose', 'lily', 'iris', 'violet', 'daisy', 'ivy', 'holly', 'hazel', 'amber', 'ruby', 'pearl', 'jade', 'coral', 'crystal',
+    'ginger', 'honey', 'candy', 'cherry', 'olive', 'sage', 'fern', 'willow', 'ash', 'robin', 'wren', 'jay', 'raven', 'kitty',
+    'bunny', 'angel', 'baby', 'doll', 'star', 'scarlet', 'scarlett', 'blue', 'red', 'silver', 'ebony', 'coco', 'sugar',
+    'cookie', 'pepper', 'page', 'bambi', 'goldie', 'brandy', 'destiny', 'dot', 'flora', 'fawn',
+    'роза', 'лилия', 'вера', 'надежда', 'любовь', 'лев', 'слава', 'мир', 'роман', 'заря', 'звезда',
+]);
+
 /** True when any of the names (or their words / transliterations) is mentioned in the prompt. */
 function namesAppearInPrompt(names, prompt) {
     const text = decodeNumericEntities(prompt);
     if (!text) return false;
-    return [...buildNameVariants(names)].some(([variant, isTransliteration]) =>
-        new RegExp(`(?<![\\p{L}\\p{N}_])${nameVariantPattern(variant, isTransliteration)}(?![\\p{L}\\p{N}_])`, 'iu').test(text));
+    return [...buildNameVariants(names)].some(([variant, isTransliteration]) => {
+        const pattern = nameVariantPattern(variant, isTransliteration);
+        if (NAME_COMMON_WORDS.has(variant)) {
+            const capitalized = pattern.charAt(0).toUpperCase() + pattern.slice(1);
+            return new RegExp(`(?<![\\p{L}\\p{N}_])(?:${capitalized}|${variant.toUpperCase()})(?![\\p{L}\\p{N}_])`, 'u').test(text);
+        }
+        return new RegExp(`(?<![\\p{L}\\p{N}_])${pattern}(?![\\p{L}\\p{N}_])`, 'iu').test(text);
+    });
 }
 
 function nameAppearsInPrompt(name, prompt) {

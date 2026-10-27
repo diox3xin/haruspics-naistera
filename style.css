@@ -1927,3 +1927,8 @@ body.iig-mode-inline .mes_text .iig-image-wrapper {
     .iig-settings-tabs { grid-template-columns: 1fr 1fr; }
     .iig-settings-tab { min-width: 0; }
 }
+
+/* Smaller picture block: at most 520px wide, centered in the reply, not taller than 60% of the screen */
+.iig-pp-figure { max-width: 520px; margin: 0 auto; box-sizing: border-box; }
+.iig-pp-figure .iig-prompt-result-image { max-height: min(60vh, 640px); }
+.mes_text .iig-prompt-panel.iig-pp.has-image:not(.is-expanded) { max-width: 520px; margin-left: auto; margin-right: auto; }

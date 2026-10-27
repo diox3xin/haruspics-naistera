@@ -805,21 +805,61 @@ async function fetchPromptGenerationModels() {
     return (data.data || []).filter(model => model?.id && !isImageModel(model.id)).map(model => String(model.id));
 }
 
-function getPromptGenerationContext(message, instruction) {
+const PROMPT_GEN_SYSTEM = [
+    'You write prompts for an image generator. You are NOT a roleplay participant.',
+    'The chat is only source material: never continue the story, never write the character\'s reply, dialogue, plans, timestamps, status or info blocks.',
+    'The prompt instruction may have been written for the chat model (story + image tag). Use it only for what the picture shows and how the prompt is formatted.',
+    'Output only the image prompt — or, if the instruction requires an image tag, only that one tag.',
+].join(' ');
+
+/** Is the picture going to NovelAI (directly, through SillyTavern or a NovelAI model on Naistera)? */
+function isNovelAIPromptTarget(settings = getSettings()) {
+    return NOVELAI_API_TYPES.includes(settings.apiType)
+        || (settings.apiType === 'naistera' && isNaisteraNovelAIModel(settings.naisteraModel));
+}
+
+function getPromptGenerationContext(message, instruction, settings = getSettings()) {
     const context = SillyTavern.getContext();
     const character = context.characters?.[context.characterId];
-    const recentMessages = (context.chat || []).slice(-8).map(item => {
+    const chat = context.chat || [];
+    const index = chat.indexOf(message);
+    const history = (index >= 0 ? chat.slice(Math.max(0, index - 7), index) : chat.slice(-8).filter(item => item !== message));
+    const recentMessages = history.map(item => {
         const role = item.is_user ? 'User' : item.is_system ? 'System' : (item.name || 'Character');
         return `${role}: ${String(item.mes || '').trim()}`;
     }).filter(Boolean).join('\n\n');
+    const novelAI = isNovelAIPromptTarget(settings)
+        ? 'Target image model: NovelAI (anime, tag-based). Write comma-separated English tags. If several characters are in the picture, write the shared scene first, then one block per character, separated by " | ".'
+        : '';
     return [
         `Character: ${character?.name || 'Unknown'}`,
         `User: ${context.name1 || 'User'}`,
-        `Current message: ${String(message?.mes || '').trim()}`,
-        `Recent context:\n${recentMessages}`,
-        `Instruction:\n${instruction.prompt}`,
-        'Return only the image-generation prompt.',
-    ].join('\n\n');
+        `<chat_history>\n${recentMessages}\n</chat_history>`,
+        `<message_to_illustrate>\n${String(message?.mes || '').trim()}\n</message_to_illustrate>`,
+        `<prompt_instruction>\n${instruction.prompt}\n</prompt_instruction>`,
+        novelAI,
+        'Do not continue the roleplay. Write ONLY the image-generation prompt for <message_to_illustrate> now.',
+    ].filter(Boolean).join('\n\n');
+}
+
+/**
+ * The prompt model sometimes answers like the chat model: story + <img data-iig-instruction='{"prompt":…}'>.
+ * Take the prompt out of the tag; otherwise strip reasoning, plans, code fences and a leading "Prompt:" label.
+ */
+async function cleanGeneratedImagePrompt(text) {
+    const raw = String(text || '');
+    const tags = await parseImageTags(raw, { forceAll: true }).catch(() => []);
+    const fromTags = tags.filter(tag => String(tag.prompt || '').trim());
+    if (fromTags.length) {
+        return { prompt: fromTags.map(tag => tag.prompt.trim()).join('\n\n'), style: fromTags[0].style || '', fromTag: true };
+    }
+    const prompt = raw
+        .replace(/<(think|thinking|rp_plan|plan)>[\s\S]*?<\/\1>/gi, '')
+        .replace(/^```[a-z]*\s*|```\s*$/gim, '')
+        .trim()
+        .replace(/^\**(?:image\s+)?prompt\**\s*:\s*/i, '')
+        .trim();
+    return { prompt, style: '', fromTag: false };
 }
 
 /**
@@ -871,7 +911,10 @@ async function generateImagePromptForMessage(messageId, signal, onChunk = null) 
             model,
             temperature: Math.max(0, Math.min(2, Number(settings.promptGenTemperature) || 0.7)),
             max_tokens: Math.max(64, Math.min(4000, Number(settings.promptGenMaxTokens) || 700)),
-            messages: [{ role: 'user', content: getPromptGenerationContext(message, instruction) }],
+            messages: [
+                { role: 'system', content: PROMPT_GEN_SYSTEM },
+                { role: 'user', content: getPromptGenerationContext(message, instruction, settings) },
+            ],
             ...(onChunk ? { stream: true } : {}),
         }),
         signal,
@@ -879,17 +922,20 @@ async function generateImagePromptForMessage(messageId, signal, onChunk = null) 
     if (!response.ok) throw new Error(`Prompt API (${response.status}): ${(await response.text().catch(() => '')).slice(0, 500)}`);
     // Some proxies ignore stream:true and answer with plain JSON
     const isStream = onChunk && response.body && /event-stream/i.test(response.headers.get('content-type') || '');
-    const prompt = isStream
+    const answer = isStream
         ? (await readChatCompletionStream(response, onChunk)).trim()
         : (await response.json()).choices?.[0]?.message?.content?.trim();
+    const cleaned = await cleanGeneratedImagePrompt(answer);
+    const prompt = cleaned.prompt;
     if (!prompt) throw new Error('Модель промпта вернула пустой ответ');
+    if (cleaned.fromTag) iigLog('INFO', 'Prompt model answered with an image tag — took the prompt from it');
 
     if (!message.extra || typeof message.extra !== 'object') message.extra = {};
     message.extra.iig_prompt_block = {
         ...(message.extra.iig_prompt_block || {}),
         instructionId: instruction.id,
         prompt,
-        style: buildEffectiveStyle(''),
+        style: buildEffectiveStyle(cleaned.style),
         negativePrompt: getActiveNegativePrompt(),
         updatedAt: Date.now(),
     };

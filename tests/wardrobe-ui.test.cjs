@@ -68,7 +68,9 @@ test('NovelAI uses hairstyle text and reports missing wardrobe descriptions', as
         const result = await collector({ apiType }, { name: 'Coat', imageData: 'COAT' }, { description: 'long braids', imageData: 'HAIR' });
         assert.equal(result.imageRefs.length, 0);
         assert.equal(result.warnings.length, 2);
-        assert.match(result.textDirectives.join(' '), /long braids/);
+        // The hairstyle belongs to its owner's own character prompt, not to the general scene text.
+        assert.doesNotMatch(result.textDirectives.join(' '), /long braids/);
+        assert.match(result.personTags.map(tag => tag.description).join(' '), /long braids/);
     }
 });
 

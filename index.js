@@ -2619,6 +2619,15 @@ async function collectReferenceImages(prompt) {
     const textOnlyClothing = [];
     const textDirectives = [];
     const warnings = [];
+    // Hairstyles and NPC outfits that belong to one person. NovelAI gets them inside that person's own prompt,
+    // otherwise they are general tags and every figure in the picture wears them.
+    const personTags = [];
+    const personDirectives = new Set();
+    const addPersonDirective = (name, description, directive) => {
+        textDirectives.push(directive);
+        personDirectives.add(directive);
+        personTags.push({ charName: name, description: String(description || '').trim() });
+    };
 
     const charName = context.characters?.[context.characterId]?.name || null;
     const userName = context.name1 || null;
@@ -2734,9 +2743,9 @@ async function collectReferenceImages(prompt) {
                     type: 'clothing'
                 });
             } else if (activeNpcOutfit?.description) {
-                textDirectives.push(`[CLOTHING INSTRUCTION for "${npc.name}"]: ${npc.name} is wearing: ${activeNpcOutfit.description}`);
+                addPersonDirective(npc.name, activeNpcOutfit.description, `[CLOTHING INSTRUCTION for "${npc.name}"]: ${npc.name} is wearing: ${activeNpcOutfit.description}`);
             } else if (npc.outfit) {
-                textDirectives.push(`[CLOTHING INSTRUCTION for "${npc.name}"]: ${npc.name} is wearing: ${npc.outfit}`);
+                addPersonDirective(npc.name, npc.outfit, `[CLOTHING INSTRUCTION for "${npc.name}"]: ${npc.name} is wearing: ${npc.outfit}`);
             }
         }
     }
@@ -2770,7 +2779,7 @@ async function collectReferenceImages(prompt) {
         const hairMode = settings.hairstyleSendMode || 'both';
         if (hairstyle && hairMode !== 'none') {
             if (hairstyle.description?.trim()) {
-                textDirectives.push(`[HAIRSTYLE INSTRUCTION for "${name}"]: ${hairstyle.description}`);
+                addPersonDirective(name, hairstyle.description, `[HAIRSTYLE INSTRUCTION for "${name}"]: ${hairstyle.description}`);
             }
             if (hairstyle.imageData && hairMode === 'both' && !textOnlyProvider) {
                 clothingRefs.push({
@@ -2792,8 +2801,9 @@ async function collectReferenceImages(prompt) {
                 charName: ref.name,
                 description: ref.description,
             }))],
-            // Appearance goes per person via `people`; everything else (hairstyle/outfit instructions…) stays here.
-            textDirectives: textDirectives.filter(directive => !appearanceDirectives.has(directive)),
+            // Appearance, outfits and hairstyles go per person (`people`, `textOnlyClothing`, `personTags`).
+            textDirectives: textDirectives.filter(directive => !appearanceDirectives.has(directive) && !personDirectives.has(directive)),
+            personTags,
             people,
             warnings,
         };
@@ -3093,6 +3103,7 @@ function buildNovelAICaptions(prompt, refData = {}) {
     };
     for (const clothing of (refData.textOnlyClothing || [])) addOutfit(clothing.charName, clothing.description);
     for (const ref of (refData.imageRefs || [])) if (ref.type === 'clothing') addOutfit(ref.name, ref.description);
+    for (const tag of (refData.personTags || [])) addOutfit(tag.charName, tag.description);
 
     const tagsFor = person => [
         String(person.appearance || '').trim(),
@@ -3112,11 +3123,16 @@ function buildNovelAICaptions(prompt, refData = {}) {
     // More segments than NovelAI allows: keep the extra text in the base prompt instead of losing it.
     const overflow = segments.slice(1 + NOVELAI_MAX_CHARACTERS);
 
+    // People in the scene without a "|" part of their own get a separate character prompt with their name,
+    // appearance and outfit — in the scene part these tags would land on everybody.
     const base = [];
     for (const person of people) {
         if (placed.has(person)) continue;
-        base.push(...tagsFor(person));
+        const tags = tagsFor(person);
         markPlaced(person);
+        if (!tags.length) continue;
+        if (characters.length < NOVELAI_MAX_CHARACTERS) characters.push([person.name, ...tags].filter(Boolean).join(', '));
+        else base.push(...tags);
     }
     // Outfits of people without an appearance entry (e.g. only a wardrobe item) are not lost either.
     for (const [key, list] of outfits) if (!placedOutfits.has(key)) base.push(...list);

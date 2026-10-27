@@ -185,3 +185,34 @@ test('SillyTavern route has no character prompts: tags follow their own segment 
     const body = JSON.parse(requests[0].init.body);
     assert.equal(body.prompt, '2girls, Marta, black bob, Eveline, pink hair');
 });
+
+test('without "|" every person in the scene still gets an own character prompt with outfit and hairstyle', async () => {
+    const { generate, requests } = setup({ ok: false, status: 500, text: async () => '' }, { apiType: 'novelai-direct', novelaiApiKey: 'tok' });
+    await assert.rejects(generate.call(null, '2girls, Eveline and Marta in a sewing room', '', {
+        people: [
+            { name: 'Eveline', names: ['Eveline'], appearance: 'pink hair' },
+            { name: 'Marta', names: ['Marta'], appearance: 'red hair, freckles' },
+        ],
+        textOnlyClothing: [{ charName: 'Eveline', description: 'grey dress, lace gloves' }],
+        personTags: [{ charName: 'Marta', description: 'braided bun' }, { charName: 'Marta', description: 'brown work dress, white apron' }],
+        textDirectives: [],
+    }));
+    const body = JSON.parse(requests[0].init.body);
+    const chars = body.parameters.v4_prompt.caption.char_captions.map(c => c.char_caption);
+    assert.deepEqual(chars, ['Eveline, pink hair, grey dress, lace gloves', 'Marta, red hair, freckles, braided bun, brown work dress, white apron']);
+    assert.equal(body.input, '2girls, Eveline and Marta in a sewing room');
+});
+
+test('a hairstyle or NPC outfit goes into its owner\'s "|" part, not the scene', async () => {
+    const { generate, requests } = setup({ ok: false, status: 500, text: async () => '' }, { apiType: 'novelai-direct', novelaiApiKey: 'tok' });
+    await assert.rejects(generate.call(null, 'workroom | Marta, smiling | Eveline, frozen', '', {
+        people: [{ name: 'Eveline', names: ['Eveline'], appearance: '' }, { name: 'Marta', names: ['Marta'], appearance: '' }],
+        personTags: [{ charName: 'Eveline', description: 'messy bob' }, { charName: 'Marta', description: 'apron' }],
+        textDirectives: [],
+    }));
+    const body = JSON.parse(requests[0].init.body);
+    const chars = body.parameters.v4_prompt.caption.char_captions.map(c => c.char_caption);
+    assert.deepEqual(chars, ['Marta, smiling, apron', 'Eveline, frozen, messy bob']);
+    assert.equal(body.input, 'workroom');
+});
+

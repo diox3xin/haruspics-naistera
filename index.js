@@ -537,7 +537,7 @@ async function collectCharacterProfileReferences(kind, settings = getSettings())
     const entity = getCurrentLibraryEntity(kind, settings);
     const profile = getCharacterProfile(kind, entity.key, settings, false);
     
-    if (!profile) return { refs: [], descriptions: [], names: [], hasPrimary: false };
+    if (!profile) return { refs: [], descriptions: [], names: [], appearance: '', hasPrimary: false };
     
     const refs = [];
     const descriptions = [];
@@ -563,6 +563,7 @@ async function collectCharacterProfileReferences(kind, settings = getSettings())
         refs,
         descriptions,
         names: splitNameList(profile.aliases),
+        appearance: profile.appearance || '',
         hasPrimary: profile.avatarSource === 'custom' && Boolean(profile.customAvatarData),
     };
 }
@@ -575,11 +576,12 @@ async function collectRpgCharacterReferences(prompt, settings = getSettings()) {
     const profile = getCharacterProfile('char', key, settings, false);
     
     if (!profile || !profile.rpgMode || profile.rpgCharacters.length === 0) {
-        return { refs: [], descriptions: [], outfits: [] };
+        return { refs: [], descriptions: [], outfits: [], people: [] };
     }
     
     const refs = [];
     const descriptions = [];
+    const people = [];
     // Active wardrobe outfits of RPG characters mentioned in the prompt
     const outfits = [];
     
@@ -594,6 +596,7 @@ async function collectRpgCharacterReferences(prompt, settings = getSettings()) {
         if (char.appearance) {
             descriptions.push(`[RPG CHARACTER "${char.name}" APPEARANCE]: ${char.appearance}`);
         }
+        people.push({ name: char.name, names: [char.name], appearance: char.appearance || '' });
         
         if (char.avatarData) {
             refs.push({
@@ -606,7 +609,7 @@ async function collectRpgCharacterReferences(prompt, settings = getSettings()) {
         }
     }
     
-    return { refs, descriptions, outfits };
+    return { refs, descriptions, outfits, people };
 }
 
 function getCharacterLibraryKey(character, index = 0) {
@@ -2397,8 +2400,10 @@ async function collectReferenceImages(prompt) {
     // this decision, so people who are not in the scene do not take reference slots.
     const textOnly = ['novelai', 'novelai-direct'].includes(settings.apiType);
     const useNaisteraRefs = settings.apiType === 'naistera';
-    const charAlways = Boolean(useNaisteraRefs ? settings.naisteraSendCharAvatar : settings.sendCharAvatar);
-    const userAlways = Boolean(useNaisteraRefs ? settings.naisteraSendUserAvatar : settings.sendUserAvatar);
+    // «Всегда отправлять аватар» is about pictures; NovelAI gets no pictures, so there a bot/persona is added
+    // only when the prompt mentions them (otherwise e.g. the bot's tags leak into a "2girls" scene without him).
+    const charAlways = !textOnly && Boolean(useNaisteraRefs ? settings.naisteraSendCharAvatar : settings.sendCharAvatar);
+    const userAlways = !textOnly && Boolean(useNaisteraRefs ? settings.naisteraSendUserAvatar : settings.sendUserAvatar);
     const charMentioned = Boolean(charName) && namesAppearInPrompt([charName, ...characterLibrary.names], prompt);
     const userMentioned = Boolean(userName) && namesAppearInPrompt([userName, ...userLibrary.names], prompt);
     const includeChar = Boolean(charName) && (charAlways || (settings.autoDetectNames && charMentioned));
@@ -2408,9 +2413,18 @@ async function collectReferenceImages(prompt) {
     if (includeChar) textDirectives.push(...characterLibrary.descriptions);
     if (includeUser) textDirectives.push(...userLibrary.descriptions);
 
+    // People in the picture with their own appearance text — NovelAI puts each of them into a separate character prompt.
+    // appearanceDirectives marks the generic "[... APPEARANCE]" lines so NovelAI can drop them in favour of `people`.
+    const people = [];
+    const appearanceDirectives = new Set([...characterLibrary.descriptions, ...userLibrary.descriptions]);
+    if (includeChar) people.push({ name: charName, names: [charName, ...characterLibrary.names], appearance: characterLibrary.appearance || '' });
+    if (includeUser) people.push({ name: userName, names: [userName, ...userLibrary.names], appearance: userLibrary.appearance || '' });
+
     // RPG characters (multi-character bots)
     const rpgRefs = await collectRpgCharacterReferences(prompt, settings);
     textDirectives.push(...rpgRefs.descriptions);
+    for (const directive of rpgRefs.descriptions || []) appearanceDirectives.add(directive);
+    people.push(...(rpgRefs.people || []));
 
     // ===== STEP 1: Collect face references (HIGHEST PRIORITY) =====
 
@@ -2472,8 +2486,11 @@ async function collectReferenceImages(prompt) {
             }
 
             if (npc.appearance) {
-                textDirectives.push(`[CHARACTER APPEARANCE for "${npc.name}"]: ${npc.appearance}`);
+                const directive = `[CHARACTER APPEARANCE for "${npc.name}"]: ${npc.appearance}`;
+                textDirectives.push(directive);
+                appearanceDirectives.add(directive);
             }
+            people.push({ name: npc.name, names: [npc.name, ...getNpcAliases(npc)], appearance: npc.appearance || '' });
 
             const activeNpcOutfit = getActiveNpcOutfit(npc);
             if (activeNpcOutfit?.imageData) {
@@ -2540,11 +2557,13 @@ async function collectReferenceImages(prompt) {
     if (['novelai', 'novelai-direct'].includes(settings.apiType)) {
         return {
             imageRefs: [],
-            textOnlyClothing: [...textOnlyClothing, ...clothingRefs.filter(ref => ref.description).map(ref => ({
+            textOnlyClothing: [...textOnlyClothing, ...clothingRefs.filter(ref => ref.description && ref.type !== 'hairstyle').map(ref => ({
                 charName: ref.name,
                 description: ref.description,
             }))],
-            textDirectives,
+            // Appearance goes per person via `people`; everything else (hairstyle/outfit instructions…) stays here.
+            textDirectives: textDirectives.filter(directive => !appearanceDirectives.has(directive)),
+            people,
             warnings,
         };
     }
@@ -2819,21 +2838,74 @@ async function extractNovelAIPng(archive) {
     throw new Error('NovelAI вернул ZIP без PNG.');
 }
 
+const NOVELAI_MAX_CHARACTERS = 6;
+
+/** V4 / V4.5 / V5 models understand separate per-character prompts. */
+function novelAISupportsCharacterPrompts(model) {
+    return /^nai-diffusion-(4|5)/.test(String(model || ''));
+}
+
+/**
+ * Splits a NovelAI prompt written as "scene | character 1 | character 2" and attaches every person's own
+ * appearance + outfit to the segment that names them. People who are in the scene but have no segment of their own
+ * (or the whole prompt when there is no "|") keep their tags in the base caption.
+ * Returns { base: string[], characters: string[] } — tag chunks, not yet joined.
+ */
+function buildNovelAICaptions(prompt, refData = {}) {
+    const people = Array.isArray(refData.people) ? refData.people : [];
+    const outfits = new Map();
+    const addOutfit = (name, description) => {
+        const text = String(description || '').trim();
+        if (!text) return;
+        const key = String(name || '').trim().toLowerCase();
+        outfits.set(key, [...(outfits.get(key) || []), text]);
+    };
+    for (const clothing of (refData.textOnlyClothing || [])) addOutfit(clothing.charName, clothing.description);
+    for (const ref of (refData.imageRefs || [])) if (ref.type === 'clothing') addOutfit(ref.name, ref.description);
+
+    const tagsFor = person => [
+        String(person.appearance || '').trim(),
+        ...(outfits.get(String(person.name || '').trim().toLowerCase()) || []),
+    ].filter(Boolean);
+    const placedOutfits = new Set();
+    const markPlaced = person => placedOutfits.add(String(person.name || '').trim().toLowerCase());
+
+    const segments = String(prompt || '').split('|').map(part => part.trim()).filter(Boolean);
+    const characters = [];
+    const placed = new Set();
+    for (const segment of segments.slice(1, 1 + NOVELAI_MAX_CHARACTERS)) {
+        const person = people.find(candidate => !placed.has(candidate) && namesAppearInPrompt(candidate.names || [candidate.name], segment));
+        if (person) { placed.add(person); markPlaced(person); }
+        characters.push([segment, ...(person ? tagsFor(person) : [])].filter(Boolean).join(', '));
+    }
+    // More segments than NovelAI allows: keep the extra text in the base prompt instead of losing it.
+    const overflow = segments.slice(1 + NOVELAI_MAX_CHARACTERS);
+
+    const base = [];
+    for (const person of people) {
+        if (placed.has(person)) continue;
+        base.push(...tagsFor(person));
+        markPlaced(person);
+    }
+    // Outfits of people without an appearance entry (e.g. only a wardrobe item) are not lost either.
+    for (const [key, list] of outfits) if (!placedOutfits.has(key)) base.push(...list);
+    base.push(segments[0] || '', ...overflow);
+    return { base: base.filter(Boolean), characters };
+}
+
 // Both NovelAI routes use text descriptions only, not image references.
 async function generateImageNovelAI(prompt, style, refData = {}, options = {}) {
     const settings = getSettings();
+    const captions = buildNovelAICaptions(prompt, refData);
     const parts = [];
     if (style) parts.push(style);
     parts.push(...(refData.textDirectives || []));
-    for (const clothing of (refData.textOnlyClothing || [])) {
-        if (clothing.description) parts.push(`${clothing.charName || 'Character'} is wearing: ${clothing.description}`);
-    }
-    // Image references are not forwarded by SillyTavern's stock endpoint.
-    // Keep any descriptions attached to wardrobe references as text.
-    for (const ref of (refData.imageRefs || [])) {
-        if (ref.type === 'clothing' && ref.description) parts.push(`${ref.name || 'Character'} is wearing: ${ref.description}`);
-    }
-    parts.push(prompt);
+    parts.push(...captions.base);
+    // Separate character prompts exist only in the direct API with V4+ models; SillyTavern's endpoint gets one string,
+    // where each character's tags at least follow that character's own part of the prompt.
+    const useCharacterPrompts = settings.apiType === 'novelai-direct'
+        && novelAISupportsCharacterPrompts(settings.novelaiModel) && captions.characters.length > 0;
+    if (!useCharacterPrompts) parts.push(...captions.characters);
 
     const ratio = String(options.aspectRatio || '');
     let width = Number(settings.novelaiWidth);
@@ -2867,7 +2939,8 @@ async function generateImageNovelAI(prompt, style, refData = {}, options = {}) {
     const direct = settings.apiType === 'novelai-direct';
     const token = direct ? normalizeApiKey(settings.novelaiApiKey) : '';
     if (direct && !token) throw new Error('Введите NovelAI Access Token в настройках haruspics.');
-    iigLog('INFO', `NovelAI ${direct ? 'direct' : 'SillyTavern'}: model=${body.model}, size=${width}x${height}, text=${body.prompt.length} chars`);
+    const characterCaptions = useCharacterPrompts ? captions.characters : [];
+    iigLog('INFO', `NovelAI ${direct ? 'direct' : 'SillyTavern'}: model=${body.model}, size=${width}x${height}, text=${body.prompt.length} chars, character prompts=${characterCaptions.length}`);
     const negative = body.negative_prompt || '';
     const directBody = direct ? {
         action: 'generate', input: body.prompt, model: body.model,
@@ -2881,10 +2954,11 @@ async function generateImageNovelAI(prompt, style, refData = {}, options = {}) {
             controlnet_strength: 1, deliberate_euler_ancestral_bug: false,
             dynamic_thresholding: body.decrisper, legacy: false, legacy_v3_extend: false,
             sm: body.sm, sm_dyn: body.sm_dyn, uncond_scale: 1,
-            skip_cfg_above_sigma: null, use_coords: false, characterPrompts: [],
+            skip_cfg_above_sigma: null, use_coords: false,
+            characterPrompts: characterCaptions.map(text => ({ prompt: text, uc: '', center: { x: 0.5, y: 0.5 }, enabled: true })),
             reference_image_multiple: [], reference_information_extracted_multiple: [], reference_strength_multiple: [],
-            v4_negative_prompt: { caption: { base_caption: negative, char_captions: [] } },
-            v4_prompt: { caption: { base_caption: body.prompt, char_captions: [] }, use_coords: false, use_order: true },
+            v4_negative_prompt: { caption: { base_caption: negative, char_captions: characterCaptions.map(() => ({ char_caption: '', centers: [{ x: 0.5, y: 0.5 }] })) }, legacy_uc: false },
+            v4_prompt: { caption: { base_caption: body.prompt, char_captions: characterCaptions.map(text => ({ char_caption: text, centers: [{ x: 0.5, y: 0.5 }] })) }, use_coords: false, use_order: true },
         },
     } : null;
     const response = await fetch(direct ? 'https://image.novelai.net/ai/generate-image' : '/api/novelai/generate-image', {
@@ -5959,7 +6033,7 @@ function createSettingsUI() {
                                 <input type="checkbox" id="iig_auto_detect_names" ${settings.autoDetectNames ? 'checked' : ''}>
                                 <span>Авто-определение имён в промпте</span>
                             </label>
-                            <p class="hint">Если имя персонажа/юзера найдено в промпте картинки, аватар отправится автоматически.</p>
+                            <p class="hint">Персонаж, юзер и NPC попадают в картинку (лицо, внешность, наряд), только если их имя есть в промпте. Имена ищутся и транслитом (Виктор → Viktor), дополнительные имена — в профилях и у NPC. «Всегда отправлять» ниже добавляет человека даже без упоминания; для NovelAI эти галочки не действуют.</p>
 
                             <label class="checkbox_label">
                                 <input type="checkbox" id="iig_send_char_avatar" ${settings.sendCharAvatar ? 'checked' : ''}>

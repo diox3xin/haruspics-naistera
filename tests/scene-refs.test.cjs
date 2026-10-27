@@ -62,3 +62,9 @@ test('NPCs are found by aliases and transliteration; disabled NPCs are skipped',
     assert.deepEqual(names(result.imageRefs), ['face:Тихонов']);
     assert.match(result.textDirectives.join(' '), /red curls/);
 });
+
+test('NovelAI ignores «Всегда отправлять»: an unmentioned bot does not leak into the picture', async () => {
+    const result = await collector({ apiType: 'novelai', sendCharAvatar: true, sendUserAvatar: true })('2girls, Gretchen and Eva at a cafe');
+    assert.deepEqual(Array.from(result.people, p => p.name), ['Ева Гринёва']);
+    assert.doesNotMatch(result.textDirectives.join(' '), /char appearance/);
+});

@@ -12,10 +12,10 @@ function section(start, end) {
     return source.slice(from, to);
 }
 
-function collector(config = {}, outfit = {}, hair = null, refs = []) {
+function collector(config = {}, outfit = {}, hair = null, refs = [], prompt = 'forest') {
     const context = vm.createContext({
         // «Всегда отправлять» on: these tests are about wardrobe modes, not about who is in the scene.
-        getSettings: () => ({ apiType: 'naistera', npcReferences: [], naisteraSendCharAvatar: true, naisteraSendUserAvatar: true, sendCharAvatar: true, sendUserAvatar: true, ...config }),
+        getSettings: () => ({ apiType: 'naistera', npcReferences: [], autoDetectNames: true, naisteraSendCharAvatar: true, naisteraSendUserAvatar: true, sendCharAvatar: true, sendUserAvatar: true, ...config }),
         SillyTavern: { getContext: () => ({ characters: [{ name: 'Hero' }], characterId: 0, name1: 'User' }) },
         collectCharacterProfileReferences: async kind => ({ descriptions: [], names: [], refs: kind === 'char' ? refs : [], hasPrimary: true }),
         namesAppearInPrompt: (names, prompt) => names.some(name => name && String(prompt).toLowerCase().includes(String(name).toLowerCase())),
@@ -26,7 +26,9 @@ function collector(config = {}, outfit = {}, hair = null, refs = []) {
         detectMimeType: () => 'image/png', iigLog: () => {}, MAX_IMAGE_REFS: 4,
     });
     vm.runInContext(section('async function collectReferenceImages(', '// IMAGE GENERATION: OpenAI'), context);
-    return context.collectReferenceImages('forest');
+    // NovelAI never uses «Всегда отправлять»: there people are included only when the prompt names them.
+    const isNovelAI = ['novelai', 'novelai-direct'].includes(config.apiType);
+    return context.collectReferenceImages(isNovelAI && prompt === 'forest' ? 'Hero and User in a forest' : prompt);
 }
 
 test('text-only wardrobe excludes its images for both character and user', async () => {

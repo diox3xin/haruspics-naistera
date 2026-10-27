@@ -18,6 +18,9 @@ const activePromptAbortControllers = new Map();
 const expandedPromptPanels = new Set();
 // Bot replies that have just been generated: «Авто» writes their image prompt once they are rendered.
 const pendingAutoPrompts = new Set();
+// messageId → { panel, mesEl }: the panel lives inside the reply text and is put back when SillyTavern re-renders it.
+const promptPanels = new Map();
+let promptPanelObserver = null;
 
 const logBuffer = [];
 const MAX_LOG_ENTRIES = 200;
@@ -153,11 +156,17 @@ const defaultSettings = Object.freeze({
     promptPanelCollapsed: false,
     // Write the image prompt by itself after every new bot reply.
     promptAutoGenerate: false,
+    // Where the picture / prompt block sits in a bot reply: 'middle' of the text or the 'end'.
+    promptPanelPosition: 'middle',
     // Meta (style/negative) collapsed by default (extblocks mode only)
     promptMetaCollapsed: false,
     promptAppearanceOpen: false,
     // Format of «Описать по аватарке» in profiles: '' = same as «Формат описаний», or 'banana' / 'novelai'.
     profileDescFormat: '',
+    // «Описать по аватарке» also reads the card / persona description (one switch for both profiles).
+    profileDescribeWithCard: false,
+    // Format for NPC appearance / outfit descriptions: '' = same as «Формат описаний».
+    npcDescFormat: '',
     // Random Gemini format per request (aspect+size picked by the model)
     geminiRandomFormat: false,
     // ===== Reference Generator =====
@@ -1462,6 +1471,12 @@ function getVisionDescFormat(settings = getSettings()) {
     return settings.wardrobeDescFormat === 'novelai' ? 'novelai' : 'banana';
 }
 
+/** Format for NPC appearance and outfit descriptions. */
+function getNpcDescFormat(settings = getSettings()) {
+    if (settings.npcDescFormat === 'novelai' || settings.npcDescFormat === 'banana') return settings.npcDescFormat;
+    return getVisionDescFormat(settings);
+}
+
 /** Format for describing the bot / persona appearance in profiles. */
 function getProfileDescFormat(settings = getSettings()) {
     if (settings.profileDescFormat === 'novelai' || settings.profileDescFormat === 'banana') return settings.profileDescFormat;
@@ -1735,9 +1750,10 @@ async function generateNpcAppearanceDescription(npcIndex) {
     const npc = settings.npcReferences?.[npcIndex];
     if (!npc?.imageData) throw new Error('Сначала загрузите картинку NPC');
 
-    const promptText = getVisionPrompt('appearance', settings);
+    const format = getNpcDescFormat(settings);
+    const promptText = getVisionPrompt('appearance', settings, format);
 
-    const description = await generateVisionDescriptionFromImage(npc.imageData, promptText);
+    const description = await generateVisionDescriptionFromImage(npc.imageData, promptText, format);
     iigLog('INFO', `Generated NPC appearance for "${npc.name}": ${description.substring(0, 100)}...`);
     return description;
 }
@@ -1812,8 +1828,9 @@ async function generateNpcOutfitDescription(npcIndex, outfitId) {
     const outfit = npc.outfits.find(i => i.id === outfitId);
     if (!outfit?.imageData) throw new Error('Нет данных изображения');
 
-    const promptText = getVisionPrompt('outfit', settings);
-    const description = await generateVisionDescriptionFromImage(outfit.imageData, promptText);
+    const format = getNpcDescFormat(settings);
+    const promptText = getVisionPrompt('outfit', settings, format);
+    const description = await generateVisionDescriptionFromImage(outfit.imageData, promptText, format);
 
     iigLog('INFO', `Generated NPC outfit for "${npc.name}" / "${outfit.name}": ${description.substring(0, 100)}...`);
     return description;
@@ -2327,6 +2344,11 @@ const SETTINGS_TABS = Object.freeze([
         { id: 'display', label: 'Отображение', icon: 'fa-image', sections: ['display_mode'] },
         { id: 'errors', label: 'Повторы и логи', icon: 'fa-gear', sections: ['errors'] },
     ] },
+    { id: 'people', label: 'Персонажи', icon: 'fa-users', subs: [
+        { id: 'profiles', label: 'Профили персонажей', icon: 'fa-id-card', sections: ['character_library', 'avatars'] },
+        { id: 'npc', label: 'NPC', icon: 'fa-masks-theater', sections: ['npc'] },
+        { id: 'refgen', label: 'API рефов', icon: 'fa-dna', sections: ['refgen'] },
+    ] },
     { id: 'prompt', label: 'Промпт и стиль', icon: 'fa-wand-magic-sparkles', subs: [
         { id: 'generator', label: 'Генератор промпта', icon: 'fa-wand-magic-sparkles', sections: ['prompt_generator'] },
         { id: 'style', label: 'Стили и негативы', icon: 'fa-palette', sections: ['style'] },
@@ -2336,12 +2358,6 @@ const SETTINGS_TABS = Object.freeze([
         { id: 'hair', label: 'Причёски', icon: 'fa-scissors', byTarget: { char: 'hairstyle_char', user: 'hairstyle_user' } },
         { id: 'send', label: 'Отправка', icon: 'fa-paper-plane', sections: ['wardrobe_inject', 'hairstyle_mode'] },
         { id: 'vision', label: 'Описание по фото', icon: 'fa-eye', sections: ['vision'] },
-    ] },
-    { id: 'people', label: 'Персонажи', icon: 'fa-users', subs: [
-        { id: 'profiles', label: 'Профили', icon: 'fa-id-card', sections: ['character_library'] },
-        { id: 'avatars', label: 'Аватары', icon: 'fa-user', sections: ['avatars'] },
-        { id: 'npc', label: 'NPC', icon: 'fa-masks-theater', sections: ['npc'] },
-        { id: 'refgen', label: 'API рефов', icon: 'fa-dna', sections: ['refgen'] },
     ] },
 ]);
 
@@ -4211,7 +4227,7 @@ function createLoadingPlaceholder(tagId, onCancel) {
         const x = document.createElement('div');
         x.title = 'Отменить генерацию';
         x.innerHTML = '<i class="fa-solid fa-xmark"></i>';
-        x.style.cssText = 'position:absolute;top:4px;right:4px;width:22px;height:22px;display:flex;align-items:center;justify-content:center;cursor:pointer;opacity:0.5;border-radius:50%;background:rgba(0,0,0,0.4);color:#fff;font-size:12px;z-index:1;';
+        x.style.cssText = 'position:absolute;top:4px;right:4px;width:22px;height:22px;display:flex;align-items:center;justify-content:center;cursor:pointer;opacity:0.5;border-radius:50%;background:rgba(0,0,0,0.4);color:#fff;font-size:13px;z-index:1;';
         x.addEventListener('mouseenter', () => { x.style.opacity = '1'; });
         x.addEventListener('mouseleave', () => { x.style.opacity = '0.5'; });
         x.addEventListener('click', (e) => {
@@ -4723,23 +4739,67 @@ function addButtonsToExistingMessages() {
     }
 }
 
-function ensurePromptPanelForMessage(messageElement, messageId) {
+function ensurePromptPanelForMessage(messageElement, messageId, { rerender = false } = {}) {
     if (!messageElement || messageId == null) return null;
     const context = SillyTavern.getContext();
     const message = context.chat?.[messageId];
     if (!message || message.is_user) return null;
-    let panel = messageElement.querySelector('.iig-prompt-panel');
+    const known = promptPanels.get(messageId);
+    let panel = known?.mesEl === messageElement ? known.panel : messageElement.querySelector('.iig-prompt-panel');
     const isNew = !panel;
     if (!panel) {
         panel = document.createElement('div');
         panel.className = 'iig-prompt-panel';
-        const text = messageElement.querySelector('.mes_text');
-        // Keep the panel outside mes_text so formatting by ST, ExtBlocks, or
-        // Horae cannot erase or duplicate it while rebuilding message HTML.
-        (text?.parentElement || messageElement).appendChild(panel);
     }
-    if (isNew) renderPromptPanel(panel, messageId);
+    promptPanels.set(messageId, { panel, mesEl: messageElement });
+    placePromptPanel(messageElement, panel);
+    if (isNew || (rerender && !activePromptAbortControllers.has(messageId))) renderPromptPanel(panel, messageId);
     return panel;
+}
+
+/**
+ * Puts the block in the middle of the reply (after the middle paragraph) or after the text.
+ * ExtBlocks mode always uses the end: there the reply HTML is rebuilt into artifacts.
+ */
+function placePromptPanel(messageElement, panel) {
+    const text = messageElement.querySelector('.mes_text');
+    const settings = getSettings();
+    const middle = settings.promptPanelPosition !== 'end' && normalizeImageDisplayMode(settings.imageDisplayMode) !== 'extblocks';
+    if (!text || !middle) {
+        const host = text?.parentElement || messageElement;
+        if (panel.parentElement !== host || (text && panel.previousElementSibling !== text && host.lastElementChild !== panel)) host.appendChild(panel);
+        return;
+    }
+    const blocks = [...text.children].filter(child => child !== panel && !child.classList.contains('iig-prompt-panel') && !/^(BR|SCRIPT|STYLE)$/.test(child.tagName));
+    if (blocks.length < 2) {
+        if (panel.parentElement !== text || text.lastElementChild !== panel) text.appendChild(panel);
+        return;
+    }
+    const anchor = blocks[Math.ceil(blocks.length / 2) - 1];
+    if (panel.previousElementSibling !== anchor || panel.parentElement !== text) anchor.after(panel);
+}
+
+/** SillyTavern rebuilds the reply HTML on edits, swipes and streaming — put lost panels back. */
+function observePromptPanels() {
+    const chat = document.getElementById('chat');
+    if (!chat || promptPanelObserver) return;
+    let scheduled = false;
+    promptPanelObserver = new MutationObserver(() => {
+        if (scheduled) return;
+        scheduled = true;
+        requestAnimationFrame(() => {
+            scheduled = false;
+            for (const [messageId, entry] of promptPanels) {
+                if (!entry.mesEl.isConnected) { promptPanels.delete(messageId); continue; }
+                if (!entry.mesEl.contains(entry.panel)) placePromptPanel(entry.mesEl, entry.panel);
+            }
+        });
+    });
+    promptPanelObserver.observe(chat, { childList: true, subtree: true });
+}
+
+function replaceAllPromptPanels() {
+    for (const entry of promptPanels.values()) if (entry.mesEl.isConnected) placePromptPanel(entry.mesEl, entry.panel);
 }
 
 /** «Внешность» under the prompt: the same profile appearance fields as in Персонажи → Профили. */
@@ -4783,6 +4843,53 @@ function bindPromptAppearance(panel) {
     });
 }
 
+/** Saves a generated picture (same-origin path or data URL) under its own file name. */
+function downloadGeneratedImage(src) {
+    const url = String(src || '');
+    if (!url) return;
+    const name = decodeURIComponent(url.split('?')[0].split('/').pop() || '') || `image_${Date.now()}.png`;
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = /^data:/.test(url) ? `image_${Date.now()}.png` : name;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+}
+
+/** Full-screen preview of a generated picture with a download button. Esc, ✕ or a click beside the picture closes it. */
+function openImageViewer(src, caption = '') {
+    if (!src) return;
+    document.getElementById('iig-image-viewer')?.remove();
+    const previousFocus = document.activeElement;
+    const viewer = document.createElement('div');
+    viewer.id = 'iig-image-viewer';
+    viewer.setAttribute('role', 'dialog');
+    viewer.setAttribute('aria-modal', 'true');
+    viewer.setAttribute('aria-label', 'Просмотр картинки');
+    viewer.innerHTML = `
+        <div class="iig-viewer-bar">
+            <button type="button" class="iig-viewer-btn iig-viewer-download"><i class="fa-solid fa-download" aria-hidden="true"></i><span>Скачать</span></button>
+            <button type="button" class="iig-viewer-btn iig-viewer-close" aria-label="Закрыть"><i class="fa-solid fa-xmark" aria-hidden="true"></i></button>
+        </div>
+        <img class="iig-viewer-image" src="${escapeHtml(src)}" alt="${escapeHtml(caption || 'Картинка')}">`;
+    const close = () => {
+        document.removeEventListener('keydown', onKey, true);
+        viewer.remove();
+        previousFocus?.focus?.();
+    };
+    const onKey = event => {
+        if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); close(); }
+    };
+    viewer.addEventListener('click', event => {
+        if (event.target === viewer) close();
+    });
+    viewer.querySelector('.iig-viewer-close').addEventListener('click', close);
+    viewer.querySelector('.iig-viewer-download').addEventListener('click', () => downloadGeneratedImage(src));
+    document.addEventListener('keydown', onKey, true);
+    document.body.appendChild(viewer);
+    viewer.querySelector('.iig-viewer-close').focus();
+}
+
 /** Short fingerprint of the reply text: «Авто» does not write a prompt again for a reply that already has one. */
 function promptSourceHash(text) {
     let hash = 0;
@@ -4791,6 +4898,8 @@ function promptSourceHash(text) {
 }
 
 function getPromptPanel(messageId) {
+    const known = promptPanels.get(messageId)?.panel;
+    if (known?.isConnected) return known;
     return document.querySelector(`#chat .mes[mesid="${messageId}"] .iig-prompt-panel`);
 }
 
@@ -4824,11 +4933,11 @@ function updatePromptPanelChrome(panel, messageId, { status = '', error = false 
     }
     const statusLine = panel.querySelector('.iig-prompt-status');
     if (statusLine && status) statusLine.textContent = status;
-    const cancel = panel.querySelector('.iig-prompt-cancel');
-    if (cancel) cancel.hidden = !(writing || drawing);
-    const generate = panel.querySelector('.iig-prompt-generate');
-    if (generate) generate.hidden = writing;
-    panel.querySelector('.iig-image-from-prompt')?.classList.toggle('disabled', drawing);
+    const badge = panel.querySelector('.iig-pp-busy-badge');
+    if (badge) badge.textContent = writing ? 'Пишу промпт…' : drawing ? 'Рисую…' : '';
+    panel.querySelectorAll('.iig-prompt-cancel').forEach(cancel => { cancel.hidden = !(writing || drawing); });
+    panel.querySelectorAll('.iig-prompt-generate').forEach(generate => { generate.hidden = writing; });
+    panel.querySelectorAll('.iig-image-from-prompt').forEach(button => button.classList.toggle('disabled', drawing));
 }
 
 function setPromptPanelExpanded(panel, messageId, expanded) {
@@ -4837,8 +4946,10 @@ function setPromptPanelExpanded(panel, messageId, expanded) {
     panel.querySelector('.iig-prompt-panel-body')?.classList.toggle('iig-collapsed-hidden', !expanded);
     panel.querySelectorAll('.iig-prompt-panel-toggle').forEach(button => {
         button.setAttribute('aria-expanded', String(expanded));
-        button.title = expanded ? 'Свернуть' : 'Развернуть';
+        button.title = expanded ? 'Свернуть' : (button.classList.contains('iig-pp-details') ? 'Подробнее: промпт и настройки' : 'Развернуть');
     });
+    const details = panel.querySelector('.iig-pp-details span');
+    if (details) details.textContent = expanded ? 'Свернуть' : 'Подробнее';
 }
 
 /** Writes the image prompt for a reply; used by the «Промпт» button and by «Авто». */
@@ -4926,10 +5037,22 @@ function renderPromptPanel(panel, messageId) {
     const image = state.imagePath ? escapeHtml(state.imagePath) : '';
 
     panel.classList.add('iig-pp');
+    panel.classList.toggle('has-image', Boolean(image));
     panel.innerHTML = `
+        ${image ? `<figure class="iig-pp-figure">
+            <button type="button" class="iig-pp-image-open" title="Открыть на весь экран"><img class="iig-prompt-result-image" src="${image}" alt="${escapeHtml(state.prompt || 'Картинка')}"></button>
+            <span class="iig-pp-busy-badge" aria-live="polite"></span>
+            <figcaption class="iig-pp-figure-actions">
+                <button type="button" class="iig-pp-image-btn iig-pp-image-download" title="Скачать картинку" aria-label="Скачать"><i class="fa-solid fa-download" aria-hidden="true"></i></button>
+                <button type="button" class="iig-pp-image-btn iig-image-from-prompt" title="Перерисовать по этому промпту" aria-label="Перерисовать"><i class="fa-solid fa-rotate-right" aria-hidden="true"></i></button>
+                <button type="button" class="iig-pp-image-btn iig-prompt-cancel" hidden title="Остановить" aria-label="Остановить"><i class="fa-solid fa-stop" aria-hidden="true"></i></button>
+                <button type="button" class="iig-pp-image-btn iig-pp-image-full" title="Открыть на весь экран" aria-label="На весь экран"><i class="fa-solid fa-expand" aria-hidden="true"></i></button>
+                <button type="button" class="iig-pp-image-btn iig-pp-details iig-prompt-panel-toggle" aria-expanded="${expanded}" title="Подробнее: промпт и настройки"><i class="fa-solid fa-sliders" aria-hidden="true"></i><span>Подробнее</span></button>
+            </figcaption>
+        </figure>` : ''}
         <div class="iig-pp-head">
             <button type="button" class="iig-pp-summary iig-prompt-panel-toggle" aria-expanded="${expanded}" title="${expanded ? 'Свернуть' : 'Развернуть'}">
-                <span class="iig-pp-thumb">${image ? `<img src="${image}" alt="">` : '<i class="fa-solid fa-wand-magic-sparkles" aria-hidden="true"></i>'}</span>
+                <span class="iig-pp-thumb"><i class="fa-solid fa-wand-magic-sparkles" aria-hidden="true"></i></span>
                 <span class="iig-pp-text">
                     <span class="iig-pp-title">Промпт картинки <span class="iig-pp-chip iig-prompt-chip"></span></span>
                     <span class="iig-pp-preview"></span>
@@ -4941,12 +5064,15 @@ function renderPromptPanel(panel, messageId) {
                 <button type="button" class="menu_button iig-pp-btn iig-image-from-prompt" title="Нарисовать картинку по промпту"><i class="fa-solid fa-image" aria-hidden="true"></i><span>Картинка</span></button>
                 <button type="button" class="iig-pp-chevron iig-prompt-panel-toggle" aria-expanded="${expanded}" title="${expanded ? 'Свернуть' : 'Развернуть'}" aria-label="Развернуть панель промпта"><i class="fa-solid fa-chevron-down" aria-hidden="true"></i></button>
             </div>
-            <div class="iig-pp-progress" aria-hidden="true"></div>
         </div>
         <div class="iig-pp-body iig-prompt-panel-body ${expanded ? '' : 'iig-collapsed-hidden'}">
-            ${image ? `<img class="iig-prompt-result-image" src="${image}" alt="${escapeHtml(state.prompt || 'Картинка')}">` : ''}
             <div class="iig-pp-toolbar iig-prompt-panel-controls">
                 <span class="iig-pp-instruction iig-prompt-selection" title="Инструкция для модели промпта — выбирается в настройках"><i class="fa-solid fa-scroll" aria-hidden="true"></i> ${escapeHtml(instruction.name)}</span>
+                <span class="iig-pp-main-actions">
+                    <button type="button" class="menu_button iig-pp-pill iig-pp-primary iig-prompt-generate" title="Написать промпт по этому ответу"><i class="fa-solid fa-wand-magic-sparkles" aria-hidden="true"></i> Промпт</button>
+                    <button type="button" class="menu_button iig-pp-pill iig-pp-primary iig-prompt-cancel" hidden title="Остановить"><i class="fa-solid fa-stop" aria-hidden="true"></i> Стоп</button>
+                    <button type="button" class="menu_button iig-pp-pill iig-pp-primary iig-image-from-prompt" title="Нарисовать картинку по промпту"><i class="fa-solid fa-image" aria-hidden="true"></i> ${image ? 'Перерисовать' : 'Картинка'}</button>
+                </span>
                 <span class="iig-pp-toggles">
                     <button type="button" class="menu_button iig-pp-pill iig-prompt-auto-toggle${settings.promptAutoGenerate ? ' is-on' : ''}" aria-pressed="${!!settings.promptAutoGenerate}" title="Писать промпт самим после каждого нового ответа бота"><i class="fa-solid fa-rotate" aria-hidden="true"></i> Авто</button>
                     <button type="button" class="menu_button iig-pp-pill iig-prompt-stream-toggle${settings.promptGenStream ? ' iig-stream-on is-on' : ''}" aria-pressed="${!!settings.promptGenStream}" title="Показывать промпт, пока он пишется"><i class="fa-solid fa-bolt" aria-hidden="true"></i> Стрим</button>
@@ -4963,10 +5089,16 @@ function renderPromptPanel(panel, messageId) {
                     <dt>Негатив</dt><dd>${escapeHtml(negative || 'не выбран')}</dd>
                 </dl>
             </details>
-        </div>`;
+        </div>
+        <div class="iig-pp-progress" aria-hidden="true"></div>`;
 
     setPromptPanelExpanded(panel, messageId, expanded);
     updatePromptPanelChrome(panel, messageId);
+
+    const openViewer = () => openImageViewer(state.imagePath, state.prompt);
+    panel.querySelector('.iig-pp-image-open')?.addEventListener('click', openViewer);
+    panel.querySelector('.iig-pp-image-full')?.addEventListener('click', openViewer);
+    panel.querySelector('.iig-pp-image-download')?.addEventListener('click', () => downloadGeneratedImage(state.imagePath));
 
     panel.querySelectorAll('.iig-prompt-panel-toggle').forEach(button => button.addEventListener('click', () => {
         setPromptPanelExpanded(panel, messageId, !expandedPromptPanels.has(messageId));
@@ -4995,12 +5127,12 @@ function renderPromptPanel(panel, messageId) {
         await context.saveChat();
     });
 
-    panel.querySelector('.iig-prompt-cancel')?.addEventListener('click', () => {
+    panel.querySelectorAll('.iig-prompt-cancel').forEach(button => button.addEventListener('click', () => {
         activePromptAbortControllers.get(messageId)?.abort();
         activeAbortControllers.get(messageId)?.abort();
-    });
-    panel.querySelector('.iig-prompt-generate')?.addEventListener('click', () => runPromptGeneration(messageId));
-    panel.querySelector('.iig-image-from-prompt')?.addEventListener('click', () => runImageFromPrompt(messageId));
+    }));
+    panel.querySelectorAll('.iig-prompt-generate').forEach(button => button.addEventListener('click', () => runPromptGeneration(messageId)));
+    panel.querySelectorAll('.iig-image-from-prompt').forEach(button => button.addEventListener('click', () => runImageFromPrompt(messageId)));
 
     const syncToggle = (selector, value, extraClass) => document.querySelectorAll(selector).forEach(button => {
         button.classList.toggle('is-on', value);
@@ -5044,7 +5176,7 @@ async function onMessageReceived(messageId) {
     const el = document.querySelector(`#chat .mes[mesid="${messageId}"]`);
     if (!el) return;
     addRegenerateButton(el, messageId);
-    ensurePromptPanelForMessage(el, messageId);
+    ensurePromptPanelForMessage(el, Number(messageId), { rerender: true });
     if (pendingAutoPrompts.delete(Number(messageId))) maybeAutoGeneratePrompt(Number(messageId));
     await processMessageTags(messageId);
     await restoreImageRegenButtons(el, messageId);
@@ -5061,7 +5193,7 @@ function renderNpcList() {
     container.innerHTML = '';
 
     if (!settings.npcReferences || settings.npcReferences.length === 0) {
-        container.innerHTML = '<p style="color:#5a5252;font-size:11px;">Нет добавленных NPC</p>';
+        container.innerHTML = '<p style="color:#5a5252;font-size:13px;">Нет добавленных NPC</p>';
         return;
     }
 
@@ -5127,7 +5259,7 @@ function renderNpcList() {
         if (aliasList.length) {
             const aliasHint = document.createElement('small');
             aliasHint.textContent = aliasList.join(', ');
-            aliasHint.style.cssText = 'display:block;color:#7a7272;font-size:10px;font-weight:400;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;';
+            aliasHint.style.cssText = 'display:block;color:#7a7272;font-size:12px;font-weight:400;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;';
             nameSpan.appendChild(aliasHint);
         }
 
@@ -5167,7 +5299,7 @@ function renderNpcList() {
                             ? `<img src="data:image/png;base64,${outfit.imageData}" style="width:100%;height:100%;object-fit:cover;">`
                             : `<i class="fa-solid fa-shirt" style="color:#666;"></i>`}
                     </div>
-                    <div style="padding:4px;font-size:9px;color:#fff;text-align:center;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${outfit.name}</div>
+                    <div style="padding:4px;font-size:11px;color:#fff;text-align:center;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${outfit.name}</div>
                 </div>
             `;
         }).join('');
@@ -5176,64 +5308,64 @@ function renderNpcList() {
         detailsPanel.style.cssText = 'display:none;padding-top:8px;border-top:1px solid rgba(255,255,255,0.05);';
         detailsPanel.innerHTML = `
             <div style="margin-bottom:8px;">
-                <label style="font-size:11px;color:#9a9292;display:block;margin-bottom:3px;">Другие имена (через запятую):</label>
+                <label style="font-size:13px;color:#9a9292;display:block;margin-bottom:3px;">Другие имена (через запятую):</label>
                 <div class="iig-names-row">
-                    <input type="text" class="text_pole npc-aliases-input" data-npc-index="${i}" style="font-size:11px;"
+                    <input type="text" class="text_pole npc-aliases-input" data-npc-index="${i}" style="font-size:13px;"
                         placeholder="Misha, Orekhov, Миша…" value="${escapeHtml(getNpcAliases(npc).join(', '))}">
                     <button type="button" class="menu_button iig-names-generate npc-aliases-generate" title="Сгенерировать варианты имени и фамилии на русском и английском (модель описаний гардероба или модель чата)" aria-label="Сгенерировать имена"><i class="fa-solid fa-wand-magic-sparkles" aria-hidden="true"></i></button>
                 </div>
-                <div style="font-size:10px;color:#7a7272;margin-top:2px;">Реф уходит, если в промпте есть имя, любое из этих слов или их транслит (Орехов → Orekhov).</div>
+                <div style="font-size:12px;color:#7a7272;margin-top:2px;">Реф уходит, если в промпте есть имя, любое из этих слов или их транслит (Орехов → Orekhov).</div>
             </div>
             <div style="margin-bottom:8px;">
-                <label style="font-size:11px;color:#9a9292;display:block;margin-bottom:3px;">Описание внешности:</label>
-                <textarea class="text_pole npc-appearance-input" rows="3" style="width:100%;font-size:11px;resize:vertical;"
+                <label style="font-size:13px;color:#9a9292;display:block;margin-bottom:3px;">Описание внешности:</label>
+                <textarea class="text_pole npc-appearance-input" rows="3" style="width:100%;font-size:13px;resize:vertical;"
                     placeholder="Опишите внешность NPC..."
                     data-npc-index="${i}">${npc.appearance || ''}</textarea>
                 <div style="display:flex;gap:6px;margin-top:4px;">
-                    <div class="menu_button npc-appearance-generate" data-npc-index="${i}" style="font-size:11px;">
+                    <div class="menu_button iig-npc-text-btn npc-appearance-generate" data-npc-index="${i}" style="font-size:13px;">
                         <i class="fa-solid fa-robot"></i> Сгенерировать
                     </div>
-                    <div class="menu_button npc-appearance-save" data-npc-index="${i}" style="font-size:11px;">
+                    <div class="menu_button iig-npc-text-btn npc-appearance-save" data-npc-index="${i}" style="font-size:13px;">
                         <i class="fa-solid fa-floppy-disk"></i> Сохранить
                     </div>
                 </div>
-                <div id="npc_appearance_status_${i}" style="display:none;font-size:10px;margin-top:4px;"></div>
+                <div id="npc_appearance_status_${i}" style="display:none;font-size:12px;margin-top:4px;"></div>
             </div>
 
             <div style="margin-bottom:8px;">
-                <label style="font-size:11px;color:#9a9292;display:block;margin-bottom:3px;">Наряды NPC:</label>
+                <label style="font-size:13px;color:#9a9292;display:block;margin-bottom:3px;">Наряды NPC:</label>
                 <div style="display:flex;gap:6px;margin-bottom:6px;align-items:center;">
-                    <input type="text" class="text_pole npc-outfit-name" data-npc-index="${i}" placeholder="Название наряда..." style="flex:1;font-size:11px;">
-                    <div class="menu_button npc-outfit-add" data-npc-index="${i}" style="font-size:11px;">
+                    <input type="text" class="text_pole npc-outfit-name" data-npc-index="${i}" placeholder="Название наряда..." style="flex:1;font-size:13px;">
+                    <div class="menu_button iig-npc-text-btn npc-outfit-add" data-npc-index="${i}" style="font-size:13px;">
                         <i class="fa-solid fa-plus"></i> Добавить
                     </div>
                 </div>
                 <div class="npc-outfits-grid" style="display:flex;flex-wrap:wrap;gap:8px;max-height:180px;overflow-y:auto;margin-bottom:8px;">
-                    ${outfitsHtml || '<div style="color:#666;font-size:11px;">Нарядов пока нет</div>'}
+                    ${outfitsHtml || '<div style="color:#666;font-size:13px;">Нарядов пока нет</div>'}
                 </div>
             </div>
 
             ${activeNpcOutfit ? `
                 <div>
-                    <label style="font-size:11px;color:#9a9292;display:block;margin-bottom:3px;">Описание активного наряда: <b>${activeNpcOutfit.name}</b></label>
-                    <textarea class="text_pole npc-outfit-description" rows="3" style="width:100%;font-size:11px;resize:vertical;"
+                    <label style="font-size:13px;color:#9a9292;display:block;margin-bottom:3px;">Описание активного наряда: <b>${activeNpcOutfit.name}</b></label>
+                    <textarea class="text_pole npc-outfit-description" rows="3" style="width:100%;font-size:13px;resize:vertical;"
                         data-npc-index="${i}" data-outfit-id="${activeNpcOutfit.id}"
                         placeholder="Введите описание наряда вручную или сгенерируйте...">${activeNpcOutfit.description || ''}</textarea>
                     <div style="display:flex;gap:6px;margin-top:4px;flex-wrap:wrap;">
-                        <div class="menu_button npc-outfit-generate" data-npc-index="${i}" data-outfit-id="${activeNpcOutfit.id}" style="font-size:11px;">
+                        <div class="menu_button iig-npc-text-btn npc-outfit-generate" data-npc-index="${i}" data-outfit-id="${activeNpcOutfit.id}" style="font-size:13px;">
                             <i class="fa-solid fa-robot"></i> Сгенерировать
                         </div>
-                        <div class="menu_button npc-outfit-save" data-npc-index="${i}" data-outfit-id="${activeNpcOutfit.id}" style="font-size:11px;">
+                        <div class="menu_button iig-npc-text-btn npc-outfit-save" data-npc-index="${i}" data-outfit-id="${activeNpcOutfit.id}" style="font-size:13px;">
                             <i class="fa-solid fa-floppy-disk"></i> Сохранить
                         </div>
-                        <div class="menu_button npc-outfit-clear" data-npc-index="${i}" data-outfit-id="${activeNpcOutfit.id}" style="font-size:11px;">
+                        <div class="menu_button iig-npc-text-btn npc-outfit-clear" data-npc-index="${i}" data-outfit-id="${activeNpcOutfit.id}" style="font-size:13px;">
                             <i class="fa-solid fa-eraser"></i>
                         </div>
-                        <div class="menu_button npc-outfit-delete" data-npc-index="${i}" data-outfit-id="${activeNpcOutfit.id}" style="font-size:11px;color:#cc5555;">
+                        <div class="menu_button iig-npc-text-btn npc-outfit-delete" data-npc-index="${i}" data-outfit-id="${activeNpcOutfit.id}" style="font-size:13px;color:#cc5555;">
                             <i class="fa-solid fa-trash"></i>
                         </div>
                     </div>
-                    <div id="npc_outfit_status_${i}" style="display:none;font-size:10px;margin-top:4px;"></div>
+                    <div id="npc_outfit_status_${i}" style="display:none;font-size:12px;margin-top:4px;"></div>
                 </div>
             ` : ''}
         `;
@@ -5664,7 +5796,7 @@ function renderWardrobeGrid(target) {
     const activeId = settings[target === 'char' ? 'activeWardrobeChar' : 'activeWardrobeUser'];
 
     if (items.length === 0) {
-        container.innerHTML = '<div style="color:#5a5252;font-size:11px;padding:8px 0;">Нет одежды. Нажмите + чтобы добавить.</div>';
+        container.innerHTML = '<div style="color:#5a5252;font-size:13px;padding:8px 0;">Нет одежды. Нажмите + чтобы добавить.</div>';
         renderWardrobeDescriptionPanel(target);
         return;
     }
@@ -5708,31 +5840,31 @@ function renderWardrobeDescriptionPanel(target) {
     panel.style.display = 'block';
     panel.style.cssText = 'margin:8px 0;padding:8px;border:1px solid rgba(255,182,193,0.15);border-radius:8px;background:rgba(255,182,193,0.03);';
     panel.innerHTML = `
-        <div style="font-size:11px;color:#e8e0e0;margin-bottom:4px;">
+        <div style="font-size:13px;color:#e8e0e0;margin-bottom:4px;">
             <i class="fa-solid fa-shirt" style="margin-right:4px;"></i>
             Описание: <b>${escapeHtml(activeItem.name)}</b>
         </div>
         <div class="flex-row" style="margin-bottom:4px;">
-            <label for="iig_ward_category_${target}" style="font-size:11px;">Категория</label>
+            <label for="iig_ward_category_${target}" style="font-size:13px;">Категория</label>
             <select id="iig_ward_category_${target}" class="flex1 iig-ward-category" data-wardrobe-id="${escapeHtml(activeItem.id)}">
                 ${Object.entries(WARDROBE_CATEGORIES).map(([key, label]) => `<option value="${key}" ${(activeItem.category || 'full') === key ? 'selected' : ''}>${escapeHtml(label)}</option>`).join('')}
             </select>
         </div>
-        <textarea class="text_pole" rows="3" style="width:100%;font-size:11px;resize:vertical;"
+        <textarea class="text_pole" rows="3" style="width:100%;font-size:13px;resize:vertical;"
             placeholder="Введите описание одежды вручную или сгенерируйте через AI..."
             data-wardrobe-id="${activeItem.id}">${escapeHtml(activeItem.description)}</textarea>
         <div style="display:flex;gap:6px;margin-top:4px;">
-            <div class="menu_button iig-ward-desc-generate" data-wardrobe-id="${activeItem.id}" style="flex:1;font-size:11px;">
+            <div class="menu_button iig-ward-desc-generate" data-wardrobe-id="${activeItem.id}" style="flex:1;font-size:13px;">
                 <i class="fa-solid fa-robot"></i> Сгенерировать
             </div>
-            <div class="menu_button iig-ward-desc-save" data-wardrobe-id="${activeItem.id}" style="font-size:11px;">
+            <div class="menu_button iig-ward-desc-save" data-wardrobe-id="${activeItem.id}" style="font-size:13px;">
                 <i class="fa-solid fa-floppy-disk"></i> Сохранить
             </div>
-            <div class="menu_button iig-ward-desc-clear" data-wardrobe-id="${activeItem.id}" style="font-size:11px;">
+            <div class="menu_button iig-ward-desc-clear" data-wardrobe-id="${activeItem.id}" style="font-size:13px;">
                 <i class="fa-solid fa-eraser"></i>
             </div>
         </div>
-        <div id="iig_ward_desc_status_${target}" style="display:none;font-size:10px;margin-top:4px;"></div>
+        <div id="iig_ward_desc_status_${target}" style="display:none;font-size:12px;margin-top:4px;"></div>
     `;
 
     const textarea = panel.querySelector('textarea');
@@ -5809,7 +5941,7 @@ function renderHairstyleGrid(target) {
     const activeId = settings[target === 'char' ? 'activeHairstyleChar' : 'activeHairstyleUser'];
 
     if (items.length === 0) {
-        container.innerHTML = '<div style="color:#5a5252;font-size:11px;padding:8px 0;">Нет причёсок. Нажмите + чтобы добавить.</div>';
+        container.innerHTML = '<div style="color:#5a5252;font-size:13px;padding:8px 0;">Нет причёсок. Нажмите + чтобы добавить.</div>';
         renderHairstyleDescriptionPanel(target);
         return;
     }
@@ -5853,25 +5985,25 @@ function renderHairstyleDescriptionPanel(target) {
     panel.style.display = 'block';
     panel.style.cssText = 'margin:8px 0;padding:8px;border:1px solid rgba(255,182,193,0.15);border-radius:8px;background:rgba(255,182,193,0.03);';
     panel.innerHTML = `
-        <div style="font-size:11px;color:#e8e0e0;margin-bottom:4px;">
+        <div style="font-size:13px;color:#e8e0e0;margin-bottom:4px;">
             <i class="fa-solid fa-scissors" style="margin-right:4px;"></i>
             Описание: <b>${escapeHtml(activeItem.name)}</b>
         </div>
-        <textarea class="text_pole" rows="3" style="width:100%;font-size:11px;resize:vertical;"
+        <textarea class="text_pole" rows="3" style="width:100%;font-size:13px;resize:vertical;"
             placeholder="Введите описание причёски вручную или сгенерируйте через AI..."
             data-hairstyle-id="${activeItem.id}">${escapeHtml(activeItem.description)}</textarea>
         <div style="display:flex;gap:6px;margin-top:4px;">
-            <div class="menu_button iig-hair-desc-generate" data-hairstyle-id="${activeItem.id}" style="flex:1;font-size:11px;">
+            <div class="menu_button iig-hair-desc-generate" data-hairstyle-id="${activeItem.id}" style="flex:1;font-size:13px;">
                 <i class="fa-solid fa-robot"></i> Сгенерировать
             </div>
-            <div class="menu_button iig-hair-desc-save" data-hairstyle-id="${activeItem.id}" style="font-size:11px;">
+            <div class="menu_button iig-hair-desc-save" data-hairstyle-id="${activeItem.id}" style="font-size:13px;">
                 <i class="fa-solid fa-floppy-disk"></i> Сохранить
             </div>
-            <div class="menu_button iig-hair-desc-clear" data-hairstyle-id="${activeItem.id}" style="font-size:11px;">
+            <div class="menu_button iig-hair-desc-clear" data-hairstyle-id="${activeItem.id}" style="font-size:13px;">
                 <i class="fa-solid fa-eraser"></i>
             </div>
         </div>
-        <div id="iig_hair_desc_status_${target}" style="display:none;font-size:10px;margin-top:4px;"></div>
+        <div id="iig_hair_desc_status_${target}" style="display:none;font-size:12px;margin-top:4px;"></div>
     `;
 
     const textarea = panel.querySelector('textarea');
@@ -6121,7 +6253,7 @@ function renderAvatarDropdown(avatars = []) {
     emptyItem.dataset.value = '';
     emptyItem.innerHTML = `
         <div style="width:36px;height:36px;border-radius:5px;background:rgba(255,255,255,0.03);display:flex;align-items:center;justify-content:center;flex-shrink:0;">
-            <i class="fa-solid fa-ban" style="color:#5a5252;font-size:12px;"></i>
+            <i class="fa-solid fa-ban" style="color:#5a5252;font-size:13px;"></i>
         </div>
         <span class="iig-item-name">-- Не выбран --</span>
     `;
@@ -6217,6 +6349,17 @@ function libraryPreviewHtml(src, fallback = 'fa-user') {
         : `<span><i class="fa-solid ${fallback}"></i></span>`;
 }
 
+/** Dropdown «Текстом · Banana / Тегами · NovelAI» with a visible arrow. */
+function describeFormatSelectHtml(id, cls, value) {
+    return `<span class="iig-select-wrap">
+            <select id="${id}" class="${cls}" aria-label="Формат описания">
+                <option value="banana" ${value === 'banana' ? 'selected' : ''}>Текстом · Nano Banana</option>
+                <option value="novelai" ${value === 'novelai' ? 'selected' : ''}>Тегами · NovelAI</option>
+            </select>
+            <i class="fa-solid fa-chevron-down" aria-hidden="true"></i>
+        </span>`;
+}
+
 function profileCardHtml(kind, entity, profile, cardPreview) {
     const customPreview = profile.customAvatarData ? `data:${detectMimeType(profile.customAvatarData)};base64,${profile.customAvatarData}` : '';
     const preview = profile.avatarSource === 'custom' ? customPreview : cardPreview;
@@ -6250,12 +6393,7 @@ function profileCardHtml(kind, entity, profile, cardPreview) {
                 <label>Внешность</label>
                 <textarea class="text_pole iig-profile-appearance" rows="3" placeholder="Волосы, глаза, кожа, телосложение, приметы...">${escapeHtml(profile.appearance)}</textarea>
                 <div class="iig-profile-describe-row">
-                    <button type="button" class="menu_button iig-profile-describe" title="Описать внешность по ${profile.avatarSource === 'custom' ? 'загруженному рефу' : 'аватарке'} через Vision API"><i class="fa-solid fa-eye" aria-hidden="true"></i> Описать по ${profile.avatarSource === 'custom' ? 'рефу' : 'аватарке'}</button>
-                    <select class="iig-profile-desc-format" title="Как описывать: предложениями (Nano Banana, GPT…) или тегами Danbooru (NovelAI)" aria-label="Формат описания">
-                        <option value="banana" ${getProfileDescFormat() === 'banana' ? 'selected' : ''}>Текстом · Banana</option>
-                        <option value="novelai" ${getProfileDescFormat() === 'novelai' ? 'selected' : ''}>Тегами · NovelAI</option>
-                    </select>
-                    <label class="checkbox_label iig-profile-use-card" title="Вместе с картинкой учитывать внешность из описания ${kind === 'user' ? 'персоны' : 'карточки'}. Выключено — только по картинке."><input type="checkbox" class="iig-profile-use-card-input" ${profile.describeWithCard ? 'checked' : ''}><span>+ описание ${kind === 'user' ? 'персоны' : 'карточки'}</span></label>
+                    <button type="button" class="menu_button iig-profile-describe" title="Описать внешность по ${profile.avatarSource === 'custom' ? 'загруженному рефу' : 'аватарке'} — формат и «+ описание» выбираются вверху"><i class="fa-solid fa-eye" aria-hidden="true"></i> Описать по ${profile.avatarSource === 'custom' ? 'рефу' : 'аватарке'}</button>
                 </div>
             </div>
         </div>`;
@@ -6313,6 +6451,15 @@ function renderCharacterProfiles() {
 
     container.innerHTML = `
         <div class="iig-profiles">
+            <div class="iig-profiles-describe-settings">
+                <div class="iig-profile-field">
+                    <label for="iig_profile_desc_format">Как описывать внешность по аватарке</label>
+                    <div class="iig-profiles-describe-controls">
+                        ${describeFormatSelectHtml('iig_profile_desc_format', 'iig-profile-desc-format', getProfileDescFormat())}
+                        <label class="checkbox_label iig-profile-use-card" title="Вместе с картинкой учитывать внешность из описания карточки бота и описания персоны. Выключено — только по картинке."><input type="checkbox" class="iig-profile-use-card-input" ${settings.profileDescribeWithCard ? 'checked' : ''}><span>+ описание карточки и персоны</span></label>
+                    </div>
+                </div>
+            </div>
             ${charProfile ? profileCardHtml('char', charEntity, charProfile, charPreview) : '<div class="iig-library-empty">Откройте чат с персонажем, чтобы настроить бота.</div>'}
             ${profileCardHtml('user', userEntity, userProfile, userPreview)}
             ${charProfile ? rpgCharactersHtml(charProfile) : ''}
@@ -6325,6 +6472,15 @@ function renderCharacterProfiles() {
 }
 
 function bindCharacterProfileEvents(container, profiles, owners = {}) {
+    container.querySelector('.iig-profile-desc-format')?.addEventListener('change', event => {
+        const settings = getSettings();
+        settings.profileDescFormat = event.target.value === 'novelai' ? 'novelai' : 'banana';
+        saveSettings();
+    });
+    container.querySelector('.iig-profile-use-card-input')?.addEventListener('change', event => {
+        getSettings().profileDescribeWithCard = event.target.checked;
+        saveSettings();
+    });
     container.querySelectorAll('.iig-profile-card[data-profile-kind]').forEach(card => {
         const profile = profiles[card.dataset.profileKind];
         if (!profile) return;
@@ -6355,17 +6511,6 @@ function bindCharacterProfileEvents(container, profiles, owners = {}) {
             profile.aliases = String(event.target.value || '').trim();
             saveSettings();
         });
-        card.querySelector('.iig-profile-desc-format')?.addEventListener('change', event => {
-            const settings = getSettings();
-            settings.profileDescFormat = event.target.value === 'novelai' ? 'novelai' : 'banana';
-            // One setting for both cards (bot and persona).
-            document.querySelectorAll('.iig-profile-desc-format').forEach(select => { select.value = settings.profileDescFormat; });
-            saveSettings();
-        });
-        card.querySelector('.iig-profile-use-card-input')?.addEventListener('change', event => {
-            profile.describeWithCard = event.target.checked;
-            saveSettings();
-        });
         card.querySelector('.iig-profile-describe')?.addEventListener('click', async event => {
             const kind = card.dataset.profileKind;
             const textarea = card.querySelector('.iig-profile-appearance');
@@ -6378,9 +6523,10 @@ function bindCharacterProfileEvents(container, profiles, owners = {}) {
                 const image = profile.avatarSource === 'custom' && profile.customAvatarData
                     ? profile.customAvatarData
                     : (kind === 'user' ? await getUserAvatarBase64() : await getCharacterAvatarBase64());
-                const cardText = profile.describeWithCard ? getCardAppearanceSource(kind) : '';
+                const withCard = Boolean(getSettings().profileDescribeWithCard);
+                const cardText = withCard ? getCardAppearanceSource(kind) : '';
                 if (!image && !cardText) throw new Error(kind === 'user' ? 'Не найдена аватарка персоны — выберите её в «Аватары»' : 'Не найдена аватарка бота');
-                if (profile.describeWithCard && !cardText) toastr.info(`Описание ${kind === 'user' ? 'персоны' : 'карточки'} пустое — описываю только по картинке`, 'Профили');
+                if (withCard && !cardText) toastr.info(`Описание ${kind === 'user' ? 'персоны' : 'карточки'} пустое — описываю только по картинке`, 'Профили');
                 const description = await describeAppearance({ image: image ? await resizeImageBase64(image, 768) : '', cardText, format: getProfileDescFormat() });
                 profile.appearance = description;
                 if (textarea) textarea.value = description;
@@ -6482,6 +6628,13 @@ function createSettingsUI() {
                                 </select>
                             </div>
                             <p class="hint">Инлайн: модель ставит тег картинки между абзацами, без HTML-обёрток. Внешние блоки: модель встраивает картинки в HTML/CSS-артефакты (для ExtBlocks).</p>
+                            <div class="flex-row">
+                                <label for="iig_prompt_panel_position">Блок «Промпт картинки»</label>
+                                <select id="iig_prompt_panel_position" class="flex1">
+                                    <option value="middle" ${settings.promptPanelPosition !== 'end' ? 'selected' : ''}>В середине ответа</option>
+                                    <option value="end" ${settings.promptPanelPosition === 'end' ? 'selected' : ''}>В конце ответа</option>
+                                </select>
+                            </div>
                             <label class="checkbox_label">
                                 <input type="checkbox" id="iig_inject_image_mode" ${settings.injectImageModeInstruction ? 'checked' : ''}>
                                 <span>Добавлять инструкцию режима в промпт</span>
@@ -6504,8 +6657,8 @@ function createSettingsUI() {
 
                             <!-- Presets -->
                             <div style="display:flex;align-items:center;gap:6px;margin-bottom:8px;">
-                                <label style="font-size:11px;color:#9a9292;flex-shrink:0;">Пресет:</label>
-                                <select id="iig_preset_select" class="flex1" style="font-size:11px;"></select>
+                                <label style="font-size:13px;color:#9a9292;flex-shrink:0;">Пресет:</label>
+                                <select id="iig_preset_select" class="flex1" style="font-size:13px;"></select>
                                 <div class="menu_button" id="iig_preset_save" title="Сохранить текущие настройки как новый пресет"><i class="fa-solid fa-floppy-disk"></i></div>
                                 <div class="menu_button" id="iig_preset_update" title="Обновить выбранный пресет текущими настройками"><i class="fa-solid fa-arrows-rotate"></i></div>
                                 <div class="menu_button" id="iig_preset_delete" title="Удалить выбранный пресет" style="color:#cc5555;"><i class="fa-solid fa-trash"></i></div>
@@ -6983,6 +7136,10 @@ function createSettingsUI() {
                         </div>
                         <div class="iig-collapsible-content">
                             <p class="hint">Добавьте NPC с картинками. Если имя NPC появляется в промпте картинки, его аватар будет отправлен как референс.</p>
+                            <div class="iig-profile-field iig-npc-describe-settings">
+                                <label for="iig_npc_desc_format">Как описывать внешность и наряды NPC по картинке</label>
+                                <div class="iig-profiles-describe-controls">${describeFormatSelectHtml('iig_npc_desc_format', 'iig-npc-desc-format', getNpcDescFormat(settings))}</div>
+                            </div>
                             <div style="display:flex;align-items:center;gap:6px;margin-bottom:8px;">
                                 <input type="text" id="iig_npc_new_name" class="text_pole flex1" placeholder="Имя NPC...">
                                 <div class="menu_button" id="iig_npc_add"><i class="fa-solid fa-plus"></i> Добавить</div>
@@ -7062,6 +7219,15 @@ function bindSettingsEvents() {
     document.getElementById('iig_enabled')?.addEventListener('change', (e) => { settings.enabled = e.target.checked; saveSettings(); updateImageModeInjection(); });
 
     // Image display mode
+    document.getElementById('iig_npc_desc_format')?.addEventListener('change', (e) => {
+        settings.npcDescFormat = e.target.value === 'novelai' ? 'novelai' : 'banana';
+        saveSettings();
+    });
+    document.getElementById('iig_prompt_panel_position')?.addEventListener('change', (e) => {
+        settings.promptPanelPosition = e.target.value === 'end' ? 'end' : 'middle';
+        saveSettings();
+        replaceAllPromptPanels();
+    });
     document.getElementById('iig_image_display_mode')?.addEventListener('change', (e) => {
         settings.imageDisplayMode = normalizeImageDisplayMode(e.target.value);
         saveSettings();
@@ -7415,8 +7581,9 @@ function bindSettingsEvents() {
         settings.wardrobeDescFormat = e.target.value === 'novelai' ? 'novelai' : 'banana';
         document.getElementById('iig_wardrobe_desc_prompt_row')?.classList.toggle('hidden', settings.wardrobeDescFormat !== 'banana');
         document.getElementById('iig_wardrobe_desc_prompt_novelai_row')?.classList.toggle('hidden', settings.wardrobeDescFormat !== 'novelai');
-        // Profiles follow this choice until their own format is picked there.
+        // Profiles and NPC follow this choice until their own format is picked there.
         if (!settings.profileDescFormat) document.querySelectorAll('.iig-profile-desc-format').forEach(select => { select.value = settings.wardrobeDescFormat; });
+        if (!settings.npcDescFormat) document.querySelectorAll('.iig-npc-desc-format').forEach(select => { select.value = settings.wardrobeDescFormat; });
         saveSettings();
     });
 
@@ -7584,6 +7751,8 @@ function bindSettingsEvents() {
 let iigFloatingBtn = null;
 let iigWardrobeModal = null;
 let iigCurrentWardrobeTab = 'char';
+// «Одежда» or «Причёски» inside the bot / user tab of the wardrobe window.
+let iigWardrobeKind = 'outfit';
 let iigWardrobeFilter = { category: 'all', search: '' };
 let iigRefGenState = {
     target: 'char',
@@ -7772,6 +7941,18 @@ function renderQuickWardrobeList() {
 
     const settings = getSettings();
     const target = iigCurrentWardrobeTab;
+    // Hairstyles exist for the bot and the user (not for RPG characters).
+    const hairAllowed = target === 'char' || target === 'user';
+    if (!hairAllowed) iigWardrobeKind = 'outfit';
+    const kindSwitch = hairAllowed ? `
+        <div class="iig-wardrobe-kinds" role="tablist" aria-label="Что показать">
+            <button type="button" class="iig-wardrobe-kind ${iigWardrobeKind === 'outfit' ? 'iig-active' : ''}" data-kind="outfit" role="tab" aria-selected="${iigWardrobeKind === 'outfit'}"><i class="fa-solid fa-shirt" aria-hidden="true"></i> Одежда</button>
+            <button type="button" class="iig-wardrobe-kind ${iigWardrobeKind === 'hair' ? 'iig-active' : ''}" data-kind="hair" role="tab" aria-selected="${iigWardrobeKind === 'hair'}"><i class="fa-solid fa-scissors" aria-hidden="true"></i> Причёски</button>
+        </div>` : '';
+    if (iigWardrobeKind === 'hair') {
+        renderQuickHairstyleList(content, target, kindSwitch);
+        return;
+    }
     const allItems = settings.wardrobeItems?.filter(i => i.target === target) || [];
     const activeId = getActiveWardrobeId(target, settings);
     const activeItem = allItems.find(i => i.id === activeId) || null;
@@ -7831,10 +8012,147 @@ function renderQuickWardrobeList() {
             <textarea id="iig_wardrobe_desc_${escapeHtml(activeItem.id)}" class="text_pole" rows="3" placeholder="Описание одежды, которое будет передано в промпт">${escapeHtml(activeItem.description || '')}</textarea>
         </div>` : ''}`;
 
-    content.innerHTML = toolbar + body + footer;
+    content.innerHTML = kindSwitch + toolbar + body + footer;
+    bindWardrobeKindSwitch(content);
     bindWardrobeToolbar(content);
     bindWardrobeCards(content, target, activeItem);
     bindWardrobeAdd(content, target);
+}
+
+function bindWardrobeKindSwitch(content) {
+    content.querySelectorAll('.iig-wardrobe-kind').forEach(button => button.addEventListener('click', () => {
+        iigWardrobeKind = button.dataset.kind === 'hair' ? 'hair' : 'outfit';
+        renderQuickWardrobeList();
+    }));
+}
+
+/** «Причёски» in the wardrobe window: the same cards as outfits — click to put on / take off. */
+function renderQuickHairstyleList(content, target, kindSwitch) {
+    const settings = getSettings();
+    const allItems = (settings.hairstyleItems || []).filter(item => (item.target || 'char') === target);
+    const activeItem = getActiveHairstyleItem(target);
+    const activeId = activeItem?.id || null;
+    const needle = String(iigWardrobeFilter.search || '').trim().toLowerCase();
+    const items = needle
+        ? allItems.filter(item => String(item.name || '').toLowerCase().includes(needle) || String(item.description || '').toLowerCase().includes(needle))
+        : allItems;
+    const imgSrc = item => `data:${detectMimeType(item.imageData)};base64,${item.imageData}`;
+
+    const toolbar = `
+        <div class="iig-wardrobe-toolbar">
+            <input type="search" class="text_pole iig-wardrobe-search" placeholder="Поиск причёски" aria-label="Поиск причёски" value="${escapeHtml(iigWardrobeFilter.search)}">
+            <button type="button" class="menu_button iig-wardrobe-add" title="Добавить причёску" aria-label="Добавить причёску"><i class="fa-solid fa-plus" aria-hidden="true"></i></button>
+            <input type="file" class="iig-wardrobe-add-file" accept="image/*" hidden>
+        </div>`;
+    const body = items.length === 0
+        ? `<div class="iig-no-outfits">
+                <i class="fa-solid fa-scissors" aria-hidden="true"></i>
+                <p>${allItems.length === 0 ? 'Причёсок пока нет' : 'Ничего не найдено'}</p>
+                ${allItems.length === 0 ? '<small>Нажмите «+», чтобы добавить картинку причёски</small>' : ''}
+           </div>`
+        : `<div class="iig-wardrobe-grid">${items.map(item => `
+            <div class="iig-wardrobe-card ${item.id === activeId ? 'iig-card-active' : ''}" data-id="${escapeHtml(item.id)}" role="button" tabindex="0" aria-pressed="${item.id === activeId}" title="${item.id === activeId ? 'Снять' : 'Выбрать'}">
+                ${item.imageData
+                    ? `<img class="iig-wardrobe-card-img" src="${imgSrc(item)}" alt="${escapeHtml(item.name)}" draggable="false">`
+                    : '<div class="iig-wardrobe-card-img iig-card-placeholder"><i class="fa-solid fa-scissors" aria-hidden="true"></i></div>'}
+                <div class="iig-wardrobe-card-body">
+                    <div class="iig-wardrobe-card-title">${escapeHtml(item.name)}</div>
+                    <div class="iig-wardrobe-card-category">${item.description ? 'с описанием' : 'без описания'}</div>
+                </div>
+                ${item.id === activeId ? '<div class="iig-card-check" aria-hidden="true"><i class="fa-solid fa-check"></i></div>' : ''}
+                <div class="iig-card-tools">
+                    ${item.imageData ? `<button type="button" class="iig-card-tool iig-card-view" title="Открыть картинку / обрезать" aria-label="Открыть картинку ${escapeHtml(item.name)}"><i class="fa-solid fa-magnifying-glass-plus" aria-hidden="true"></i></button>` : ''}
+                    ${item.imageData ? `<button type="button" class="iig-card-tool iig-card-describe" title="Описать через AI" aria-label="Описать ${escapeHtml(item.name)}"><i class="fa-solid fa-wand-magic-sparkles" aria-hidden="true"></i></button>` : ''}
+                    <button type="button" class="iig-card-tool iig-card-delete" title="Удалить" aria-label="Удалить ${escapeHtml(item.name)}"><i class="fa-solid fa-trash" aria-hidden="true"></i></button>
+                </div>
+            </div>`).join('')}
+           </div>`;
+    const footer = `
+        <div class="iig-wardrobe-footer">
+            <span class="iig-footer-label">Сейчас причёска:</span>
+            ${activeItem
+                ? `${activeItem.imageData ? `<img src="${imgSrc(activeItem)}" alt="">` : ''}
+                   <span class="iig-footer-name">${escapeHtml(activeItem.name)}</span>
+                   <button type="button" class="menu_button iig-footer-clear" title="Снять" aria-label="Снять причёску"><i class="fa-solid fa-xmark"></i></button>`
+                : '<span class="iig-footer-name iig-footer-empty">своя</span>'}
+        </div>
+        ${activeItem ? `
+        <div class="iig-wardrobe-description">
+            <label for="iig_hair_desc_${escapeHtml(activeItem.id)}"><i class="fa-solid fa-align-left"></i> Описание для промпта:</label>
+            <textarea id="iig_hair_desc_${escapeHtml(activeItem.id)}" class="text_pole iig-hair-desc" rows="3" placeholder="Описание причёски, которое будет передано в промпт">${escapeHtml(activeItem.description || '')}</textarea>
+        </div>` : ''}`;
+
+    content.innerHTML = kindSwitch + toolbar + body + footer;
+    bindWardrobeKindSwitch(content);
+    bindWardrobeToolbar(content);
+
+    const toggle = itemId => {
+        const wasActive = activeId === itemId;
+        setActiveHairstyle(itemId, target);
+        renderQuickWardrobeList();
+        const item = settings.hairstyleItems.find(i => i.id === itemId);
+        if (item) toastr[wasActive ? 'info' : 'success'](`${wasActive ? 'Снята' : 'Выбрана'} причёска: ${item.name}`, 'Гардероб');
+    };
+    content.querySelectorAll('.iig-wardrobe-card').forEach(card => {
+        const itemId = card.dataset.id;
+        const item = () => settings.hairstyleItems.find(i => i.id === itemId);
+        card.querySelector('.iig-card-view')?.addEventListener('click', event => {
+            event.stopPropagation();
+            if (item()) editSavedReferenceImage(item(), renderQuickWardrobeList);
+        });
+        card.querySelector('.iig-card-delete')?.addEventListener('click', event => {
+            event.stopPropagation();
+            if (!item() || !confirm(`Удалить причёску «${item().name}»?`)) return;
+            const name = item().name;
+            removeHairstyleItem(itemId);
+            renderQuickWardrobeList();
+            toastr.info(`Удалено: ${name}`, 'Гардероб');
+        });
+        card.querySelector('.iig-card-describe')?.addEventListener('click', async event => {
+            event.stopPropagation();
+            const button = event.currentTarget;
+            button.disabled = true;
+            button.innerHTML = '<i class="fa-solid fa-spinner fa-spin" aria-hidden="true"></i>';
+            try {
+                updateHairstyleItemDescription(itemId, await generateHairstyleDescription(itemId));
+                saveSettings();
+                toastr.success(`Описание готово: ${item()?.name || ''}`, 'Гардероб', { timeOut: 4000 });
+                renderQuickWardrobeList();
+            } catch (error) {
+                toastr.error(`Ошибка: ${error.message}`, 'Гардероб');
+                button.disabled = false;
+                button.innerHTML = '<i class="fa-solid fa-wand-magic-sparkles" aria-hidden="true"></i>';
+            }
+        });
+        card.addEventListener('click', () => toggle(itemId));
+        card.addEventListener('keydown', event => {
+            if (event.target !== card) return;
+            if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); toggle(itemId); }
+        });
+    });
+    content.querySelector('.iig-footer-clear')?.addEventListener('click', () => { if (activeId) toggle(activeId); });
+    content.querySelector('.iig-hair-desc')?.addEventListener('blur', event => {
+        updateHairstyleItemDescription(activeId, event.target.value);
+        saveSettings();
+        toastr.info('Описание сохранено', 'Гардероб');
+    });
+    const addButton = content.querySelector('.iig-wardrobe-add');
+    const addInput = content.querySelector('.iig-wardrobe-add-file');
+    addButton?.addEventListener('click', () => addInput?.click());
+    addInput?.addEventListener('change', async () => {
+        const file = addInput.files?.[0];
+        if (!file) return;
+        try {
+            const resized = await resizeImageBase64(await readLibraryFileAsBase64(file), 512);
+            const added = addHairstyleItem(file.name.replace(/\.[^.]+$/, '').trim() || 'Hairstyle', resized, target);
+            toastr.success(`Добавлено: ${added.name}`, 'Гардероб');
+            renderQuickWardrobeList();
+        } catch (error) {
+            toastr.error(`Не удалось добавить: ${error.message}`, 'Гардероб');
+        } finally {
+            addInput.value = '';
+        }
+    });
 }
 
 /** "+" in the wardrobe: upload an outfit image for the current target (bot, user or RPG character). */
@@ -8169,7 +8487,9 @@ function bindReferenceGenerator(content) {
         setTimeout(() => {
             observeImageRegenButtons();
             addButtonsToExistingMessages();
+            promptPanels.clear();
             addPromptPanelsToExistingMessages();
+            observePromptPanels();
             updateWardrobeInjection();
             updateImageModeInjection();
             // Bot profile / RPG mode depend on the open character
@@ -8178,6 +8498,21 @@ function bindReferenceGenerator(content) {
             if (iigWardrobeModal) openWardrobeModal();
         }, 100);
         setTimeout(updateCharAvatarPreview, 200);
+    });
+
+    // A swipe shows another variant of the reply with its own prompt block data.
+    context.eventSource.on(context.event_types.MESSAGE_SWIPED, (messageId) => {
+        const id = Number(messageId);
+        const el = document.querySelector(`#chat .mes[mesid="${id}"]`);
+        if (el) setTimeout(() => ensurePromptPanelForMessage(el, id, { rerender: true }), 50);
+    });
+    // Deleting messages renumbers them: rebuild the blocks from scratch.
+    context.eventSource.on(context.event_types.MESSAGE_DELETED, () => {
+        setTimeout(() => {
+            for (const entry of promptPanels.values()) entry.panel.remove();
+            promptPanels.clear();
+            addPromptPanelsToExistingMessages();
+        }, 50);
     });
 
     // Only freshly generated replies (not old messages rendered on chat load) get an automatic prompt.
@@ -8191,6 +8526,7 @@ function bindReferenceGenerator(content) {
 
     // Wardrobe button in the input bar
     createFloatingWardrobeButton();
+    observePromptPanels();
 
     console.log('[IIG] Inline Image Generation v3.0 initialized');
 })();

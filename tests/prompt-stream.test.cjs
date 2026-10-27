@@ -56,3 +56,11 @@ test('the panel is a one-line card with status, live preview, stop and «Авт�
     assert.match(source, /pendingAutoPrompts\.delete\(Number\(messageId\)\)\) maybeAutoGeneratePrompt/);
 });
 
+test('the generated picture is shown big with download and a full-screen viewer', () => {
+    assert.match(source, /class="iig-pp-figure"/);
+    assert.match(source, /iig-pp-image-download/);
+    assert.match(source, /function openImageViewer\(/);
+    assert.match(source, /function downloadGeneratedImage\(/);
+    assert.match(source, /event\.key === 'Escape'/);
+});
+

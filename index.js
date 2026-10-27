@@ -154,8 +154,8 @@ const defaultSettings = Object.freeze({
     promptGenStream: false,
     // Prompt panel collapsed by default (extblocks mode only)
     promptPanelCollapsed: false,
-    // Write the image prompt by itself after every new bot reply.
-    promptAutoGenerate: false,
+    // «Авто»: after every new bot reply write the image prompt and then draw the picture by itself.
+    promptAutoGenerate: true,
     // Where the picture / prompt block sits in a bot reply: 'middle' of the text or the 'end'.
     promptPanelPosition: 'middle',
     // Meta (style/negative) collapsed by default (extblocks mode only)
@@ -344,6 +344,8 @@ function getSettings() {
     if (!s.promptInstructionItems.some(item => item.id === s.activePromptInstructionId)) s.activePromptInstructionId = 'builtin-image';
     if (!Number.isFinite(Number(s.promptGenMaxTokens))) s.promptGenMaxTokens = 700;
     if (!Number.isFinite(Number(s.promptGenTemperature))) s.promptGenTemperature = 0.7;
+    // «Авто» became on by default (prompt + picture after every reply): switch it on once for existing settings too.
+    if (!s.promptAutoDefaultApplied) { s.promptAutoGenerate = true; s.promptAutoDefaultApplied = true; }
     // The first version of the NovelAI tag prompt let the model invent phrases; move it to the current default.
     if (String(s.wardrobeDescPromptNovelAI || '').startsWith('List ONLY the clothing in this picture as Danbooru-style tags')) s.wardrobeDescPromptNovelAI = defaultSettings.wardrobeDescPromptNovelAI;
         for (const npc of (s.npcReferences || [])) {
@@ -2345,7 +2347,7 @@ const SETTINGS_TABS = Object.freeze([
         { id: 'errors', label: 'Повторы и логи', icon: 'fa-gear', sections: ['errors'] },
     ] },
     { id: 'people', label: 'Персонажи', icon: 'fa-users', subs: [
-        { id: 'profiles', label: 'Профили персонажей', icon: 'fa-id-card', sections: ['character_library', 'avatars'] },
+        { id: 'profiles', label: 'Профили персонажей', icon: 'fa-id-card', sections: ['character_library'] },
         { id: 'npc', label: 'NPC', icon: 'fa-masks-theater', sections: ['npc'] },
         { id: 'refgen', label: 'API рефов', icon: 'fa-dna', sections: ['refgen'] },
     ] },
@@ -4751,8 +4753,10 @@ function ensurePromptPanelForMessage(messageElement, messageId, { rerender = fal
         panel = document.createElement('div');
         panel.className = 'iig-prompt-panel';
     }
-    promptPanels.set(messageId, { panel, mesEl: messageElement });
-    placePromptPanel(messageElement, panel);
+    const entry = known?.mesEl === messageElement ? known : { panel, mesEl: messageElement, anchor: null };
+    entry.panel = panel;
+    promptPanels.set(messageId, entry);
+    placePromptPanel(messageElement, panel, entry);
     if (isNew || (rerender && !activePromptAbortControllers.has(messageId))) renderPromptPanel(panel, messageId);
     return panel;
 }
@@ -4761,7 +4765,7 @@ function ensurePromptPanelForMessage(messageElement, messageId, { rerender = fal
  * Puts the block in the middle of the reply (after the middle paragraph) or after the text.
  * ExtBlocks mode always uses the end: there the reply HTML is rebuilt into artifacts.
  */
-function placePromptPanel(messageElement, panel) {
+function placePromptPanel(messageElement, panel, entry = null) {
     const text = messageElement.querySelector('.mes_text');
     const settings = getSettings();
     const middle = settings.promptPanelPosition !== 'end' && normalizeImageDisplayMode(settings.imageDisplayMode) !== 'extblocks';
@@ -4775,7 +4779,11 @@ function placePromptPanel(messageElement, panel) {
         if (panel.parentElement !== text || text.lastElementChild !== panel) text.appendChild(panel);
         return;
     }
-    const anchor = blocks[Math.ceil(blocks.length / 2) - 1];
+    // The spot is chosen once (middle paragraph) and kept: re-renders while streaming or swiping
+    // must not move the block from line to line as the text grows.
+    if (entry && entry.anchor == null) entry.anchor = Math.ceil(blocks.length / 2) - 1;
+    const index = entry?.anchor ?? (Math.ceil(blocks.length / 2) - 1);
+    const anchor = blocks[Math.min(index, blocks.length - 1)];
     if (panel.previousElementSibling !== anchor || panel.parentElement !== text) anchor.after(panel);
 }
 
@@ -4791,7 +4799,7 @@ function observePromptPanels() {
             scheduled = false;
             for (const [messageId, entry] of promptPanels) {
                 if (!entry.mesEl.isConnected) { promptPanels.delete(messageId); continue; }
-                if (!entry.mesEl.contains(entry.panel)) placePromptPanel(entry.mesEl, entry.panel);
+                if (!entry.mesEl.contains(entry.panel)) placePromptPanel(entry.mesEl, entry.panel, entry);
             }
         });
     });
@@ -4799,7 +4807,10 @@ function observePromptPanels() {
 }
 
 function replaceAllPromptPanels() {
-    for (const entry of promptPanels.values()) if (entry.mesEl.isConnected) placePromptPanel(entry.mesEl, entry.panel);
+    for (const entry of promptPanels.values()) {
+        entry.anchor = null;
+        if (entry.mesEl.isConnected) placePromptPanel(entry.mesEl, entry.panel, entry);
+    }
 }
 
 /** «Внешность» under the prompt: the same profile appearance fields as in Персонажи → Профили. */
@@ -4919,13 +4930,12 @@ function updatePromptPanelChrome(panel, messageId, { status = '', error = false 
     const drawing = activeAbortControllers.has(messageId);
     panel.classList.toggle('is-busy', writing || drawing);
     panel.classList.toggle('has-error', Boolean(error));
-    const chip = panel.querySelector('.iig-prompt-chip');
-    if (chip) {
-        const [text, state] = writing ? ['пишу промпт', 'busy'] : drawing ? ['рисую', 'busy'] : error ? ['ошибка', 'error'] : prompt ? ['готов', 'ready'] : ['пусто', 'empty'];
-        chip.textContent = text;
-        chip.dataset.state = state;
+    const [chipText, chipState] = writing ? ['пишу промпт', 'busy'] : drawing ? ['рисую', 'busy'] : error ? ['ошибка', 'error'] : prompt ? ['готов', 'ready'] : ['пусто', 'empty'];
+    panel.querySelectorAll('.iig-prompt-chip').forEach(chip => {
+        chip.textContent = chipText;
+        chip.dataset.state = chipState;
         chip.title = error ? status : '';
-    }
+    });
     const preview = panel.querySelector('.iig-pp-preview');
     if (preview && !writing) {
         preview.textContent = error ? status : (promptPreviewText(prompt) || 'Промпта ещё нет — нажмите «Промпт» или напишите свой');
@@ -4954,7 +4964,7 @@ function setPromptPanelExpanded(panel, messageId, expanded) {
 
 /** Writes the image prompt for a reply; used by the «Промпт» button and by «Авто». */
 async function runPromptGeneration(messageId, { auto = false } = {}) {
-    if (activePromptAbortControllers.has(messageId)) return;
+    if (activePromptAbortControllers.has(messageId)) return false;
     const controller = new AbortController();
     activePromptAbortControllers.set(messageId, controller);
     const startPanel = getPromptPanel(messageId);
@@ -4977,6 +4987,7 @@ async function runPromptGeneration(messageId, { auto = false } = {}) {
         const panel = getPromptPanel(messageId);
         if (panel) renderPromptPanel(panel, messageId);
         if (!auto) toastr.success('Промпт картинки готов');
+        return true;
     } catch (error) {
         activePromptAbortControllers.delete(messageId);
         const aborted = error?.name === 'AbortError';
@@ -4987,6 +4998,7 @@ async function runPromptGeneration(messageId, { auto = false } = {}) {
         }
         if (aborted) toastr.info('Генерация промпта остановлена');
         else if (!auto) toastr.error(`Промпт: ${error.message}`);
+        return false;
     } finally {
         activePromptAbortControllers.delete(messageId);
     }
@@ -4999,11 +5011,16 @@ function maybeAutoGeneratePrompt(messageId) {
     const message = SillyTavern.getContext().chat?.[messageId];
     if (!message || message.is_user || message.is_system || !String(message.mes || '').trim()) return;
     if (message.extra?.iig_prompt_block?.sourceHash === promptSourceHash(message.mes)) return;
-    runPromptGeneration(messageId, { auto: true });
+    // Prompt first, then the picture right away — no extra button press.
+    runPromptGeneration(messageId, { auto: true }).then(ok => { if (ok) runImageFromPrompt(messageId, { auto: true }); });
 }
 
-async function runImageFromPrompt(messageId) {
-    if (activeAbortControllers.has(messageId)) return;
+async function runImageFromPrompt(messageId, { auto = false } = {}) {
+    if (activeAbortControllers.has(messageId) || activePromptAbortControllers.has(messageId)) return;
+    const hasPrompt = () => Boolean(String(SillyTavern.getContext().chat?.[messageId]?.extra?.iig_prompt_block?.prompt || '').trim());
+    // No prompt yet: write it first, then draw.
+    if (!hasPrompt() && !(await runPromptGeneration(messageId, { auto: true }))) return;
+    if (!hasPrompt()) return;
     const controller = new AbortController();
     activeAbortControllers.set(messageId, controller);
     updatePromptPanelChrome(getPromptPanel(messageId), messageId, { status: 'Рисую…' });
@@ -5012,12 +5029,12 @@ async function runImageFromPrompt(messageId) {
         activeAbortControllers.delete(messageId);
         const panel = getPromptPanel(messageId);
         if (panel) renderPromptPanel(panel, messageId);
-        toastr.success('Картинка по промпту готова');
+        if (!auto) toastr.success('Картинка по промпту готова');
     } catch (error) {
         activeAbortControllers.delete(messageId);
         const aborted = error?.name === 'AbortError';
         updatePromptPanelChrome(getPromptPanel(messageId), messageId, aborted ? { status: 'Остановлено' } : { status: error.message, error: true });
-        if (!aborted) toastr.error(`Картинка: ${error.message}`);
+        if (!aborted && !auto) toastr.error(`Картинка: ${error.message}`);
     } finally {
         activeAbortControllers.delete(messageId);
     }
@@ -5050,6 +5067,14 @@ function renderPromptPanel(panel, messageId) {
                 <button type="button" class="iig-pp-image-btn iig-pp-details iig-prompt-panel-toggle" aria-expanded="${expanded}" title="Подробнее: промпт и настройки"><i class="fa-solid fa-sliders" aria-hidden="true"></i><span>Подробнее</span></button>
             </figcaption>
         </figure>` : ''}
+        ${image ? '' : `<div class="iig-pp-dock" role="toolbar" aria-label="Картинка к ответу">
+            <button type="button" class="iig-pp-icon iig-prompt-generate" title="Написать промпт по этому ответу" aria-label="Написать промпт"><i class="fa-solid fa-wand-magic-sparkles" aria-hidden="true"></i></button>
+            <button type="button" class="iig-pp-icon iig-image-from-prompt" title="Нарисовать картинку (если промпта нет — сначала напишет его)" aria-label="Нарисовать картинку"><i class="fa-solid fa-image" aria-hidden="true"></i></button>
+            <button type="button" class="iig-pp-icon iig-pp-icon-stop iig-prompt-cancel" hidden title="Остановить" aria-label="Остановить"><i class="fa-solid fa-stop" aria-hidden="true"></i></button>
+            <button type="button" class="iig-pp-icon iig-prompt-auto-toggle${settings.promptAutoGenerate ? ' is-on' : ''}" aria-pressed="${!!settings.promptAutoGenerate}" title="Авто: промпт и картинка сами после каждого нового ответа" aria-label="Авто"><i class="fa-solid fa-robot" aria-hidden="true"></i></button>
+            <span class="iig-pp-dock-status iig-prompt-chip" aria-live="polite"></span>
+            <button type="button" class="iig-pp-icon iig-prompt-panel-toggle" aria-expanded="${expanded}" title="Подробнее: промпт и настройки" aria-label="Подробнее"><i class="fa-solid fa-chevron-down" aria-hidden="true"></i></button>
+        </div>`}
         <div class="iig-pp-head">
             <button type="button" class="iig-pp-summary iig-prompt-panel-toggle" aria-expanded="${expanded}" title="${expanded ? 'Свернуть' : 'Развернуть'}">
                 <span class="iig-pp-thumb"><i class="fa-solid fa-wand-magic-sparkles" aria-hidden="true"></i></span>
@@ -5074,7 +5099,7 @@ function renderPromptPanel(panel, messageId) {
                     <button type="button" class="menu_button iig-pp-pill iig-pp-primary iig-image-from-prompt" title="Нарисовать картинку по промпту"><i class="fa-solid fa-image" aria-hidden="true"></i> ${image ? 'Перерисовать' : 'Картинка'}</button>
                 </span>
                 <span class="iig-pp-toggles">
-                    <button type="button" class="menu_button iig-pp-pill iig-prompt-auto-toggle${settings.promptAutoGenerate ? ' is-on' : ''}" aria-pressed="${!!settings.promptAutoGenerate}" title="Писать промпт самим после каждого нового ответа бота"><i class="fa-solid fa-rotate" aria-hidden="true"></i> Авто</button>
+                    <button type="button" class="menu_button iig-pp-pill iig-prompt-auto-toggle${settings.promptAutoGenerate ? ' is-on' : ''}" aria-pressed="${!!settings.promptAutoGenerate}" title="Авто: промпт и картинка сами после каждого нового ответа"><i class="fa-solid fa-robot" aria-hidden="true"></i> Авто</button>
                     <button type="button" class="menu_button iig-pp-pill iig-prompt-stream-toggle${settings.promptGenStream ? ' iig-stream-on is-on' : ''}" aria-pressed="${!!settings.promptGenStream}" title="Показывать промпт, пока он пишется"><i class="fa-solid fa-bolt" aria-hidden="true"></i> Стрим</button>
                     ${showFormat ? `<button type="button" class="menu_button iig-pp-pill iig-gemini-format-toggle${settings.geminiRandomFormat ? ' iig-format-on is-on' : ''}" aria-pressed="${!!settings.geminiRandomFormat}" title="Случайный формат Gemini (каждый запрос)"><i class="fa-solid fa-dice" aria-hidden="true"></i> Формат</button>` : ''}
                 </span>
@@ -5139,13 +5164,13 @@ function renderPromptPanel(panel, messageId) {
         if (extraClass) button.classList.toggle(extraClass, value);
         button.setAttribute('aria-pressed', String(value));
     });
-    panel.querySelector('.iig-prompt-auto-toggle')?.addEventListener('click', () => {
+    panel.querySelectorAll('.iig-prompt-auto-toggle').forEach(toggleButton => toggleButton.addEventListener('click', () => {
         const settings = getSettings();
         settings.promptAutoGenerate = !settings.promptAutoGenerate;
         saveSettings();
         syncToggle('.iig-prompt-auto-toggle', settings.promptAutoGenerate);
-        toastr.info(settings.promptAutoGenerate ? 'Промпт будет писаться сам после каждого нового ответа' : 'Авто-промпт выключен: нажимайте «Промпт» сами');
-    });
+        toastr.info(settings.promptAutoGenerate ? 'Авто: промпт и картинка будут появляться сами после каждого нового ответа' : 'Авто выключено: нажимайте ✦ (промпт) или 🖼 (картинка) сами');
+    }));
     panel.querySelector('.iig-prompt-stream-toggle')?.addEventListener('click', () => {
         const settings = getSettings();
         settings.promptGenStream = !settings.promptGenStream;
@@ -6396,6 +6421,7 @@ function profileCardHtml(kind, entity, profile, cardPreview) {
                     <button type="button" class="menu_button iig-profile-describe" title="Описать внешность по ${profile.avatarSource === 'custom' ? 'загруженному рефу' : 'аватарке'} — формат и «+ описание» выбираются вверху"><i class="fa-solid fa-eye" aria-hidden="true"></i> Описать по ${profile.avatarSource === 'custom' ? 'рефу' : 'аватарке'}</button>
                 </div>
             </div>
+            <div class="iig-profile-avatar-slot"></div>
         </div>`;
 }
 
@@ -6446,6 +6472,10 @@ function renderCharacterProfiles() {
     const userProfile = getCharacterProfile('user', userEntity.key, settings, true);
     userEntity.title = context.name1 || userEntity.title;
 
+    // «Аватары и референсы» live inside the profiles now: keep their nodes (and listeners) across re-renders.
+    const avatarParts = ['common', 'char', 'user'].map(part => document.getElementById(`iig_avatar_part_${part}`));
+    avatarParts.forEach(node => node?.remove());
+
     const charPreview = character?.avatar ? `/thumbnail?type=avatar&file=${encodeURIComponent(character.avatar)}` : '';
     const userPreview = settings.userAvatarFile ? `/thumbnail?type=persona&file=${encodeURIComponent(settings.userAvatarFile)}` : '';
 
@@ -6464,6 +6494,12 @@ function renderCharacterProfiles() {
             ${profileCardHtml('user', userEntity, userProfile, userPreview)}
             ${charProfile ? rpgCharactersHtml(charProfile) : ''}
         </div>`;
+
+    const [commonPart, charPart, userPart] = avatarParts;
+    if (commonPart) container.querySelector('.iig-profiles-describe-settings')?.appendChild(commonPart);
+    const charSlot = container.querySelector('.iig-profile-card[data-profile-kind="char"] .iig-profile-avatar-slot');
+    if (charPart) (charSlot || container.querySelector('.iig-profiles-describe-settings'))?.appendChild(charPart);
+    if (userPart) container.querySelector('.iig-profile-card[data-profile-kind="user"] .iig-profile-avatar-slot')?.appendChild(userPart);
 
     bindCharacterProfileEvents(container, { char: charProfile, user: userProfile }, {
         char: { name: character?.name || charEntity.title, notes: character?.description || '' },
@@ -6908,12 +6944,15 @@ function createSettingsUI() {
                             <span>👤 Аватары и референсы</span>
                         </div>
                         <div class="iig-collapsible-content">
+                            <div id="iig_avatar_part_common">
                             <label class="checkbox_label">
                                 <input type="checkbox" id="iig_auto_detect_names" ${settings.autoDetectNames ? 'checked' : ''}>
                                 <span>Авто-определение имён в промпте</span>
                             </label>
                             <p class="hint">Персонаж, юзер и NPC попадают в картинку (лицо, внешность, наряд), только если их имя есть в промпте. Имена ищутся и транслитом (Иван → Ivan), дополнительные имена — в профилях и у NPC. «Всегда отправлять» ниже добавляет человека даже без упоминания; для NovelAI эти галочки не действуют.</p>
 
+                            </div>
+                            <div id="iig_avatar_part_char">
                             <label class="checkbox_label">
                                 <input type="checkbox" id="iig_send_char_avatar" ${settings.sendCharAvatar ? 'checked' : ''}>
                                 <span>Всегда отправлять аватар персонажа</span>
@@ -6922,12 +6961,14 @@ function createSettingsUI() {
                                 <img src="" alt="Аватар персонажа">
                             </div>
 
+                            </div>
+                            <div id="iig_avatar_part_user">
                             <label class="checkbox_label">
                                 <input type="checkbox" id="iig_send_user_avatar" ${settings.sendUserAvatar ? 'checked' : ''}>
                                 <span>Всегда отправлять аватар юзера</span>
                             </label>
 
-                            <div id="iig_user_avatar_row" class="${!settings.sendUserAvatar ? 'hidden' : ''}" style="margin-top:4px;">
+                            <div id="iig_user_avatar_row" style="margin-top:4px;">
                                 <div class="flex-row">
                                     <label>Аватар юзера</label>
                                     <div class="iig-avatar-dropdown flex1" id="iig_avatar_dropdown">
@@ -6944,6 +6985,7 @@ function createSettingsUI() {
                                     </div>
                                     <div class="menu_button iig-refresh-btn" id="iig_refresh_avatars" title="Обновить список"><i class="fa-solid fa-arrows-rotate"></i></div>
                                 </div>
+                            </div>
                             </div>
                         </div>
                     </div>
@@ -7484,7 +7526,6 @@ function bindSettingsEvents() {
 
     document.getElementById('iig_send_user_avatar')?.addEventListener('change', (e) => {
         settings.sendUserAvatar = e.target.checked; saveSettings();
-        document.getElementById('iig_user_avatar_row')?.classList.toggle('hidden', !e.target.checked);
 
         
     });

@@ -1932,3 +1932,43 @@ body.iig-mode-inline .mes_text .iig-image-wrapper {
 .iig-pp-figure { max-width: 520px; margin: 0 auto; box-sizing: border-box; }
 .iig-pp-figure .iig-prompt-result-image { max-height: min(60vh, 640px); }
 .mes_text .iig-prompt-panel.iig-pp.has-image:not(.is-expanded) { max-width: 520px; margin-left: auto; margin-right: auto; }
+
+/* ===== Closed block without a picture: a small row of icons in the middle of the reply ===== */
+.iig-pp:not(.is-expanded) .iig-pp-head { display: none; }
+.iig-pp.is-expanded .iig-pp-dock { display: none; }
+.mes_text .iig-prompt-panel.iig-pp:not(.has-image):not(.is-expanded) { width: fit-content; max-width: 100%; margin: 12px auto; border-radius: 999px; }
+.iig-pp-dock { display: flex; align-items: center; gap: 2px; padding: 4px; }
+.iig-pp-icon { all: unset; box-sizing: border-box; width: 36px; height: 36px; display: grid; place-items: center; border-radius: 999px; cursor: pointer; font-size: 15px; color: var(--pp-muted); transition: color .15s ease, background-color .15s ease; }
+.iig-pp-icon:hover { color: var(--pp-text); background: var(--pp-field); }
+.iig-pp-icon:focus-visible { outline: 2px solid var(--iig-accent); outline-offset: 1px; }
+.iig-pp-icon[hidden] { display: none !important; }
+.iig-pp-icon.disabled { opacity: .4; pointer-events: none; }
+.iig-pp-icon.is-on { color: var(--iig-accent); background: color-mix(in srgb, var(--iig-accent) 14%, transparent); }
+.iig-pp-icon-stop { color: #ffb0b0; }
+.iig-pp-icon-stop:hover { color: #fff; background: rgba(220, 80, 80, .35); }
+.iig-pp-dock-status { padding: 0 8px; font-size: 13px; white-space: nowrap; color: var(--pp-muted); }
+.iig-pp-dock-status[data-state="empty"], .iig-pp-dock-status:empty { display: none; }
+.iig-pp-dock-status[data-state="busy"] { color: var(--iig-accent); }
+.iig-pp-dock-status[data-state="ready"] { color: #b9e4c3; }
+.iig-pp-dock-status[data-state="error"] { color: #ffb0b0; max-width: 220px; overflow: hidden; text-overflow: ellipsis; }
+.iig-pp-dock-status[data-state="ready"]::before { content: "промпт "; }
+@media (max-width: 600px) {
+    .iig-pp-icon { width: 40px; height: 40px; }
+}
+
+/* ===== Readability: hints, small labels and field captions a bit larger and brighter ===== */
+.iig-settings { --iig-text-muted: #aba3a6; }
+.iig-settings p.hint { font-size: 13.5px; line-height: 1.5; }
+.iig-settings .checkbox_label span { font-size: 14px; }
+.iig-settings .flex-row > label, .iig-profile-field > label { font-size: 13.5px; opacity: .9; }
+.iig-profile-head small, .iig-library-empty { font-size: 13px; }
+.iig-settings .text_pole, .iig-settings select { font-size: 14px; }
+
+/* ===== «Аватары и референсы» moved into the profiles ===== */
+.iig-collapsible[data-section-id="avatars"] { display: none !important; }
+.iig-profile-avatar-slot:empty { display: none; }
+.iig-profile-avatar-slot { margin-top: 12px; padding-top: 10px; border-top: 1px dashed rgba(255, 255, 255, .1); }
+.iig-profile-avatar-slot .checkbox_label { margin-bottom: 6px; }
+.iig-profile-avatar-slot .iig-avatar-preview { margin-bottom: 0 !important; }
+.iig-profiles-describe-settings #iig_avatar_part_common { margin-top: 10px; padding-top: 10px; border-top: 1px dashed rgba(255, 255, 255, .1); }
+.iig-profiles-describe-settings #iig_avatar_part_common p.hint { margin-bottom: 0; }

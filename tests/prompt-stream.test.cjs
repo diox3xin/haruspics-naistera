@@ -50,7 +50,7 @@ test('the panel is a one-line card with status, live preview, stop and «Авт�
     assert.match(source, /class="iig-pp-chip iig-prompt-chip"/);
     assert.match(source, /class="iig-pp-progress"/);
     assert.match(source, /iig-prompt-auto-toggle/);
-    assert.match(source, /promptAutoGenerate: false/);
+    assert.match(source, /promptAutoGenerate: true/);
     // Auto runs only for freshly generated replies, marked on MESSAGE_RECEIVED.
     assert.match(source, /event_types\.MESSAGE_RECEIVED[\s\S]{0,200}pendingAutoPrompts\.add/);
     assert.match(source, /pendingAutoPrompts\.delete\(Number\(messageId\)\)\) maybeAutoGeneratePrompt/);

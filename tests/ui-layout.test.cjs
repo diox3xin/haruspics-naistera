@@ -9,7 +9,10 @@ const css = fs.readFileSync(path.join(__dirname, '..', 'style.css'), 'utf8');
 test('settings tabs go Основное → Персонажи → Промпт и стиль → Гардероб; profiles and avatars are one sub-tab', () => {
     const order = ['Основное', 'Персонажи', 'Промпт и стиль', 'Гардероб'].map(label => source.indexOf(`label: '${label}'`));
     assert.ok(order.every((pos, i) => pos > 0 && (i === 0 || pos > order[i - 1])), 'tab order');
-    assert.match(source, /label: 'Профили персонажей'[^\n]*sections: \['character_library', 'avatars'\]/);
+    assert.match(source, /label: 'Профили персонажей'[^\n]*sections: \['character_library'\]/);
+    // the avatar settings are moved into the profile cards, not shown as a separate section
+    assert.match(source, /id="iig_avatar_part_user"/);
+    assert.match(source, /class="iig-profile-avatar-slot"/);
 });
 
 test('the picture block can sit in the middle of the reply and is put back after re-renders', () => {
@@ -34,4 +37,9 @@ test('NPC text buttons are not squeezed into icon squares', () => {
 test('the wardrobe window has Одежда / Причёски for the bot and the user', () => {
     assert.match(source, /data-kind="hair"/);
     assert.match(source, /function renderQuickHairstyleList\(/);
+});
+
+test('the picture block keeps the spot it chose instead of jumping while the reply grows', () => {
+    assert.match(source, /if \(entry && entry\.anchor == null\) entry\.anchor = /);
+    assert.match(source, /placePromptPanel\(entry\.mesEl, entry\.panel, entry\)/);
 });

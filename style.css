@@ -1737,3 +1737,20 @@ body.iig-mode-inline .mes_text .iig-image-wrapper {
 @media (max-width: 600px) {
     #iig-wardrobe-modal .iig-wardrobe-grid { grid-template-columns: repeat(auto-fill, minmax(92px, 1fr)); gap: 8px; }
 }
+
+/* «Сгенерировать имена» next to the profile / NPC name fields */
+.iig-names-row {
+    display: flex;
+    gap: 6px;
+    align-items: center;
+}
+.iig-names-row > input { flex: 1; min-width: 0; }
+.iig-names-generate {
+    flex: 0 0 auto;
+    margin: 0;
+    padding: 4px 9px;
+    min-width: 0;
+}
+.iig-names-generate:disabled { opacity: .6; cursor: wait; }
+.iig-profile-names { display: flex; flex-direction: column; gap: 3px; margin: 4px 0; }
+.iig-profile-names > label { font-size: 0.85em; opacity: .8; }

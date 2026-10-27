@@ -427,8 +427,9 @@ function getCharacterProfile(kind, key, settings = getSettings(), create = false
         bucket[normalizedKey] = makeCharacterProfile();
     }
     if (!bucket[normalizedKey]) return null;
-    bucket[normalizedKey] = makeCharacterProfile(bucket[normalizedKey]);
-    return bucket[normalizedKey];
+    // Normalize in place: the settings UI keeps a reference to this object, a fresh copy would drop its edits.
+    const stored = bucket[normalizedKey];
+    return Object.assign(stored, makeCharacterProfile(stored));
 }
 
 function migrateOldCharacterLibrary(settings = getSettings()) {
@@ -2415,6 +2416,116 @@ function nameAppearsInPrompt(name, prompt) {
 /** NPC name + its «Другие имена» (array in old data, or a comma-separated string). */
 function getNpcAliases(npc) {
     return splitNameList(npc?.aliases || []);
+}
+
+const NAME_VARIANTS_MAX = 20;
+
+/** Request text for the «Сгенерировать имена» button: how this person's name can be written in RU/EN image prompts. */
+function buildNameVariantsRequest(name, existing = [], context = '') {
+    const known = splitNameList(existing);
+    const notes = String(context || '').replace(/\s+/g, ' ').trim().slice(0, 1500);
+    return [
+        `Character name: ${String(name || '').trim()}`,
+        known.length ? `Already known variants: ${known.join(', ')}` : null,
+        notes ? `Character notes (look only for nicknames of THIS character): ${notes}` : null,
+        '',
+        'List how this character can be named in an image prompt written in English or in Russian:',
+        '- full name, first name and surname, in the original script;',
+        '- the same in English (Latin) spelling and in Russian (Cyrillic) spelling, with the usual transliteration;',
+        '- common short forms of the first name (e.g. Aleksey → Alyosha, Lyosha; Алексей → Лёша) and nicknames from the notes.',
+        'Do not add other characters, titles, roles, pronouns or generic words (girl, man, boss).',
+        `Answer with ONE comma-separated line, at most ${NAME_VARIANTS_MAX} items, no numbering, no explanation.`,
+    ].filter(line => line !== null).join('\n');
+}
+
+/** Model answer → name list, merged after the existing names (no duplicates, no repeat of the main name). */
+function parseGeneratedNameList(text, existing = [], mainName = '') {
+    const body = String(text || '')
+        .replace(/<think>[\s\S]*?<\/think>/gi, '')
+        .replace(/```[a-z]*\n?|```/gi, '');
+    const lines = body.split('\n').map(line => line.trim()).filter(Boolean);
+    const listLines = lines.filter(line => line.includes(','));
+    const candidates = splitNameList(listLines.length ? listLines.join(',') : lines.join(','))
+        .map(item => item
+            .replace(/^\s*(?:[-*•]|\d+[.)])\s*/, '')
+            .replace(/^[^:]{0,40}:\s*/, '')
+            .replace(/^["'«“„]+|["'»”.!]+$/g, '')
+            .trim())
+        .filter(item => item.length >= 2 && item.length <= 40 && item.split(/\s+/).length <= 4)
+        .filter(item => /\p{L}/u.test(item) && !/[<>{}[\]=]/.test(item))
+        .filter(item => !NAME_IGNORED_WORDS.has(item.toLowerCase()));
+    const seen = new Set([String(mainName || '').trim().toLowerCase()]);
+    const result = [];
+    for (const item of [...splitNameList(existing), ...candidates]) {
+        const key = item.toLowerCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        result.push(item);
+    }
+    return result.slice(0, Math.max(NAME_VARIANTS_MAX, splitNameList(existing).length));
+}
+
+/** Short text answer: the wardrobe-description model if it is set up, otherwise the main chat model of SillyTavern. */
+async function generateShortTextWithModel(promptText, { maxTokens = 600 } = {}) {
+    const settings = getSettings();
+    const endpoint = settings.wardrobeDescEndpoint || settings.endpoint;
+    const apiKey = settings.wardrobeDescApiKey || settings.apiKey;
+    const model = settings.wardrobeDescModel;
+    if (endpoint && apiKey && model) {
+        const response = await fetch(buildOpenAIUrl(endpoint, 'chat/completions'), {
+            method: 'POST',
+            headers: buildAuthHeaders(apiKey, { 'Content-Type': 'application/json' }),
+            body: JSON.stringify({ model, max_tokens: maxTokens, temperature: 0.2, messages: [{ role: 'user', content: promptText }] }),
+        });
+        if (!response.ok) throw new Error(`API ошибка (${response.status}): ${(await response.text().catch(() => '?')).slice(0, 300)}`);
+        const result = await response.json();
+        const text = result.choices?.[0]?.message?.content;
+        const answer = (Array.isArray(text) ? text.map(part => part?.text || '').join('') : String(text || '')).trim();
+        if (!answer) throw new Error('Модель вернула пустой ответ');
+        return answer;
+    }
+    const context = SillyTavern.getContext();
+    if (typeof context.generateRaw !== 'function') {
+        throw new Error('Выберите модель в «Описание гардероба» или подключите модель чата в SillyTavern');
+    }
+    const systemPrompt = 'You are a precise assistant. Follow the output format exactly.';
+    // Newer SillyTavern takes one options object, older versions take positional arguments.
+    const answer = context.generateRaw.length >= 2
+        ? await context.generateRaw(promptText, null, false, false, systemPrompt, maxTokens)
+        : await context.generateRaw({ prompt: promptText, systemPrompt, responseLength: maxTokens });
+    if (!String(answer || '').trim()) throw new Error('Модель чата вернула пустой ответ');
+    return String(answer).trim();
+}
+
+/** Asks the model for RU/EN spellings and short forms of a name; returns the merged list. */
+async function generateNameVariants(name, existing = [], context = '') {
+    const mainName = String(name || '').trim();
+    if (!mainName) throw new Error('Сначала укажите имя');
+    const answer = await generateShortTextWithModel(buildNameVariantsRequest(mainName, existing, context));
+    const names = parseGeneratedNameList(answer, existing, mainName);
+    iigLog('INFO', `Generated name variants for "${mainName}": ${names.join(', ')}`);
+    return names;
+}
+
+/** Spinner on a «generate names» button while the request runs. */
+async function runNameGenerationButton(button, task) {
+    if (!button || button.disabled || button.classList.contains('disabled')) return;
+    const html = button.innerHTML;
+    button.disabled = true;
+    button.classList.add('disabled');
+    button.innerHTML = '<i class="fa-solid fa-spinner fa-spin" aria-hidden="true"></i>';
+    try {
+        await task();
+    } catch (error) {
+        iigLog('ERROR', `Name generation failed: ${error.message}`);
+        toastr.error(`Ошибка: ${error.message}`, 'Имена');
+    } finally {
+        if (button.isConnected) {
+            button.disabled = false;
+            button.classList.remove('disabled');
+            button.innerHTML = html;
+        }
+    }
 }
 
 // ============================================================
@@ -4587,8 +4698,11 @@ function renderNpcList() {
         detailsPanel.innerHTML = `
             <div style="margin-bottom:8px;">
                 <label style="font-size:11px;color:#9a9292;display:block;margin-bottom:3px;">Другие имена (через запятую):</label>
-                <input type="text" class="text_pole npc-aliases-input" data-npc-index="${i}" style="width:100%;font-size:11px;"
-                    placeholder="Misha, Orekhov, Миша…" value="${escapeHtml(getNpcAliases(npc).join(', '))}">
+                <div class="iig-names-row">
+                    <input type="text" class="text_pole npc-aliases-input" data-npc-index="${i}" style="font-size:11px;"
+                        placeholder="Misha, Orekhov, Миша…" value="${escapeHtml(getNpcAliases(npc).join(', '))}">
+                    <button type="button" class="menu_button iig-names-generate npc-aliases-generate" title="Сгенерировать варианты имени и фамилии на русском и английском (модель описаний гардероба или модель чата)" aria-label="Сгенерировать имена"><i class="fa-solid fa-wand-magic-sparkles" aria-hidden="true"></i></button>
+                </div>
                 <div style="font-size:10px;color:#7a7272;margin-top:2px;">Реф уходит, если в промпте есть имя, любое из этих слов или их транслит (Орехов → Orekhov).</div>
             </div>
             <div style="margin-bottom:8px;">
@@ -4657,6 +4771,19 @@ function renderNpcList() {
             settings.npcReferences[i].aliases = splitNameList(e.target.value);
             saveSettings();
             renderNpcList();
+        });
+
+        detailsPanel.querySelector('.npc-aliases-generate')?.addEventListener('click', (e) => {
+            e.stopPropagation();
+            const target = settings.npcReferences[i];
+            const input = detailsPanel.querySelector('.npc-aliases-input');
+            runNameGenerationButton(e.currentTarget, async () => {
+                const names = await generateNameVariants(target?.name, splitNameList(input?.value || ''), '');
+                target.aliases = names;
+                if (input) input.value = names.join(', ');
+                saveSettings();
+                toastr.success(names.join(', ') || 'Новых вариантов нет', `Имена: ${target.name}`, { timeOut: 6000 });
+            });
         });
 
         detailsPanel.querySelector('.npc-appearance-input')?.addEventListener('blur', (e) => {
@@ -5633,9 +5760,12 @@ function profileCardHtml(kind, entity, profile, cardPreview) {
                 <button type="button" class="menu_button iig-profile-upload"><i class="fa-solid fa-upload"></i> ${profile.customAvatarData ? 'Заменить реф' : 'Загрузить реф'}</button>
                 ${profile.customAvatarData ? '<button type="button" class="menu_button iig-profile-clear"><i class="fa-solid fa-trash"></i> Убрать</button>' : ''}
             </div>
-            <div class="flex-row">
+            <div class="iig-profile-names">
                 <label title="Если имя или любое из этих слов есть в промпте картинки — реф и описание уйдут в генерацию">Имена в промпте</label>
-                <input type="text" class="text_pole flex1 iig-profile-aliases" value="${escapeHtml(profile.aliases)}" placeholder="${kind === 'user' ? 'Eva, Ева, Evie' : 'Ivan, Vanya, Petrov'}">
+                <div class="iig-names-row">
+                <input type="text" class="text_pole iig-profile-aliases" value="${escapeHtml(profile.aliases)}" placeholder="${kind === 'user' ? 'Eva, Ева, Evie' : 'Ivan, Vanya, Petrov'}">
+                <button type="button" class="menu_button iig-names-generate iig-profile-aliases-generate" title="Сгенерировать варианты имени и фамилии на русском и английском (модель описаний гардероба или модель чата)" aria-label="Сгенерировать имена"><i class="fa-solid fa-wand-magic-sparkles" aria-hidden="true"></i></button>
+                </div>
             </div>
             <textarea class="text_pole iig-profile-appearance" rows="3" placeholder="Описание внешности: волосы, глаза, телосложение, приметы...">${escapeHtml(profile.appearance)}</textarea>
         </div>`;
@@ -5698,10 +5828,13 @@ function renderCharacterProfiles() {
             ${charProfile ? rpgCharactersHtml(charProfile) : ''}
         </div>`;
 
-    bindCharacterProfileEvents(container, { char: charProfile, user: userProfile });
+    bindCharacterProfileEvents(container, { char: charProfile, user: userProfile }, {
+        char: { name: character?.name || charEntity.title, notes: character?.description || '' },
+        user: { name: userEntity.title, notes: context.powerUserSettings?.persona_description || '' },
+    });
 }
 
-function bindCharacterProfileEvents(container, profiles) {
+function bindCharacterProfileEvents(container, profiles, owners = {}) {
     container.querySelectorAll('.iig-profile-card[data-profile-kind]').forEach(card => {
         const profile = profiles[card.dataset.profileKind];
         if (!profile) return;
@@ -5730,6 +5863,17 @@ function bindCharacterProfileEvents(container, profiles) {
         card.querySelector('.iig-profile-aliases')?.addEventListener('change', event => {
             profile.aliases = String(event.target.value || '').trim();
             saveSettings();
+        });
+        card.querySelector('.iig-profile-aliases-generate')?.addEventListener('click', event => {
+            const owner = owners[card.dataset.profileKind] || {};
+            const input = card.querySelector('.iig-profile-aliases');
+            runNameGenerationButton(event.currentTarget, async () => {
+                const names = await generateNameVariants(owner.name, splitNameList(input?.value || ''), owner.notes);
+                profile.aliases = names.join(', ');
+                if (input) input.value = profile.aliases;
+                saveSettings();
+                toastr.success(profile.aliases || 'Новых вариантов нет', `Имена: ${owner.name}`, { timeOut: 6000 });
+            });
         });
     });
     bindRpgCharacterEvents(container, profiles.char);

@@ -29,11 +29,13 @@ const chat = [
     { name: 'Novak', mes: 'The bar is dark and loud. Novak orders two drinks.' },
 ];
 const settings = { apiType: 'novelai', naisteraModel: '' };
+let fixedAppearances = [];
 const context = vm.createContext({
     SillyTavern: { getContext: () => ({ chat, characters: [{ name: 'Novak' }], characterId: 0, name1: 'Eva' }) },
     getSettings: () => settings,
     iigLog: () => {},
     checkFileExists: async () => true,
+    getFixedAppearances: () => fixedAppearances,
 });
 vm.runInContext([
     grabConst('NOVELAI_API_TYPES'),
@@ -77,3 +79,13 @@ test('a plain answer loses reasoning, code fences and the "Prompt:" label', asyn
     assert.equal(result.prompt, '1girl, bar, night, neon');
     assert.equal(result.fromTag, false);
 });
+
+test('profile appearances are given to the prompt model as fixed, with an order not to invent a new look', () => {
+    fixedAppearances = [{ name: 'Novak', appearance: 'short hair, blonde hair, scar on face' }, { name: 'Eva', appearance: 'pink hair, freckles' }];
+    const text = context.ctx(chat[3], { prompt: 'x' }, settings);
+    assert.match(text, /<fixed_appearance>\nNovak: short hair, blonde hair, scar on face\nEva: pink hair, freckles\n<\/fixed_appearance>/);
+    assert.match(text, /Do NOT describe or change their hair, eyes, skin, face or body/);
+    fixedAppearances = [];
+    assert.doesNotMatch(context.ctx(chat[3], { prompt: 'x' }, settings), /fixed_appearance/);
+});
+

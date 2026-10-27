@@ -1754,3 +1754,12 @@ body.iig-mode-inline .mes_text .iig-image-wrapper {
 .iig-names-generate:disabled { opacity: .6; cursor: wait; }
 .iig-profile-names { display: flex; flex-direction: column; gap: 3px; margin: 4px 0; }
 .iig-profile-names > label { font-size: 0.85em; opacity: .8; }
+.iig-profile-describe-row { display: flex; align-items: center; gap: 8px; margin-top: 4px; flex-wrap: wrap; }
+.iig-profile-describe-row .menu_button { margin: 0; }
+.iig-profile-describe-format { opacity: .65; }
+.iig-profile-use-card { margin: 0; font-size: 0.9em; }
+.iig-prompt-appearance { margin: 6px 0 2px; }
+.iig-prompt-appearance > summary { cursor: pointer; opacity: .85; font-size: 0.9em; }
+.iig-prompt-appearance-row { display: flex; flex-direction: column; gap: 2px; margin-top: 6px; font-size: 0.85em; }
+.iig-prompt-appearance-row > span { opacity: .75; }
+.iig-prompt-appearance-input { width: 100%; font-size: 0.95em; resize: vertical; }

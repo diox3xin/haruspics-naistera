@@ -120,15 +120,18 @@ test('collector forwards library and wardrobe descriptions, not images, to offic
     const collectorStart = source.indexOf('async function collectReferenceImages(');
     const collectorEnd = source.indexOf('// IMAGE GENERATION: OpenAI', collectorStart);
     assert.ok(collectorStart >= 0 && collectorEnd > collectorStart);
-    const settings = { apiType: 'novelai', npcReferences: [], autoDetectNames: false };
+    const settings = { apiType: 'novelai', npcReferences: [], autoDetectNames: false, sendCharAvatar: true, sendUserAvatar: true };
     const context = vm.createContext({
         getSettings: () => settings,
         SillyTavern: { getContext: () => ({ characters: [{ name: 'Hero' }], characterId: 0, name1: 'User' }) },
         collectCharacterProfileReferences: async (kind) => ({
             descriptions: [`${kind} library description`],
             refs: [{ data: 'LIBRARY_IMAGE', type: 'face' }],
+            names: [],
             hasPrimary: true,
         }),
+        namesAppearInPrompt: (names, prompt) => names.some(name => name && String(prompt).toLowerCase().includes(String(name).toLowerCase())),
+        getNpcAliases: () => [], splitNameList: value => (Array.isArray(value) ? value : [value]).filter(Boolean),
         collectRpgCharacterReferences: async () => ({ descriptions: [], refs: [] }),
         getActiveWardrobeItem: (kind) => kind === 'char'
             ? { imageData: 'WARDROBE_IMAGE', description: 'green jacket', name: 'Jacket' }

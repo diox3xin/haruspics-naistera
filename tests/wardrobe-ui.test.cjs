@@ -14,9 +14,12 @@ function section(start, end) {
 
 function collector(config = {}, outfit = {}, hair = null, refs = []) {
     const context = vm.createContext({
-        getSettings: () => ({ apiType: 'naistera', npcReferences: [], ...config }),
+        // «Всегда отправлять» on: these tests are about wardrobe modes, not about who is in the scene.
+        getSettings: () => ({ apiType: 'naistera', npcReferences: [], naisteraSendCharAvatar: true, naisteraSendUserAvatar: true, sendCharAvatar: true, sendUserAvatar: true, ...config }),
         SillyTavern: { getContext: () => ({ characters: [{ name: 'Hero' }], characterId: 0, name1: 'User' }) },
-        collectCharacterProfileReferences: async kind => ({ descriptions: [], refs: kind === 'char' ? refs : [], hasPrimary: true }),
+        collectCharacterProfileReferences: async kind => ({ descriptions: [], names: [], refs: kind === 'char' ? refs : [], hasPrimary: true }),
+        namesAppearInPrompt: (names, prompt) => names.some(name => name && String(prompt).toLowerCase().includes(String(name).toLowerCase())),
+        getNpcAliases: () => [], splitNameList: value => (Array.isArray(value) ? value : [value]).filter(Boolean),
         collectRpgCharacterReferences: async () => ({ descriptions: [], refs: [] }),
         getActiveWardrobeItem: () => outfit,
         getActiveHairstyleItem: kind => kind === 'char' ? hair : null,
@@ -70,6 +73,7 @@ test('NovelAI uses hairstyle text and reports missing wardrobe descriptions', as
 test('generated legacy tags retain prompt, style and options for regeneration', async () => {
     const context = vm.createContext({ iigLog: () => {} });
     vm.runInContext(section('function escapeHtml(', '// SETTINGS'), context);
+    vm.runInContext(section('const NAME_IGNORED_WORDS', 'function getNpcAliases('), context);
     vm.runInContext(section('function buildGeneratedImageTag(', 'async function restoreImageRegenButtons('), context);
     vm.runInContext(section('async function parseImageTags(', '// DOM HELPERS'), context);
     const tag = { prompt: `Hero's "coat" <red> & blue`, style: 'anime', aspectRatio: '2:3', negativePrompt: 'blur' };

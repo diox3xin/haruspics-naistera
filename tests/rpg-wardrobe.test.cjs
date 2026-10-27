@@ -30,6 +30,7 @@ function makeContext(settings, profile) {
         migrateOldCharacterLibrary: () => {},
         SillyTavern: { getContext: () => ({}) },
         nameAppearsInPrompt: (name, prompt) => prompt.toLowerCase().includes(name.toLowerCase()),
+        namesAppearInPrompt: (names, prompt) => names.some(name => prompt.toLowerCase().includes(name.toLowerCase())),
         detectMimeType: () => 'image/png',
     });
     vm.runInContext(

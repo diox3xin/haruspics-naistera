@@ -84,8 +84,6 @@ const defaultSettings = Object.freeze({
     sendUserAvatar: false,
     userAvatarFile: '',
     autoDetectNames: true,
-    // Appearance only from reference images + extension profile/NPC descriptions; ignore looks written in the scene text.
-    identityFromRefsOnly: false,
     defaultStyle: '',
     aspectRatio: '1:1',
     imageSize: '1K',
@@ -404,6 +402,8 @@ function makeCharacterProfile(raw = {}) {
         avatarSource: raw.avatarSource === 'custom' ? 'custom' : 'card',
         customAvatarData: String(raw.customAvatarData || ''),
         appearance: String(raw.appearance || '').trim(),
+        // Extra names to look for in the image prompt (e.g. "Viktor, Vitya, Gromov"), comma-separated.
+        aliases: String(raw.aliases || '').trim(),
         rpgMode: Boolean(raw.rpgMode),
         rpgCharacters: rpgCharacters.map(char => ({
             id: String(char?.id || `rpg_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`),
@@ -537,7 +537,7 @@ async function collectCharacterProfileReferences(kind, settings = getSettings())
     const entity = getCurrentLibraryEntity(kind, settings);
     const profile = getCharacterProfile(kind, entity.key, settings, false);
     
-    if (!profile) return { refs: [], descriptions: [], hasPrimary: false };
+    if (!profile) return { refs: [], descriptions: [], names: [], hasPrimary: false };
     
     const refs = [];
     const descriptions = [];
@@ -562,6 +562,7 @@ async function collectCharacterProfileReferences(kind, settings = getSettings())
     return {
         refs,
         descriptions,
+        names: splitNameList(profile.aliases),
         hasPrimary: profile.avatarSource === 'custom' && Boolean(profile.customAvatarData),
     };
 }
@@ -584,7 +585,7 @@ async function collectRpgCharacterReferences(prompt, settings = getSettings()) {
     
     for (const char of profile.rpgCharacters) {
         if (!char.name) continue;
-        if (!nameAppearsInPrompt(char.name, prompt)) continue;
+        if (!namesAppearInPrompt([char.name], prompt)) continue;
         
         const outfitId = settings.activeWardrobeRpg?.[char.id];
         const outfit = outfitId ? (settings.wardrobeItems || []).find(i => i.id === outfitId) : null;
@@ -1964,7 +1965,6 @@ const FAQ_HINTS = Object.freeze({
     },
     avatars: {
         '#iig_auto_detect_names': 'Авто-поиск имён в промпте и отправка их лиц как референсов.',
-        '#iig_identity_refs_only': 'Внешность (лицо, волосы, глаза, кожа, фигура) берётся только с картинок-референсов и из «Описания внешности» в профилях и NPC. Описания внешности в тексте промпта игнорируются. Не действует на NovelAI — он работает только с текстом.',
         '#iig_send_char_avatar': 'Отправлять лицо персонажа как референс во все промпты (даже если имя не упомянуто).',
         '#iig_send_user_avatar': 'Отправлять лицо юзера как референс во все промпты.',
     },
@@ -2271,11 +2271,95 @@ function initCollapsibleSections() {
 // NAME DETECTION
 // ============================================================
 
+// ============================================================
+// NAME MATCHING (who is in the picture?)
+// ============================================================
+// A reference (face / outfit / appearance text) is sent only for people the image prompt actually mentions.
+// - A name field may hold several names: "Виктор Громов, Витя, Viktor" (separators: , ; | / or new line).
+// - Every name also counts by its separate words ("Громов" alone matches "Виктор Громов"), except titles and
+//   generic placeholders ("user", "персонаж", "Lord", "капитан"…), which never trigger on their own.
+// - Cyrillic names are also searched in Latin transliteration, because chat models write image prompts in English.
+// - Russian case endings are tolerated ("Ева" also finds "Еву", "Евой").
+// - Word boundaries are Unicode-aware (plain \b only knows Latin letters).
+
+const NAME_IGNORED_WORDS = new Set([
+    'user', 'char', 'character', 'persona', 'you', 'me', 'npc', 'bot', 'the', 'and', 'of', 'man', 'woman', 'girl', 'boy',
+    'mr', 'mrs', 'ms', 'miss', 'sir', 'lady', 'lord', 'king', 'queen', 'prince', 'princess', 'captain', 'capt', 'major',
+    'colonel', 'lt', 'lieutenant', 'sergeant', 'doctor', 'dr', 'professor', 'prof', 'officer', 'detective', 'agent',
+    'юзер', 'пользователь', 'персонаж', 'персона', 'бот', 'нпс', 'господин', 'госпожа', 'капитан', 'майор', 'полковник',
+    'лейтенант', 'сержант', 'доктор', 'профессор', 'король', 'королева', 'принц', 'принцесса', 'лорд', 'леди',
+]);
+
+const RU_TO_LATIN = Object.freeze({
+    а: 'a', б: 'b', в: 'v', г: 'g', д: 'd', е: 'e', ё: 'e', ж: 'zh', з: 'z', и: 'i', й: 'y', к: 'k', л: 'l', м: 'm',
+    н: 'n', о: 'o', п: 'p', р: 'r', с: 's', т: 't', у: 'u', ф: 'f', х: 'kh', ц: 'ts', ч: 'ch', ш: 'sh', щ: 'shch',
+    ъ: '', ы: 'y', ь: '', э: 'e', ю: 'yu', я: 'ya',
+});
+
+/** SillyTavern can store Cyrillic inside the image tag attribute as &#1040;… — turn it back into letters. */
+function decodeNumericEntities(text) {
+    const value = String(text ?? '');
+    if (!value.includes('&#')) return value;
+    return value
+        .replace(/&#x([0-9a-f]+);/gi, (match, hex) => { try { return String.fromCodePoint(parseInt(hex, 16)); } catch (_) { return match; } })
+        .replace(/&#(\d+);/g, (match, dec) => { try { return String.fromCodePoint(parseInt(dec, 10)); } catch (_) { return match; } });
+}
+
+function transliterateRu(text) {
+    return String(text || '').toLowerCase().replace(/[а-яё]/g, letter => RU_TO_LATIN[letter] ?? letter);
+}
+
+/** "Виктор Громов, Витя; Viktor" → ['Виктор Громов', 'Витя', 'Viktor'] */
+function splitNameList(value) {
+    const list = Array.isArray(value) ? value : [value];
+    return list.flatMap(item => String(item ?? '').split(/[,;|/\n]+/)).map(name => name.trim()).filter(Boolean);
+}
+
+/** All strings that should count as a mention of this person. */
+function buildNameVariants(names) {
+    const variants = new Set();
+    const add = raw => {
+        const value = String(raw || '').trim().toLowerCase();
+        if (value.length < 2 || NAME_IGNORED_WORDS.has(value) || /^\{\{.*\}\}$/.test(value)) return;
+        variants.add(value);
+        if (/[а-яё]/.test(value)) {
+            const latin = transliterateRu(value);
+            if (latin.length >= 2 && !NAME_IGNORED_WORDS.has(latin)) variants.add(latin);
+        }
+    };
+    for (const name of splitNameList(names)) {
+        add(name);
+        const words = name.split(/\s+/).filter(Boolean);
+        if (words.length > 1) for (const word of words) if (word.replace(/[^\p{L}]/gu, '').length >= 3) add(word);
+    }
+    return [...variants];
+}
+
+function nameVariantPattern(variant) {
+    const escaped = variant.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\s+/g, '\\s+');
+    // Russian declension: a single Cyrillic word ending in a vowel/й/ь may change that ending (Ева → Еву, Евой).
+    if (/^[а-яё]{3,}$/.test(variant) && /[аеёиоуыэюяйь]$/.test(variant)) {
+        return `${escaped.slice(0, -1)}[а-яё]{0,3}`;
+    }
+    if (/^[а-яё]{4,}$/.test(variant)) return `${escaped}[а-яё]{0,3}`;
+    return escaped;
+}
+
+/** True when any of the names (or their words / transliterations) is mentioned in the prompt. */
+function namesAppearInPrompt(names, prompt) {
+    const text = decodeNumericEntities(prompt);
+    if (!text) return false;
+    return buildNameVariants(names).some(variant =>
+        new RegExp(`(?<![\\p{L}\\p{N}_])${nameVariantPattern(variant)}(?![\\p{L}\\p{N}_])`, 'iu').test(text));
+}
+
 function nameAppearsInPrompt(name, prompt) {
-    if (!name || !prompt) return false;
-    const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const regex = new RegExp(`\\b${escaped}\\b`, 'i');
-    return regex.test(prompt);
+    return namesAppearInPrompt([name], prompt);
+}
+
+/** NPC name + its «Другие имена» (array in old data, or a comma-separated string). */
+function getNpcAliases(npc) {
+    return splitNameList(npc?.aliases || []);
 }
 
 // ============================================================
@@ -2292,22 +2376,6 @@ const MAX_IMAGE_REFS = 4;
  * @param {string} prompt - Combined prompt text for name detection
  * @returns {{ imageRefs: Array, textOnlyClothing: Array, warnings: Array }}
  */
-/**
- * «Внешность только из референсов»: the scene prompt is written by the chat model, which often copies looks from the
- * character card / persona. This rule tells the image model to take identity only from the reference images and the
- * APPEARANCE notes coming from extension profiles / NPCs.
- */
-function buildIdentityFromRefsDirective(faceRefs, textDirectives) {
-    const names = new Set(faceRefs.filter(ref => ref.type === 'face' && ref.name).map(ref => ref.name));
-    for (const directive of textDirectives) {
-        const match = String(directive).match(/^\[(?:CHARACTER APPEARANCE for "([^"]+)"|CHARACTER "([^"]+)" APPEARANCE|(USER) APPEARANCE)\]/);
-        if (match) names.add(match[1] || match[2] || 'the user');
-    }
-    if (!names.size) return '';
-    const list = [...names].map(name => `"${name}"`).join(', ');
-    return `[IDENTITY RULE]: The appearance of ${list} (face, hair colour and hairstyle, eye colour, skin tone, body type, apparent age) must come ONLY from their reference images and their APPEARANCE notes. Ignore any physical description of these characters inside the scene text; use the scene text only for action, pose, expression, clothing, setting, lighting and composition.`;
-}
-
 async function collectReferenceImages(prompt) {
     const settings = getSettings();
     const context = SillyTavern.getContext();
@@ -2323,7 +2391,22 @@ async function collectReferenceImages(prompt) {
 
     const characterLibrary = await collectCharacterProfileReferences('char', settings);
     const userLibrary = await collectCharacterProfileReferences('user', settings);
-    textDirectives.push(...characterLibrary.descriptions, ...userLibrary.descriptions);
+
+    // Who is in the picture? A bot/persona is included when its name (or one of its profile names) is mentioned
+    // in the prompt, or when «Всегда отправлять» is on. Their face, appearance text, outfit and hairstyle all follow
+    // this decision, so people who are not in the scene do not take reference slots.
+    const textOnly = ['novelai', 'novelai-direct'].includes(settings.apiType);
+    const useNaisteraRefs = settings.apiType === 'naistera';
+    const charAlways = Boolean(useNaisteraRefs ? settings.naisteraSendCharAvatar : settings.sendCharAvatar);
+    const userAlways = Boolean(useNaisteraRefs ? settings.naisteraSendUserAvatar : settings.sendUserAvatar);
+    const charMentioned = Boolean(charName) && namesAppearInPrompt([charName, ...characterLibrary.names], prompt);
+    const userMentioned = Boolean(userName) && namesAppearInPrompt([userName, ...userLibrary.names], prompt);
+    const includeChar = Boolean(charName) && (charAlways || (settings.autoDetectNames && charMentioned));
+    const includeUser = Boolean(userName) && (userAlways || (settings.autoDetectNames && userMentioned));
+    iigLog('INFO', `In scene: char "${charName}" ${includeChar ? 'yes' : 'no'} (mentioned: ${charMentioned}), user "${userName}" ${includeUser ? 'yes' : 'no'} (mentioned: ${userMentioned})`);
+
+    if (includeChar) textDirectives.push(...characterLibrary.descriptions);
+    if (includeUser) textDirectives.push(...userLibrary.descriptions);
 
     // RPG characters (multi-character bots)
     const rpgRefs = await collectRpgCharacterReferences(prompt, settings);
@@ -2331,10 +2414,8 @@ async function collectReferenceImages(prompt) {
 
     // ===== STEP 1: Collect face references (HIGHEST PRIORITY) =====
 
-    const useNaisteraRefs = settings.apiType === 'naistera';
-    const needCharAvatar = !['novelai', 'novelai-direct'].includes(settings.apiType) && !characterLibrary.hasPrimary && ((useNaisteraRefs ? settings.naisteraSendCharAvatar : settings.sendCharAvatar) ||
-        (settings.autoDetectNames && charName && nameAppearsInPrompt(charName, prompt)));
-    if (characterLibrary.refs.length > 0) faceRefs.push(...characterLibrary.refs);
+    const needCharAvatar = !textOnly && includeChar && !characterLibrary.hasPrimary;
+    if (includeChar && characterLibrary.refs.length > 0) faceRefs.push(...characterLibrary.refs);
 
     if (needCharAvatar) {
         const charAvatar = await getCharacterAvatarBase64();
@@ -2350,9 +2431,8 @@ async function collectReferenceImages(prompt) {
         }
     }
 
-    const needUserAvatar = !['novelai', 'novelai-direct'].includes(settings.apiType) && !userLibrary.hasPrimary && ((useNaisteraRefs ? settings.naisteraSendUserAvatar : settings.sendUserAvatar) ||
-        (settings.autoDetectNames && userName && nameAppearsInPrompt(userName, prompt)));
-    if (userLibrary.refs.length > 0) faceRefs.push(...userLibrary.refs);
+    const needUserAvatar = !textOnly && includeUser && !userLibrary.hasPrimary;
+    if (includeUser && userLibrary.refs.length > 0) faceRefs.push(...userLibrary.refs);
 
     // RPG character face refs (NovelAI receives text descriptions only)
     if (!['novelai', 'novelai-direct'].includes(settings.apiType) && rpgRefs.refs.length > 0) {
@@ -2379,7 +2459,7 @@ async function collectReferenceImages(prompt) {
         for (const npc of settings.npcReferences) {
             ensureNpcDefaults(npc);
             if (!npc.enabled || !npc.name) continue;
-            if (!nameAppearsInPrompt(npc.name, prompt)) continue;
+            if (!namesAppearInPrompt([npc.name, ...getNpcAliases(npc)], prompt)) continue;
 
             if (npc.imageData) {
                 faceRefs.push({
@@ -2434,6 +2514,7 @@ async function collectReferenceImages(prompt) {
     for (const { name, outfit } of (rpgRefs.outfits || [])) pushOutfit(name, outfit);
 
     for (const target of ['char', 'user']) {
+        if (target === 'char' ? !includeChar : !includeUser) continue;
         const name = target === 'char' ? (charName || 'Character') : (userName || 'User');
         pushOutfit(name, getActiveWardrobeItem(target));
 
@@ -2504,10 +2585,6 @@ async function collectReferenceImages(prompt) {
     // Final array: faces first, then clothing images
     const imageRefs = [...faceRefs, ...clothingAsImage];
 
-    if (settings.identityFromRefsOnly) {
-        const directive = buildIdentityFromRefsDirective(faceRefs, textDirectives);
-        if (directive) textDirectives.unshift(directive);
-    }
     iigLog('INFO', `Reference collection: ${faceRefs.length} face(s), ${clothingAsImage.length} clothing image(s), ${textOnlyClothing.length} clothing text(s), ${warnings.length} warning(s). Total image refs: ${imageRefs.length}/${MAX_IMAGE_REFS}`);
 
     return { imageRefs, textOnlyClothing, textDirectives, warnings };
@@ -3007,6 +3084,21 @@ function parseImageFromApiResponse(result) {
     return null;
 }
 
+/**
+ * One numbered list that matches the order the images are attached in, so the model knows exactly which picture is whom:
+ * "Image 1 = FACE of "Viktor" …, Image 2 = OUTFIT of "Eva" …".
+ */
+function buildReferenceLegend(imageRefs) {
+    const lines = imageRefs.map((ref, index) => {
+        const n = index + 1;
+        if (ref.type === 'face') return `Image ${n} = FACE of "${ref.name}": keep this person's face and identity exactly (not the pose, expression, framing or art style of the picture).`;
+        if (ref.type === 'clothing') return `Image ${n} = OUTFIT of "${ref.name}"${ref.outfitName ? ` ("${ref.outfitName}")` : ''}: copy only the clothing, not the face, body or pose.${ref.description ? ` ${ref.description}` : ''}`;
+        if (ref.type === 'hairstyle') return `Image ${n} = HAIRSTYLE of "${ref.name}": copy only the hair, not the face.`;
+        return `Image ${n} = reference for "${ref.name}".`;
+    });
+    return `[REFERENCE IMAGES, in the order they are attached]\n${lines.join('\n')}\nUse each reference only for its own named person. Draw only the people the scene mentions.`;
+}
+
 async function generateImageOpenAIChat(prompt, style, refData, options = {}) {
     const settings = getSettings();
     const url = buildOpenAIUrl(settings.endpoint, 'chat/completions');
@@ -3035,11 +3127,7 @@ async function generateImageOpenAIChat(prompt, style, refData, options = {}) {
     if (style) promptParts.push(`[Art Style: ${style}]`);
     for (const directive of textDirectives) promptParts.push(directive);
     for (const c of textOnlyClothing) promptParts.push(`[CLOTHING: ${c.charName} is wearing: ${c.description}]`);
-    for (const ref of imageRefs) {
-        if (ref.type === 'face') promptParts.push(`[FACE REFERENCE: ${ref.name}] Copy this character's face and identity as closely as possible.`);
-        if (ref.type === 'clothing') promptParts.push(`[CLOTHING REFERENCE for ${ref.name}: ${ref.description || ref.outfitName || 'copy the outfit only, not the face'}]`);
-        if (ref.type === 'hairstyle') promptParts.push(`[HAIRSTYLE REFERENCE for ${ref.name}: copy only the hair, not the face]`);
-    }
+    if (imageRefs.length) promptParts.push(buildReferenceLegend(imageRefs));
     promptParts.push(`[SCENE TO GENERATE]\n${prompt}`);
     const galleryNegative = options.negativePrompt == null
         ? String(settings.negativeGalleryItems?.find(item => item.id === settings.activeNegativeId)?.prompt || '').trim()
@@ -3481,7 +3569,7 @@ async function parseImageTags(text, options = {}) {
             const data = JSON.parse(nj);
             tags.push({
                 fullMatch: fullImgTag, index: imgStart,
-                style: data.style || '', prompt: data.prompt || '',
+                style: decodeNumericEntities(data.style || ''), prompt: decodeNumericEntities(data.prompt || ''),
                 aspectRatio: data.aspect_ratio || data.aspectRatio || null,
                 imageSize: data.image_size || data.imageSize || null,
                 quality: data.quality || null,
@@ -3533,7 +3621,7 @@ async function parseImageTags(text, options = {}) {
             }
             tags.push({
                 fullMatch: tagOnly, index: markerIndex,
-                style: data.style || '', prompt: data.prompt || '',
+                style: decodeNumericEntities(data.style || ''), prompt: decodeNumericEntities(data.prompt || ''),
                 aspectRatio: data.aspect_ratio || data.aspectRatio || null,
                 imageSize: data.image_size || data.imageSize || null,
                 quality: data.quality || null,
@@ -4318,7 +4406,14 @@ function renderNpcList() {
 
         const nameSpan = document.createElement('span');
         nameSpan.textContent = npc.name;
-        nameSpan.style.cssText = 'flex:1;color:#e8e0e0;font-size:13px;font-weight:500;';
+        nameSpan.style.cssText = 'flex:1;min-width:0;color:#e8e0e0;font-size:13px;font-weight:500;overflow:hidden;text-overflow:ellipsis;';
+        const aliasList = getNpcAliases(npc);
+        if (aliasList.length) {
+            const aliasHint = document.createElement('small');
+            aliasHint.textContent = aliasList.join(', ');
+            aliasHint.style.cssText = 'display:block;color:#7a7272;font-size:10px;font-weight:400;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;';
+            nameSpan.appendChild(aliasHint);
+        }
 
         const expandBtn = document.createElement('div');
         expandBtn.className = 'menu_button';
@@ -4364,6 +4459,12 @@ function renderNpcList() {
         const detailsPanel = document.createElement('div');
         detailsPanel.style.cssText = 'display:none;padding-top:8px;border-top:1px solid rgba(255,255,255,0.05);';
         detailsPanel.innerHTML = `
+            <div style="margin-bottom:8px;">
+                <label style="font-size:11px;color:#9a9292;display:block;margin-bottom:3px;">Другие имена (через запятую):</label>
+                <input type="text" class="text_pole npc-aliases-input" data-npc-index="${i}" style="width:100%;font-size:11px;"
+                    placeholder="Lyosha, Tikhonov, Лёша…" value="${escapeHtml(getNpcAliases(npc).join(', '))}">
+                <div style="font-size:10px;color:#7a7272;margin-top:2px;">Реф уходит, если в промпте есть имя, любое из этих слов или их транслит (Тихонов → Tikhonov).</div>
+            </div>
             <div style="margin-bottom:8px;">
                 <label style="font-size:11px;color:#9a9292;display:block;margin-bottom:3px;">Описание внешности:</label>
                 <textarea class="text_pole npc-appearance-input" rows="3" style="width:100%;font-size:11px;resize:vertical;"
@@ -4424,6 +4525,12 @@ function renderNpcList() {
             detailsPanel.style.display = isExpanded ? 'none' : 'block';
             expandBtn.querySelector('i').classList.toggle('fa-chevron-down', isExpanded);
             expandBtn.querySelector('i').classList.toggle('fa-chevron-up', !isExpanded);
+        });
+
+        detailsPanel.querySelector('.npc-aliases-input')?.addEventListener('change', (e) => {
+            settings.npcReferences[i].aliases = splitNameList(e.target.value);
+            saveSettings();
+            renderNpcList();
         });
 
         detailsPanel.querySelector('.npc-appearance-input')?.addEventListener('blur', (e) => {
@@ -5400,6 +5507,10 @@ function profileCardHtml(kind, entity, profile, cardPreview) {
                 <button type="button" class="menu_button iig-profile-upload"><i class="fa-solid fa-upload"></i> ${profile.customAvatarData ? 'Заменить реф' : 'Загрузить реф'}</button>
                 ${profile.customAvatarData ? '<button type="button" class="menu_button iig-profile-clear"><i class="fa-solid fa-trash"></i> Убрать</button>' : ''}
             </div>
+            <div class="flex-row">
+                <label title="Если имя или любое из этих слов есть в промпте картинки — реф и описание уйдут в генерацию">Имена в промпте</label>
+                <input type="text" class="text_pole flex1 iig-profile-aliases" value="${escapeHtml(profile.aliases)}" placeholder="${kind === 'user' ? 'Eva, Ева, Evie' : 'Viktor, Vitya, Gromov'}">
+            </div>
             <textarea class="text_pole iig-profile-appearance" rows="3" placeholder="Описание внешности: волосы, глаза, телосложение, приметы...">${escapeHtml(profile.appearance)}</textarea>
         </div>`;
 }
@@ -5488,6 +5599,10 @@ function bindCharacterProfileEvents(container, profiles) {
         });
         card.querySelector('.iig-profile-appearance')?.addEventListener('input', event => {
             profile.appearance = event.target.value;
+            saveSettings();
+        });
+        card.querySelector('.iig-profile-aliases')?.addEventListener('change', event => {
+            profile.aliases = String(event.target.value || '').trim();
             saveSettings();
         });
     });
@@ -5845,12 +5960,6 @@ function createSettingsUI() {
                                 <span>Авто-определение имён в промпте</span>
                             </label>
                             <p class="hint">Если имя персонажа/юзера найдено в промпте картинки, аватар отправится автоматически.</p>
-
-                            <label class="checkbox_label">
-                                <input type="checkbox" id="iig_identity_refs_only" ${settings.identityFromRefsOnly ? 'checked' : ''}>
-                                <span>Внешность только с референсов и профилей</span>
-                            </label>
-                            <p class="hint">Лицо, волосы, глаза и фигура берутся только с аватаров/рефов и из «Описания внешности» в профилях и NPC. Внешность, которую модель чата списала в промпт из карточки или персоны, игнорируется. Не действует на NovelAI.</p>
 
                             <label class="checkbox_label">
                                 <input type="checkbox" id="iig_send_char_avatar" ${settings.sendCharAvatar ? 'checked' : ''}>
@@ -6392,7 +6501,6 @@ function bindSettingsEvents() {
     document.getElementById('iig_negative_clear_active')?.addEventListener('click', () => { settings.activeNegativeId = ''; saveSettings(); renderNegativeGallery(); });
 
     document.getElementById('iig_auto_detect_names')?.addEventListener('change', (e) => { settings.autoDetectNames = e.target.checked; saveSettings(); });
-    document.getElementById('iig_identity_refs_only')?.addEventListener('change', (e) => { settings.identityFromRefsOnly = e.target.checked; saveSettings(); });
 
     document.getElementById('iig_send_char_avatar')?.addEventListener('change', (e) => { settings.sendCharAvatar = e.target.checked; saveSettings(); });
 

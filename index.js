@@ -2463,18 +2463,34 @@ const NAME_COMMON_WORDS = new Set([
     'роза', 'лилия', 'вера', 'надежда', 'любовь', 'лев', 'слава', 'мир', 'роман', 'заря', 'звезда',
 ]);
 
+/** Regexps for every spelling of the names. `atStart` — only at the very beginning of the text (one tag). */
+function nameRegexps(names, atStart = false) {
+    const before = atStart ? '^\\s*' : '(?<![\\p{L}\\p{N}_])';
+    return [...buildNameVariants(names)].map(([variant, isTransliteration]) => {
+        const pattern = nameVariantPattern(variant, isTransliteration);
+        if (NAME_COMMON_WORDS.has(variant)) {
+            const capitalized = pattern.charAt(0).toUpperCase() + pattern.slice(1);
+            return new RegExp(`${before}(?:${capitalized}|${variant.toUpperCase()})(?![\\p{L}\\p{N}_])`, 'u');
+        }
+        return new RegExp(`${before}${pattern}(?![\\p{L}\\p{N}_])`, 'iu');
+    });
+}
+
 /** True when any of the names (or their words / transliterations) is mentioned in the prompt. */
 function namesAppearInPrompt(names, prompt) {
     const text = decodeNumericEntities(prompt);
     if (!text) return false;
-    return [...buildNameVariants(names)].some(([variant, isTransliteration]) => {
-        const pattern = nameVariantPattern(variant, isTransliteration);
-        if (NAME_COMMON_WORDS.has(variant)) {
-            const capitalized = pattern.charAt(0).toUpperCase() + pattern.slice(1);
-            return new RegExp(`(?<![\\p{L}\\p{N}_])(?:${capitalized}|${variant.toUpperCase()})(?![\\p{L}\\p{N}_])`, 'u').test(text);
-        }
-        return new RegExp(`(?<![\\p{L}\\p{N}_])${pattern}(?![\\p{L}\\p{N}_])`, 'iu').test(text);
-    });
+    return nameRegexps(names).some(regexp => regexp.test(text));
+}
+
+/**
+ * Index of the first comma-separated tag that STARTS with one of the names ("Eveline", "Eveline smiling"), or -1.
+ * "looking at Eveline" only mentions her — such a part of the prompt is about somebody else.
+ */
+function nameLeadsTagIndex(names, prompt) {
+    const tags = decodeNumericEntities(prompt).split(',');
+    const regexps = nameRegexps(names, true);
+    return tags.findIndex(tag => regexps.some(regexp => regexp.test(tag)));
 }
 
 function nameAppearsInPrompt(name, prompt) {
@@ -2623,10 +2639,10 @@ async function collectReferenceImages(prompt) {
     // otherwise they are general tags and every figure in the picture wears them.
     const personTags = [];
     const personDirectives = new Set();
-    const addPersonDirective = (name, description, directive) => {
+    const addPersonDirective = (name, description, directive, kind = 'outfit') => {
         textDirectives.push(directive);
         personDirectives.add(directive);
-        personTags.push({ charName: name, description: String(description || '').trim() });
+        personTags.push({ charName: name, description: String(description || '').trim(), kind });
     };
 
     const charName = context.characters?.[context.characterId]?.name || null;
@@ -2779,7 +2795,7 @@ async function collectReferenceImages(prompt) {
         const hairMode = settings.hairstyleSendMode || 'both';
         if (hairstyle && hairMode !== 'none') {
             if (hairstyle.description?.trim()) {
-                addPersonDirective(name, hairstyle.description, `[HAIRSTYLE INSTRUCTION for "${name}"]: ${hairstyle.description}`);
+                addPersonDirective(name, hairstyle.description, `[HAIRSTYLE INSTRUCTION for "${name}"]: ${hairstyle.description}`, 'hairstyle');
             }
             if (hairstyle.imageData && hairMode === 'both' && !textOnlyProvider) {
                 clothingRefs.push({
@@ -3086,56 +3102,100 @@ function novelAISupportsCharacterPrompts(model) {
     return /^nai-diffusion-(4|5)/.test(String(model || ''));
 }
 
+/** Clothing words: when a character's own "|" part already dresses them, the wardrobe text is not added again. */
+const NOVELAI_GARMENT_PATTERN = /\b(?:dress|gown|skirt|blouse|shirt|t-shirt|sweater|jumper|hoodie|jacket|coat|cardigan|vest|waistcoat|suit|uniform|apron|robe|kimono|yukata|pants|trousers|jeans|shorts|leggings|corset|bodice|lingerie|bra|bikini|swimsuit|pajamas|nightgown|negligee|cape|cloak|tunic|overalls|turtleneck|blazer|tank top|crop top|camisole|leotard|armor|armour|naked|nude|topless)\b/i;
+
+/**
+ * Where a character stands, from words like "top left focus frame", "on the right", "bottom panel".
+ * Returns NovelAI grid coordinates or null. Body parts ("left hand") are not positions.
+ */
+function novelAICenterFor(caption) {
+    const text = String(caption || '').toLowerCase();
+    const patterns = [
+        /\b(top|upper|bottom|lower)[\s-]+(left|right)\b/,
+        /\b(?:on the )(left|right)\b/,
+        /\b(main|center|centre|middle)[\s-]+(?:frame|panel)\b/,
+        /\b(left|right)(?:[\s-]+side|[\s-]+(?:focus[\s-]+)?(?:frame|panel))\b/,
+        /\b(top|upper|bottom|lower)(?:[\s-]+(?:focus[\s-]+)?(?:frame|panel))\b/,
+    ];
+    let best = null;
+    for (const pattern of patterns) {
+        const match = pattern.exec(text);
+        if (match && (!best || match.index < best.index)) best = match;
+    }
+    if (!best) return null;
+    const words = best.slice(1).filter(Boolean);
+    const x = words.includes('left') ? 0.3 : words.includes('right') ? 0.7 : 0.5;
+    const y = words.some(word => word === 'top' || word === 'upper') ? 0.3 : words.some(word => word === 'bottom' || word === 'lower') ? 0.7 : 0.5;
+    return { x, y };
+}
+
 /**
  * Splits a NovelAI prompt written as "scene | character 1 | character 2" and attaches every person's own
- * appearance + outfit to the segment that names them. People who are in the scene but have no segment of their own
- * (or the whole prompt when there is no "|") keep their tags in the base caption.
+ * appearance, hairstyle and outfit to the segment that names them. The outfit is skipped when that segment already
+ * describes clothes (the prompt model dressed them from the wardrobe injection) — a second, longer copy made the
+ * caption so heavy that NovelAI spread its details over the other figures.
+ * People in the scene without a segment of their own get a separate character prompt.
  * Returns { base: string[], characters: string[] } — tag chunks, not yet joined.
  */
 function buildNovelAICaptions(prompt, refData = {}) {
     const people = Array.isArray(refData.people) ? refData.people : [];
     const outfits = new Map();
-    const addOutfit = (name, description) => {
+    const extras = new Map();
+    const add = (map, name, description) => {
         const text = String(description || '').trim();
         if (!text) return;
         const key = String(name || '').trim().toLowerCase();
-        outfits.set(key, [...(outfits.get(key) || []), text]);
+        map.set(key, [...(map.get(key) || []), text]);
     };
-    for (const clothing of (refData.textOnlyClothing || [])) addOutfit(clothing.charName, clothing.description);
-    for (const ref of (refData.imageRefs || [])) if (ref.type === 'clothing') addOutfit(ref.name, ref.description);
-    for (const tag of (refData.personTags || [])) addOutfit(tag.charName, tag.description);
+    for (const clothing of (refData.textOnlyClothing || [])) add(outfits, clothing.charName, clothing.description);
+    for (const ref of (refData.imageRefs || [])) if (ref.type === 'clothing') add(outfits, ref.name, ref.description);
+    for (const tag of (refData.personTags || [])) add(tag.kind === 'hairstyle' ? extras : outfits, tag.charName, tag.description);
 
-    const tagsFor = person => [
+    const keyOf = person => String(person.name || '').trim().toLowerCase();
+    const tagsFor = (person, segment = '') => [
         String(person.appearance || '').trim(),
-        ...(outfits.get(String(person.name || '').trim().toLowerCase()) || []),
+        ...(extras.get(keyOf(person)) || []),
+        ...(NOVELAI_GARMENT_PATTERN.test(segment) ? [] : (outfits.get(keyOf(person)) || [])),
     ].filter(Boolean);
-    const placedOutfits = new Set();
-    const markPlaced = person => placedOutfits.add(String(person.name || '').trim().toLowerCase());
+    const handled = new Set();
 
     const segments = String(prompt || '').split('|').map(part => part.trim()).filter(Boolean);
-    const characters = [];
+    const characterSegments = segments.slice(1, 1 + NOVELAI_MAX_CHARACTERS);
+    // A "|" part belongs to the person whose name starts one of its tags, the earliest such tag wins.
+    // A part that only mentions someone ("looking at Eveline") is not theirs.
+    const candidates = [];
+    people.forEach(person => characterSegments.forEach((segment, index) => {
+        const tagIndex = nameLeadsTagIndex(person.names || [person.name], segment);
+        if (tagIndex >= 0) candidates.push({ person, index, tagIndex });
+    }));
+    candidates.sort((a, b) => a.tagIndex - b.tagIndex || a.index - b.index);
+    const owners = new Array(characterSegments.length).fill(null);
     const placed = new Set();
-    for (const segment of segments.slice(1, 1 + NOVELAI_MAX_CHARACTERS)) {
-        const person = people.find(candidate => !placed.has(candidate) && namesAppearInPrompt(candidate.names || [candidate.name], segment));
-        if (person) { placed.add(person); markPlaced(person); }
-        characters.push([segment, ...(person ? tagsFor(person) : [])].filter(Boolean).join(', '));
+    for (const { person, index } of candidates) {
+        if (owners[index] || placed.has(person)) continue;
+        owners[index] = person;
+        placed.add(person);
+        handled.add(keyOf(person));
     }
+    const characters = characterSegments.map((segment, index) => {
+        const person = owners[index];
+        return [segment, ...(person ? tagsFor(person, segment) : [])].filter(Boolean).join(', ');
+    });
     // More segments than NovelAI allows: keep the extra text in the base prompt instead of losing it.
     const overflow = segments.slice(1 + NOVELAI_MAX_CHARACTERS);
 
-    // People in the scene without a "|" part of their own get a separate character prompt with their name,
-    // appearance and outfit — in the scene part these tags would land on everybody.
     const base = [];
     for (const person of people) {
         if (placed.has(person)) continue;
         const tags = tagsFor(person);
-        markPlaced(person);
+        handled.add(keyOf(person));
         if (!tags.length) continue;
         if (characters.length < NOVELAI_MAX_CHARACTERS) characters.push([person.name, ...tags].filter(Boolean).join(', '));
         else base.push(...tags);
     }
-    // Outfits of people without an appearance entry (e.g. only a wardrobe item) are not lost either.
-    for (const [key, list] of outfits) if (!placedOutfits.has(key)) base.push(...list);
+    // Outfits/hairstyles of people without an appearance entry (e.g. only a wardrobe item) are not lost either.
+    for (const map of [outfits, extras]) for (const [key, list] of map) if (!handled.has(key)) base.push(...list);
     base.push(segments[0] || '', ...overflow);
     return { base: base.filter(Boolean), characters };
 }
@@ -3221,6 +3281,10 @@ async function generateImageNovelAI(prompt, style, refData = {}, options = {}) {
     const token = direct ? normalizeApiKey(settings.novelaiApiKey) : '';
     if (direct && !token) throw new Error('Введите NovelAI Access Token в настройках haruspics.');
     const characterCaptions = useCharacterPrompts ? captions.characters : [];
+    // Positions from the prompt ("top left focus frame", "on the right") keep each person in their own place.
+    const centers = characterCaptions.map(text => novelAICenterFor(text));
+    const useCoords = centers.some(Boolean);
+    const centerOf = index => centers[index] || { x: 0.5, y: 0.5 };
     iigLog('INFO', `NovelAI ${direct ? 'direct' : 'SillyTavern'}: model=${body.model}, size=${width}x${height}, text=${body.prompt.length} chars, character prompts=${characterCaptions.length}`);
     const negative = body.negative_prompt || '';
     const directBody = direct ? {
@@ -3235,11 +3299,11 @@ async function generateImageNovelAI(prompt, style, refData = {}, options = {}) {
             controlnet_strength: 1, deliberate_euler_ancestral_bug: false,
             dynamic_thresholding: body.decrisper, legacy: false, legacy_v3_extend: false,
             sm: body.sm, sm_dyn: body.sm_dyn, uncond_scale: 1,
-            skip_cfg_above_sigma: null, use_coords: false,
-            characterPrompts: characterCaptions.map(text => ({ prompt: text, uc: '', center: { x: 0.5, y: 0.5 }, enabled: true })),
+            skip_cfg_above_sigma: null, use_coords: useCoords,
+            characterPrompts: characterCaptions.map((text, index) => ({ prompt: text, uc: '', center: centerOf(index), enabled: true })),
             reference_image_multiple: [], reference_information_extracted_multiple: [], reference_strength_multiple: [],
-            v4_negative_prompt: { caption: { base_caption: negative, char_captions: characterCaptions.map(() => ({ char_caption: '', centers: [{ x: 0.5, y: 0.5 }] })) }, legacy_uc: false },
-            v4_prompt: { caption: { base_caption: body.prompt, char_captions: characterCaptions.map(text => ({ char_caption: text, centers: [{ x: 0.5, y: 0.5 }] })) }, use_coords: false, use_order: true },
+            v4_negative_prompt: { caption: { base_caption: negative, char_captions: characterCaptions.map((text, index) => ({ char_caption: '', centers: [centerOf(index)] })) }, legacy_uc: false },
+            v4_prompt: { caption: { base_caption: body.prompt, char_captions: characterCaptions.map((text, index) => ({ char_caption: text, centers: [centerOf(index)] })) }, use_coords: useCoords, use_order: true },
         },
     } : null;
     const response = await fetch(direct ? 'https://image.novelai.net/ai/generate-image' : '/api/novelai/generate-image', {

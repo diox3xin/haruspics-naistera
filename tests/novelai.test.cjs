@@ -27,6 +27,7 @@ function setup(response, settings = {}) {
         SillyTavern: { getContext: () => ({ getRequestHeaders: () => ({ 'Content-Type': 'application/json', 'X-CSRF-Token': 'test' }) }) },
         fetch: async (url, init) => { requests.push({ url, init }); return response; },
         namesAppearInPrompt: (names, text) => names.some(name => String(text).toLowerCase().includes(String(name).toLowerCase())),
+        nameLeadsTagIndex: (names, text) => String(text).split(',').findIndex(tag => names.some(name => tag.trim().toLowerCase().startsWith(String(name).toLowerCase()))),
     });
     vm.runInContext(source.slice(start, end), context);
     return { generate: context.generateImageNovelAI, requests };
@@ -243,3 +244,45 @@ test('English text gets the "english text" tag; prompts without text keep the ne
     assert.equal(plain.negative_prompt, 'text, blurry');
 });
 
+test('a character already dressed by the prompt does not get the wardrobe text again; appearance still goes in', async () => {
+    const { generate, requests } = setup({ ok: false, status: 500, text: async () => '' }, { apiType: 'novelai-direct', novelaiApiKey: 'tok' });
+    await assert.rejects(generate.call(null, 'comic page | girl, Marta, red hair, apron | girl, Eveline, cream blouse, long black skirt, frightened', '', {
+        people: [{ name: 'Eveline', names: ['Eveline'], appearance: 'pink hair, blue eyes' }],
+        textOnlyClothing: [{ charName: 'Eveline', description: 'This elegant ensemble features a cream silken blouse and a floor-length black skirt.' }],
+        personTags: [{ charName: 'Eveline', description: 'twin braids', kind: 'hairstyle' }],
+        textDirectives: [],
+    }));
+    const body = JSON.parse(requests[0].init.body);
+    const chars = body.parameters.v4_prompt.caption.char_captions.map(c => c.char_caption);
+    assert.deepEqual(chars, ['girl, Marta, red hair, apron', 'girl, Eveline, cream blouse, long black skirt, frightened, pink hair, blue eyes, twin braids']);
+    assert.doesNotMatch(body.input, /ensemble/);
+});
+
+test('panel and side words become character positions; body parts and gaze do not', async () => {
+    const { generate, requests } = setup({ ok: false, status: 500, text: async () => '' }, { apiType: 'novelai-direct', novelaiApiKey: 'tok' });
+    await assert.rejects(generate.call(null, 'comic page | girl, top left focus frame, Marta, raising right hand | girl, main frame, top left focus frame, Eveline | boy, on the right, Novak | girl, looking to the left, holding cup in left hand, Ivy', '', { people: [], textDirectives: [] }));
+    const body = JSON.parse(requests[0].init.body);
+    assert.equal(body.parameters.use_coords, true);
+    assert.equal(body.parameters.v4_prompt.use_coords, true);
+    const centers = body.parameters.v4_prompt.caption.char_captions.map(c => `${c.centers[0].x},${c.centers[0].y}`);
+    assert.deepEqual(centers, ['0.3,0.3', '0.5,0.5', '0.7,0.5', '0.5,0.5']);
+    assert.deepEqual(body.parameters.characterPrompts.map(c => `${c.center.x},${c.center.y}`), centers);
+});
+
+test('without position words the coordinates stay off', async () => {
+    const { generate, requests } = setup({ ok: false, status: 500, text: async () => '' }, { apiType: 'novelai-direct', novelaiApiKey: 'tok' });
+    await assert.rejects(generate.call(null, 'cafe | girl, Marta | girl, Eveline', '', { people: [], textDirectives: [] }));
+    const body = JSON.parse(requests[0].init.body);
+    assert.equal(body.parameters.use_coords, false);
+});
+
+test('a part that only looks at someone does not get their appearance', async () => {
+    const { generate, requests } = setup({ ok: false, status: 500, text: async () => '' }, { apiType: 'novelai-direct', novelaiApiKey: 'tok' });
+    await assert.rejects(generate.call(null, 'comic page | girl, top left focus frame, Marta, red hair, looking at Eveline | girl, main frame, Eveline, frightened', '', {
+        people: [{ name: 'Eveline', names: ['Eveline'], appearance: 'pink hair' }],
+        textDirectives: [],
+    }));
+    const body = JSON.parse(requests[0].init.body);
+    const chars = body.parameters.v4_prompt.caption.char_captions.map(c => c.char_caption);
+    assert.deepEqual(chars, ['girl, top left focus frame, Marta, red hair, looking at Eveline', 'girl, main frame, Eveline, frightened, pink hair']);
+});

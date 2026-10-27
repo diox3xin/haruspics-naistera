@@ -9,7 +9,7 @@ const start = source.indexOf('const NAME_IGNORED_WORDS');
 const end = source.indexOf('function getNpcAliases', start);
 assert.ok(start >= 0 && end > start, 'name matching block must exist');
 const context = vm.createContext({});
-vm.runInContext(`${source.slice(start, end)}\nglobalThis.match = namesAppearInPrompt; globalThis.decode = decodeNumericEntities;`, context);
+vm.runInContext(`${source.slice(start, end)}\nglobalThis.match = namesAppearInPrompt; globalThis.decode = decodeNumericEntities; globalThis.leads = nameLeadsTagIndex;`, context);
 
 test('Cyrillic names match with Unicode boundaries and case endings', () => {
     assert.equal(context.match(['Ева Гринёва'], 'Ваня смотрит на Еву у подъезда'), true);
@@ -45,13 +45,19 @@ test('transliteration is matched loosely: Evelin → Eveline, v/w, kh/h, ks/x', 
 });
 
 test('a name that is also a word or tag counts only when capitalized', () => {
-    const robert = ['Robert Novak', 'Rob', 'Bob', 'Bobby'];
-    assert.equal(context.match(robert, '1girl, Marta, pale pink hair, messy bob, bangs'), false);
-    assert.equal(context.match(robert, 'Bob leans on the counter'), true);
-    assert.equal(context.match(robert, 'BOB, close-up'), true);
+    const bobby = ['Bobby Novak', 'Bob', 'Bobby'];
+    assert.equal(context.match(bobby, '1girl, Marta, pale pink hair, messy bob, bangs'), false);
+    assert.equal(context.match(bobby, 'Bob leans on the counter'), true);
+    assert.equal(context.match(bobby, 'BOB, close-up'), true);
     assert.equal(context.match(['Ivy'], 'old wall covered in ivy'), false);
     assert.equal(context.match(['Роза'], 'на столе стоит роза'), false);
     assert.equal(context.match(['Роза'], 'Розу зовут к столу'), true);
-    assert.equal(context.match(['Robert Novak'], 'robert novak, suit'), true);
+    assert.equal(context.match(['Bobby Novak'], 'bobby novak, suit'), true);
 });
 
+test('a tag that starts with the name marks its owner; "looking at X" does not', () => {
+    assert.equal(context.leads(['Eveline'], 'girl, top left focus frame, Marta, looking at Eveline'), -1);
+    assert.equal(context.leads(['Eveline'], 'girl, main frame, Eveline, frightened'), 2);
+    assert.equal(context.leads(['Эвелин Гринвелл'], 'girl, Eveline smiling, pink hair'), 1);
+    assert.equal(context.leads(['Bobby', 'Bob'], 'girl, messy bob, Bob'), 2);
+});

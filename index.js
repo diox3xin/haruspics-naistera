@@ -2318,16 +2318,20 @@ function splitNameList(value) {
     return list.flatMap(item => String(item ?? '').split(/[,;|/\n]+/)).map(name => name.trim()).filter(Boolean);
 }
 
-/** All strings that should count as a mention of this person. */
+/**
+ * All strings that should count as a mention of this person: Map<text, isTransliteration>.
+ * Transliterations are matched loosely (see latinSpellingPattern), because «Эвелин Гринвелл» is written
+ * "Eveline Grinwell" in English, «Алексей» — "Alexei", «Тихонов» — "Tihonov" or "Tikhonov".
+ */
 function buildNameVariants(names) {
-    const variants = new Set();
+    const variants = new Map();
     const add = raw => {
         const value = String(raw || '').trim().toLowerCase();
         if (value.length < 2 || NAME_IGNORED_WORDS.has(value) || /^\{\{.*\}\}$/.test(value)) return;
-        variants.add(value);
+        if (!variants.has(value)) variants.set(value, false);
         if (/[а-яё]/.test(value)) {
             const latin = transliterateRu(value);
-            if (latin.length >= 2 && !NAME_IGNORED_WORDS.has(latin)) variants.add(latin);
+            if (latin.length >= 2 && !NAME_IGNORED_WORDS.has(latin) && !variants.has(latin)) variants.set(latin, true);
         }
     };
     for (const name of splitNameList(names)) {
@@ -2335,10 +2339,25 @@ function buildNameVariants(names) {
         const words = name.split(/\s+/).filter(Boolean);
         if (words.length > 1) for (const word of words) if (word.replace(/[^\p{L}]/gu, '').length >= 3) add(word);
     }
-    return [...variants];
+    return variants;
 }
 
-function nameVariantPattern(variant) {
+const LATIN_SPELLING_ALTERNATIVES = Object.freeze({
+    shch: '(?:shch|sch|sh)', kh: '(?:kh|h)', ks: '(?:ks|x)', ts: '(?:ts|tz|c)',
+    yu: '(?:yu|iu|ju|u)', ya: '(?:ya|ia|ja)', ey: '(?:ey|ei|ej|y)', v: '[vw]', y: '[yij]',
+});
+
+/** Loose pattern for an automatic transliteration: v/w, kh/h, ks/x…, plus up to 2 extra letters at the end (Evelin → Eveline). */
+function latinSpellingPattern(latin) {
+    return latin.split(/\s+/).map((word, index, words) => {
+        const body = word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+            .replace(/shch|kh|ks|ts|yu|ya|ey|v|y/g, match => LATIN_SPELLING_ALTERNATIVES[match]);
+        return index === words.length - 1 && word.length >= 4 ? `${body}[a-z]{0,2}` : body;
+    }).join('\\s+');
+}
+
+function nameVariantPattern(variant, isTransliteration = false) {
+    if (isTransliteration && /^[a-z\s]+$/.test(variant)) return latinSpellingPattern(variant);
     const escaped = variant.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\s+/g, '\\s+');
     // Russian declension: a single Cyrillic word ending in a vowel/й/ь may change that ending (Ева → Еву, Евой).
     if (/^[а-яё]{3,}$/.test(variant) && /[аеёиоуыэюяйь]$/.test(variant)) {
@@ -2352,8 +2371,8 @@ function nameVariantPattern(variant) {
 function namesAppearInPrompt(names, prompt) {
     const text = decodeNumericEntities(prompt);
     if (!text) return false;
-    return buildNameVariants(names).some(variant =>
-        new RegExp(`(?<![\\p{L}\\p{N}_])${nameVariantPattern(variant)}(?![\\p{L}\\p{N}_])`, 'iu').test(text));
+    return [...buildNameVariants(names)].some(([variant, isTransliteration]) =>
+        new RegExp(`(?<![\\p{L}\\p{N}_])${nameVariantPattern(variant, isTransliteration)}(?![\\p{L}\\p{N}_])`, 'iu').test(text));
 }
 
 function nameAppearsInPrompt(name, prompt) {

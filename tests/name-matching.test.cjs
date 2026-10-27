@@ -34,3 +34,11 @@ test('names inside numeric HTML entities are found', () => {
     assert.equal(context.decode(encoded), 'Лапин');
     assert.equal(context.match(['Лапин'], `Captain ${encoded} at the desk`), true);
 });
+
+test('transliteration is matched loosely: Evelin → Eveline, v/w, kh/h, ks/x', () => {
+    assert.equal(context.match(['Эвелин Гринвелл'], '2girls, Gretchen and Eveline at a cafe'), true);
+    assert.equal(context.match(['Эвелин Гринвелл'], 'Lady Grinwell smiles'), true);
+    assert.equal(context.match(['Алексей'], 'Alexei lights a cigarette'), true);
+    assert.equal(context.match(['Тихонов'], 'Tihonov waits'), true);
+    assert.equal(context.match(['Эвелин Гринвелл'], 'Evening in the forest'), false);
+});

@@ -16,6 +16,8 @@ function collector(settings, { profileNames = { char: [], user: [] } } = {}) {
     const context = vm.createContext({
         getSettings: () => ({ apiType: 'gemini', autoDetectNames: true, sendCharAvatar: false, sendUserAvatar: false, ...settings }),
         SillyTavern: { getContext: () => ({ characters: [{ name: 'Иван Петров' }], characterId: 0, name1: 'Ева Гринёва' }) },
+        getExtensionPersona: () => ({ name: 'Ева Гринёва', description: '' }),
+        getExtensionCharacter: () => null,
         collectCharacterProfileReferences: async kind => ({
             descriptions: [`[${kind} appearance]`], names: profileNames[kind] || [],
             refs: [{ type: 'face', name: kind, data: `${kind.toUpperCase()}_FACE` }], hasPrimary: true,

@@ -17,6 +17,8 @@ function collector(config = {}, outfit = {}, hair = null, refs = [], prompt = 'f
         // «Всегда отправлять» on: these tests are about wardrobe modes, not about who is in the scene.
         getSettings: () => ({ apiType: 'naistera', npcReferences: [], autoDetectNames: true, naisteraSendCharAvatar: true, naisteraSendUserAvatar: true, sendCharAvatar: true, sendUserAvatar: true, ...config }),
         SillyTavern: { getContext: () => ({ characters: [{ name: 'Hero' }], characterId: 0, name1: 'User' }) },
+        getExtensionPersona: () => ({ name: 'User', description: '' }),
+        getExtensionCharacter: () => null,
         collectCharacterProfileReferences: async kind => ({ descriptions: [], names: [], refs: kind === 'char' ? refs : [], hasPrimary: true }),
         namesAppearInPrompt: (names, prompt) => names.some(name => name && String(prompt).toLowerCase().includes(String(name).toLowerCase())),
         getNpcAliases: () => [], splitNameList: value => (Array.isArray(value) ? value : [value]).filter(Boolean),

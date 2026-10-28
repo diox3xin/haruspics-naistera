@@ -422,11 +422,38 @@ function formatNaisteraDescription(value) {
 // CHARACTER PROFILES V2 (replaces characterReferenceLibrary)
 // ============================================================
 
+function makeProfileRefId() {
+    return `ref_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
 function makeCharacterProfile(raw = {}) {
     const rpgCharacters = Array.isArray(raw.rpgCharacters) ? raw.rpgCharacters : [];
+    // Own refs uploaded for this bot / persona: a list to pick from. The chosen one replaces the main avatar.
+    const customAvatars = (Array.isArray(raw.customAvatars) ? raw.customAvatars : [])
+        .map(item => ({
+            id: String(item?.id || makeProfileRefId()),
+            name: String(item?.name || '').trim().slice(0, 60),
+            data: String(item?.data || ''),
+        }))
+        .filter(item => item.data);
+    const customAvatarData = String(raw.customAvatarData || '');
+    // Bot only: the card whose picture was picked in the list of characters (its name and card text are used too).
+    const pickedCharacter = String(raw.pickedCharacter || '').trim();
+    let customAvatarId = String(raw.customAvatarId || '');
+    // Older profiles kept a single uploaded ref: it becomes the first item of the list.
+    if (customAvatarData && !pickedCharacter && !customAvatars.some(item => item.data === customAvatarData)) {
+        customAvatarId = makeProfileRefId();
+        customAvatars.unshift({ id: customAvatarId, name: 'Реф', data: customAvatarData });
+    }
+    if (customAvatarId && !customAvatars.some(item => item.id === customAvatarId)) {
+        customAvatarId = customAvatars.find(item => item.data === customAvatarData)?.id || '';
+    }
     return {
         avatarSource: raw.avatarSource === 'custom' ? 'custom' : 'card',
-        customAvatarData: String(raw.customAvatarData || ''),
+        customAvatarData,
+        customAvatars,
+        customAvatarId,
+        pickedCharacter,
         appearance: String(raw.appearance || '').trim(),
         // Extra names to look for in the image prompt (e.g. "Ivan, Vanya, Petrov"), comma-separated.
         aliases: String(raw.aliases || '').trim(),
@@ -692,10 +719,54 @@ function getCharacterLibraryEntry(kind, key, settings = getSettings(), create = 
     return bucket[normalizedKey];
 }
 
+/**
+ * The persona chosen in the extension (Персонажи → Профили), not the one active in SillyTavern:
+ * its name and description are used for names, «+ описание карточки», the prompt model and name search.
+ */
+function getExtensionPersona(settings = getSettings()) {
+    const context = SillyTavern.getContext();
+    const power = context.powerUserSettings || {};
+    const file = String(settings.userAvatarFile || '').trim();
+    const name = String((file && power.personas?.[file]) || context.name1 || 'User').trim();
+    let description = '';
+    if (file && power.persona_descriptions?.[file]) description = String(power.persona_descriptions[file]?.description || '');
+    else if (!file) description = String(power.persona_description || '');
+    return { file, name, description };
+}
+
+/**
+ * The bot as set up in the extension: the chat's character, or the card whose picture was picked for it
+ * in the profile (then that card's name and description are used for names and «+ описание карточки»).
+ */
+function getExtensionCharacter(settings = getSettings()) {
+    const context = SillyTavern.getContext();
+    const current = context.characters?.[context.characterId];
+    if (!current) return null;
+    const profile = getCharacterProfile('char', getCurrentCharacterLibraryKey(), settings);
+    const pickedFile = profile?.avatarSource === 'custom' ? profile.pickedCharacter : '';
+    const picked = pickedFile ? (context.characters || []).find(character => character?.avatar === pickedFile) : null;
+    const owner = picked || current;
+    return {
+        name: String(owner.name || owner.avatar || 'Character').trim(),
+        chatName: String(current.name || '').trim(),
+        description: String(owner.description || ''),
+        picked: Boolean(picked),
+    };
+}
+
+/** {{user}} / {{char}} in a card text, filled with the extension's persona and bot. */
+function fillCardMacros(raw, settings = getSettings()) {
+    const context = SillyTavern.getContext();
+    let text = String(raw || '').replace(/\{\{user\}\}/gi, getExtensionPersona(settings).name);
+    const owner = getExtensionCharacter(settings);
+    if (owner) text = text.replace(/\{\{char\}\}/gi, owner.name);
+    return typeof context.substituteParams === 'function' ? context.substituteParams(text) : text;
+}
+
 function getCurrentLibraryEntity(kind, settings = getSettings()) {
     if (kind === 'user') {
         const key = getCurrentUserLibraryKey(settings);
-        return { key, title: settings.userAvatarFile || 'User' };
+        return { key, title: getExtensionPersona(settings).name || settings.userAvatarFile || 'User' };
     }
     const context = SillyTavern.getContext();
     const character = context.characters?.[context.characterId];
@@ -861,7 +932,7 @@ function getFixedAppearances(text = '', settings = getSettings()) {
     const charProfile = character ? getCharacterProfile('char', getCurrentLibraryEntity('char', settings).key, settings) : null;
     if (character && charProfile) add(character.name, charProfile.appearance);
     const userProfile = getCharacterProfile('user', getCurrentLibraryEntity('user', settings).key, settings);
-    if (userProfile) add(context.name1 || 'User', userProfile.appearance);
+    if (userProfile) add(getExtensionPersona(settings).name, userProfile.appearance);
     if (charProfile?.rpgMode) {
         for (const rpg of charProfile.rpgCharacters || []) if (namesAppearInPrompt([rpg.name], text)) add(rpg.name, rpg.appearance);
     }
@@ -891,7 +962,7 @@ function getPromptGenerationContext(message, instruction, settings = getSettings
         : '';
     return [
         `Character: ${character?.name || 'Unknown'}`,
-        `User: ${context.name1 || 'User'}`,
+        `User: ${getExtensionPersona(settings).name}`,
         `<chat_history>\n${recentMessages}\n</chat_history>`,
         `<message_to_illustrate>\n${String(message?.mes || '').trim()}\n</message_to_illustrate>`,
         `<prompt_instruction>\n${instruction.prompt}\n</prompt_instruction>`,
@@ -1511,13 +1582,11 @@ function cleanVisionAnswer(text, settings = getSettings(), format = getVisionDes
 }
 
 /** Card text of the current bot, or the persona description, with {{char}}/{{user}} filled in. */
-function getCardAppearanceSource(kind) {
-    const context = SillyTavern.getContext();
+function getCardAppearanceSource(kind, settings = getSettings()) {
     const raw = kind === 'user'
-        ? String(context.powerUserSettings?.persona_description || '')
-        : String(context.characters?.[context.characterId]?.description || '');
-    const text = typeof context.substituteParams === 'function' ? context.substituteParams(raw) : raw;
-    return text.trim().slice(0, 6000);
+        ? getExtensionPersona(settings).description
+        : (getExtensionCharacter(settings)?.description || '');
+    return fillCardMacros(raw, settings).trim().slice(0, 6000);
 }
 
 /**
@@ -1909,7 +1978,7 @@ function updateWardrobeInjection() {
 
         const userItem = getActiveWardrobeItem('user');
         if (userItem?.description) {
-            const userName = context.name1 || 'User';
+            const userName = getExtensionPersona(settings).name;
             parts.push(`[${userName} is currently wearing: ${userItem.description}]`);
         }
 
@@ -2251,6 +2320,7 @@ let activeFaqSection = null;
 
 function clearFaqHints() {
     document.querySelectorAll('.iig-faq-hint').forEach(hint => hint.remove());
+    document.querySelectorAll('.iig-collapsible.iig-hints-open').forEach(section => section.classList.remove('iig-hints-open'));
     document.querySelectorAll('.iig-faq-highlight').forEach(el => el.classList.remove('iig-faq-highlight'));
     document.querySelectorAll('.iig-faq-btn.iig-faq-active').forEach(btn => {
         btn.classList.remove('iig-faq-active');
@@ -2265,9 +2335,10 @@ function toggleFaqHints(sectionId, button) {
     activeFaqSection = null;
     if (wasActive || !section) return;
 
-    const hints = FAQ_HINTS[sectionId];
-    if (!hints) return;
+    // The section's own hint texts (p.hint) are hidden until «?» is pressed.
+    const hints = FAQ_HINTS[sectionId] || {};
     activeFaqSection = sectionId;
+    section.classList.add('iig-hints-open');
     button.classList.add('iig-faq-active');
     button.setAttribute('aria-pressed', 'true');
 
@@ -2275,7 +2346,8 @@ function toggleFaqHints(sectionId, button) {
     if (section.classList.contains('collapsed')) section.classList.remove('collapsed');
 
     const content = section.querySelector('.iig-collapsible-content');
-    if (hints._section && content) {
+    // A section with its own hint text does not need the short FAQ line on top as well.
+    if (hints._section && content && !content.querySelector('p.hint')) {
         const badge = document.createElement('div');
         badge.className = 'iig-faq-hint iig-faq-section-hint';
         badge.setAttribute('role', 'note');
@@ -2308,8 +2380,11 @@ let faqEscBound = false;
 
 function initFaqButtons() {
     document.querySelectorAll('#extensions_settings .iig-collapsible-header').forEach(header => {
-        const sectionId = header.closest('.iig-collapsible')?.dataset.sectionId;
-        if (!sectionId || !FAQ_HINTS[sectionId] || header.querySelector('.iig-faq-btn')) return;
+        const section = header.closest('.iig-collapsible');
+        const sectionId = section?.dataset.sectionId;
+        // «?» for every section with hints: FAQ lines or its own hint texts, which stay hidden until it is pressed.
+        if (!sectionId || header.querySelector('.iig-faq-btn')) return;
+        if (!FAQ_HINTS[sectionId] && !section.querySelector('p.hint')) return;
         const button = document.createElement('button');
         button.type = 'button';
         button.className = 'iig-faq-btn';
@@ -2803,7 +2878,11 @@ async function collectReferenceImages(prompt) {
     };
 
     const charName = context.characters?.[context.characterId]?.name || null;
-    const userName = context.name1 || null;
+    // The persona chosen in the extension, not the one active in SillyTavern.
+    const userName = getExtensionPersona(settings).name || null;
+    // A bot whose picture was taken from another card is also found by that card's name.
+    const charOwner = getExtensionCharacter(settings);
+    const charExtraNames = charOwner?.picked && charOwner.name !== charName ? [charOwner.name] : [];
 
     const characterLibrary = await collectCharacterProfileReferences('char', settings);
     const userLibrary = await collectCharacterProfileReferences('user', settings);
@@ -2817,7 +2896,7 @@ async function collectReferenceImages(prompt) {
     // only when the prompt mentions them (otherwise e.g. the bot's tags leak into a "2girls" scene without him).
     const charAlways = !textOnly && Boolean(useNaisteraRefs ? settings.naisteraSendCharAvatar : settings.sendCharAvatar);
     const userAlways = !textOnly && Boolean(useNaisteraRefs ? settings.naisteraSendUserAvatar : settings.sendUserAvatar);
-    const charMentioned = Boolean(charName) && namesAppearInPrompt([charName, ...characterLibrary.names], prompt);
+    const charMentioned = Boolean(charName) && namesAppearInPrompt([charName, ...charExtraNames, ...characterLibrary.names], prompt);
     const userMentioned = Boolean(userName) && namesAppearInPrompt([userName, ...userLibrary.names], prompt);
     const includeChar = Boolean(charName) && (charAlways || (settings.autoDetectNames && charMentioned));
     const includeUser = Boolean(userName) && (userAlways || (settings.autoDetectNames && userMentioned));
@@ -2830,7 +2909,7 @@ async function collectReferenceImages(prompt) {
     // appearanceDirectives marks the generic "[... APPEARANCE]" lines so NovelAI can drop them in favour of `people`.
     const people = [];
     const appearanceDirectives = new Set([...characterLibrary.descriptions, ...userLibrary.descriptions]);
-    if (includeChar) people.push({ name: charName, names: [charName, ...characterLibrary.names], appearance: characterLibrary.appearance || '' });
+    if (includeChar) people.push({ name: charName, names: [charName, ...charExtraNames, ...characterLibrary.names], appearance: characterLibrary.appearance || '' });
     if (includeUser) people.push({ name: userName, names: [userName, ...userLibrary.names], appearance: userLibrary.appearance || '' });
 
     // RPG characters (multi-character bots)
@@ -4741,12 +4820,30 @@ function addButtonsToExistingMessages() {
     }
 }
 
+/** Is this reply being written right now (streaming)? The block waits for the end instead of riding along. */
+function isMessageStreaming(messageId) {
+    const processor = SillyTavern.getContext().streamingProcessor;
+    if (!processor || processor.isFinished || processor.isStopped) return false;
+    const streamingId = Number(processor.messageId);
+    return !Number.isInteger(streamingId) || streamingId === Number(messageId);
+}
+
 function ensurePromptPanelForMessage(messageElement, messageId, { rerender = false } = {}) {
     if (!messageElement || messageId == null) return null;
     const context = SillyTavern.getContext();
     const message = context.chat?.[messageId];
     if (!message || message.is_user) return null;
     const known = promptPanels.get(messageId);
+    // While the reply streams, the block is not shown: its spot is chosen once the whole text is there
+    // (otherwise it lands after the first paragraphs, i.e. at the top, and stays there).
+    if (isMessageStreaming(messageId)) {
+        if (known) {
+            known.panel.remove();
+            known.anchor = null;
+        }
+        messageElement.querySelectorAll('.iig-prompt-panel').forEach(panel => panel.remove());
+        return null;
+    }
     let panel = known?.mesEl === messageElement ? known.panel : messageElement.querySelector('.iig-prompt-panel');
     const isNew = !panel;
     if (!panel) {
@@ -4774,17 +4871,48 @@ function placePromptPanel(messageElement, panel, entry = null) {
         if (panel.parentElement !== host || (text && panel.previousElementSibling !== text && host.lastElementChild !== panel)) host.appendChild(panel);
         return;
     }
-    const blocks = [...text.children].filter(child => child !== panel && !child.classList.contains('iig-prompt-panel') && !/^(BR|SCRIPT|STYLE)$/.test(child.tagName));
-    if (blocks.length < 2) {
+    const { container, blocks } = promptPanelBlocks(text, panel);
+    const lengths = blocks.map(block => block.textContent.replace(/\s+/g, ' ').trim().length);
+    const total = lengths.reduce((sum, length) => sum + length, 0);
+    if (lengths.filter(Boolean).length < 2) {
         if (panel.parentElement !== text || text.lastElementChild !== panel) text.appendChild(panel);
         return;
     }
-    // The spot is chosen once (middle paragraph) and kept: re-renders while streaming or swiping
-    // must not move the block from line to line as the text grows.
-    if (entry && entry.anchor == null) entry.anchor = Math.ceil(blocks.length / 2) - 1;
-    const index = entry?.anchor ?? (Math.ceil(blocks.length / 2) - 1);
-    const anchor = blocks[Math.min(index, blocks.length - 1)];
-    if (panel.previousElementSibling !== anchor || panel.parentElement !== text) anchor.after(panel);
+    // The spot is chosen once — after the paragraph where the middle of the text is — and kept as a text
+    // position, so re-renders and swipes put the block back to the same place instead of moving it around.
+    if (entry && entry.anchor == null) entry.anchor = Math.round(total / 2);
+    const target = Math.min(entry?.anchor ?? Math.round(total / 2), total);
+    let index = 0;
+    for (let sum = 0; index < blocks.length; index++) {
+        sum += lengths[index];
+        if (lengths[index] && sum >= target) break;
+    }
+    // Never after the last paragraph (that is «в конце») and never after an empty block (a line, a picture).
+    const lastText = lengths.map(Boolean).lastIndexOf(true);
+    index = Math.min(index, lastText - 1);
+    while (index > 0 && !lengths[index]) index--;
+    const anchor = blocks[Math.max(0, index)];
+    if (panel.previousElementSibling !== anchor || panel.parentElement !== container) anchor.after(panel);
+}
+
+/**
+ * Paragraph-level blocks of the reply. When the whole text sits inside one plain wrapper
+ * (a <div> with the paragraphs inside), the block goes between those paragraphs, not after the wrapper.
+ */
+function promptPanelBlocks(text, panel) {
+    let container = text;
+    for (let depth = 0; depth < 3; depth++) {
+        const blocks = [...container.children].filter(child => child !== panel && !child.classList.contains('iig-prompt-panel') && !/^(BR|SCRIPT|STYLE)$/.test(child.tagName));
+        const withText = blocks.filter(block => block.textContent.trim());
+        const only = withText.length === 1 ? withText[0] : null;
+        const paragraphs = only ? [...only.children].filter(child => /^(P|BLOCKQUOTE|UL|OL|H[1-6])$/.test(child.tagName)).length : 0;
+        if (only && /^(DIV|SECTION|ARTICLE|BLOCKQUOTE)$/.test(only.tagName) && paragraphs >= 2) {
+            container = only;
+            continue;
+        }
+        return { container, blocks };
+    }
+    return { container, blocks: [...container.children].filter(child => child !== panel && !child.classList.contains('iig-prompt-panel')) };
 }
 
 /** SillyTavern rebuilds the reply HTML on edits, swipes and streaming — put lost panels back. */
@@ -4799,7 +4927,7 @@ function observePromptPanels() {
             scheduled = false;
             for (const [messageId, entry] of promptPanels) {
                 if (!entry.mesEl.isConnected) { promptPanels.delete(messageId); continue; }
-                if (!entry.mesEl.contains(entry.panel)) placePromptPanel(entry.mesEl, entry.panel, entry);
+                if (!entry.mesEl.contains(entry.panel) && !isMessageStreaming(messageId)) placePromptPanel(entry.mesEl, entry.panel, entry);
             }
         });
     });
@@ -4823,7 +4951,7 @@ function promptAppearanceHtml(settings = getSettings()) {
         rows.push({ kind: 'char', name: character.name, value: profile?.appearance || '' });
     }
     const userProfile = getCharacterProfile('user', getCurrentLibraryEntity('user', settings).key, settings, true);
-    rows.push({ kind: 'user', name: context.name1 || 'Персона', value: userProfile?.appearance || '' });
+    rows.push({ kind: 'user', name: getExtensionPersona(settings).name || 'Персона', value: userProfile?.appearance || '' });
     return `<details class="iig-prompt-appearance" ${settings.promptAppearanceOpen ? 'open' : ''}>
             <summary title="Точная внешность: модель промпта не придумывает её заново, расширение само добавляет её в картинку"><i class="fa-solid fa-user-pen" aria-hidden="true"></i> Внешность</summary>
             ${rows.map(row => `<label class="iig-prompt-appearance-row"><span>${row.kind === 'user' ? 'Персона' : 'Бот'}: ${escapeHtml(row.name)}</span>
@@ -6385,22 +6513,37 @@ function describeFormatSelectHtml(id, cls, value) {
         </span>`;
 }
 
+/** What the profile sends as the face: «свой реф «…»», «картинка из «…»» or the main avatar. */
+function profileAvatarSourceLabel(kind, profile) {
+    if (profile.avatarSource === 'custom' && profile.customAvatarData) {
+        const ref = profile.customAvatars.find(item => item.id === profile.customAvatarId);
+        if (ref) return `свой реф «${ref.name || 'Реф'}»`;
+        if (kind === 'char' && profile.pickedCharacter) {
+            const picked = (SillyTavern.getContext().characters || []).find(character => character?.avatar === profile.pickedCharacter);
+            return `картинка из «${picked?.name || profile.pickedCharacter}»`;
+        }
+        return 'свой реф';
+    }
+    return kind === 'user' ? 'основная аватарка' : 'обложка карточки';
+}
+
 function profileCardHtml(kind, entity, profile, cardPreview) {
     const settings = getSettings();
     const customPreview = profile.customAvatarData ? `data:${detectMimeType(profile.customAvatarData)};base64,${profile.customAvatarData}` : '';
-    const preview = profile.avatarSource === 'custom' ? customPreview : cardPreview;
+    const preview = profile.avatarSource === 'custom' && customPreview ? customPreview : cardPreview;
     const label = kind === 'user' ? 'Персона' : 'Бот';
     const always = kind === 'user' ? settings.sendUserAvatar : settings.sendCharAvatar;
     return `
         <div class="iig-profile-card" data-profile-kind="${kind}">
             <div class="iig-profile-head">
-                <button type="button" class="iig-profile-avatar-btn" title="${kind === 'user' ? 'Выбрать аватарку персоны' : 'Выбрать картинку бота из персонажей'}" aria-haspopup="true" aria-expanded="false">
+                <button type="button" class="iig-profile-avatar-btn" title="${kind === 'user' ? 'Выбрать персону или свой реф' : 'Выбрать картинку бота: свой реф или другой персонаж'}" aria-haspopup="true" aria-expanded="false">
                     ${preview ? `<img src="${escapeHtml(preview)}" alt="" onerror="this.style.display='none'">` : `<span class="iig-profile-avatar-empty"><i class="fa-solid ${kind === 'user' ? 'fa-user' : 'fa-user-pen'}" aria-hidden="true"></i></span>`}
                     <span class="iig-profile-avatar-edit" aria-hidden="true"><i class="fa-solid fa-pen"></i></span>
                 </button>
                 <div class="iig-profile-head-text">
                     <h4>${escapeHtml(entity.title)}</h4>
                     <small>${label}${kind === 'user' && settings.userAvatarFile ? ` · ${escapeHtml(settings.userAvatarFile)}` : ''}</small>
+                    <small class="iig-profile-source-label"><i class="fa-solid fa-image" aria-hidden="true"></i> Реф: ${escapeHtml(profileAvatarSourceLabel(kind, profile))}</small>
                     <div class="iig-profile-head-controls">
                         <label class="checkbox_label iig-profile-always" title="Отправлять ${kind === 'user' ? 'аватар юзера' : 'аватар персонажа'} во все картинки, даже если имени нет в промпте (для NovelAI не действует)"><input type="checkbox" class="iig-profile-always-input" ${always ? 'checked' : ''}><span>Всегда отправлять аватар</span></label>
                         <button type="button" class="menu_button iig-profile-avatar-refresh" title="Обновить аватарку и список" aria-label="Обновить"><i class="fa-solid fa-arrows-rotate" aria-hidden="true"></i></button>
@@ -6408,18 +6551,6 @@ function profileCardHtml(kind, entity, profile, cardPreview) {
                 </div>
             </div>
             <div class="iig-profile-avatar-picker" hidden></div>
-            <div class="iig-profile-field">
-                <label>Референс</label>
-                <select class="iig-profile-source">
-                    <option value="card" ${profile.avatarSource === 'card' ? 'selected' : ''}>Обложка карточки</option>
-                    <option value="custom" ${profile.avatarSource === 'custom' ? 'selected' : ''}>Загруженный реф</option>
-                </select>
-                <div class="iig-profile-buttons ${profile.avatarSource === 'custom' ? '' : 'hidden'}">
-                    <input type="file" class="iig-profile-file" accept="image/*" hidden>
-                    <button type="button" class="menu_button iig-profile-upload"><i class="fa-solid fa-upload" aria-hidden="true"></i> ${profile.customAvatarData ? 'Заменить реф' : 'Загрузить реф'}</button>
-                    ${profile.customAvatarData ? '<button type="button" class="menu_button iig-profile-clear"><i class="fa-solid fa-trash" aria-hidden="true"></i> Убрать</button>' : ''}
-                </div>
-            </div>
             <div class="iig-profile-field">
                 <label title="Если имя или любое из этих слов есть в промпте картинки — реф и описание уйдут в генерацию">Имена в промпте</label>
                 <div class="iig-names-row">
@@ -6482,13 +6613,12 @@ function renderCharacterProfiles() {
     const userEntity = getCurrentLibraryEntity('user', settings);
     const charProfile = character ? getCharacterProfile('char', charEntity.key, settings, true) : null;
     const userProfile = getCharacterProfile('user', userEntity.key, settings, true);
-    userEntity.title = context.name1 || userEntity.title;
+    const persona = getExtensionPersona(settings);
+    const charOwner = getExtensionCharacter(settings);
 
     // «Авто-определение имён» lives in the profiles' top block now: keep its node (and listener) across re-renders.
     const commonPart = document.getElementById('iig_avatar_part_common');
     commonPart?.remove();
-    const personaName = settings.userAvatarFile ? context.powerUserSettings?.personas?.[settings.userAvatarFile] : '';
-    if (personaName) userEntity.title = personaName;
 
     // Full-size pictures: the small thumbnails looked blurry at this size.
     const charPreview = character?.avatar ? `/characters/${encodeURIComponent(character.avatar)}` : '';
@@ -6512,9 +6642,10 @@ function renderCharacterProfiles() {
 
     if (commonPart) container.querySelector('.iig-profiles-describe-settings')?.appendChild(commonPart);
 
+    // Names are generated for the persona / bot chosen here, not for the persona active in SillyTavern.
     bindCharacterProfileEvents(container, { char: charProfile, user: userProfile }, {
-        char: { name: character?.name || charEntity.title, notes: character?.description || '' },
-        user: { name: userEntity.title, notes: context.powerUserSettings?.persona_description || '' },
+        char: { name: charOwner?.name || character?.name || charEntity.title, notes: fillCardMacros(charOwner?.description || '', settings) },
+        user: { name: persona.name, notes: fillCardMacros(persona.description, settings) },
     });
 }
 
@@ -6528,19 +6659,89 @@ async function profileAvatarChoices(kind, profile) {
             id: file,
             name: names[file] || file,
             thumb: `/thumbnail?type=persona&file=${encodeURIComponent(file)}`,
-            selected: file === settings.userAvatarFile,
+            selected: file === settings.userAvatarFile && profile.avatarSource !== 'custom',
         }));
     }
     const current = context.characters?.[context.characterId];
+    const picked = profile.avatarSource === 'custom' && !profile.customAvatarId ? profile.pickedCharacter : '';
     return [
         ...(current?.avatar ? [{ id: '__card__', name: 'Обложка карточки', thumb: `/thumbnail?type=avatar&file=${encodeURIComponent(current.avatar)}`, selected: profile.avatarSource !== 'custom' }] : []),
         ...(context.characters || []).filter(character => character?.avatar && character.avatar !== 'none').map(character => ({
             id: character.avatar,
             name: character.name || character.avatar,
             thumb: `/thumbnail?type=avatar&file=${encodeURIComponent(character.avatar)}`,
-            selected: false,
+            selected: Boolean(picked) && character.avatar === picked,
         })),
     ];
+}
+
+/** Use the main avatar (persona picture / card cover) again instead of an own ref. */
+function useMainProfileAvatar(profile) {
+    profile.avatarSource = 'card';
+    profile.pickedCharacter = '';
+    // A picture taken from another card is not kept; uploaded refs stay in the list.
+    if (!profile.customAvatarId) profile.customAvatarData = '';
+}
+
+function selectProfileRef(profile, id) {
+    const ref = profile.customAvatars.find(item => item.id === id);
+    if (!ref) return false;
+    profile.avatarSource = 'custom';
+    profile.customAvatarId = ref.id;
+    profile.customAvatarData = ref.data;
+    profile.pickedCharacter = '';
+    return true;
+}
+
+function removeProfileRef(profile, id) {
+    const wasActive = profile.customAvatarId === id;
+    profile.customAvatars = profile.customAvatars.filter(item => item.id !== id);
+    if (wasActive) {
+        profile.customAvatarId = '';
+        useMainProfileAvatar(profile);
+    }
+}
+
+async function addProfileRefs(profile, files) {
+    let last = null;
+    for (const file of files) {
+        if (!String(file?.type || '').startsWith('image/')) continue;
+        const data = await readProfileImage(file);
+        if (!data) continue;
+        last = { id: makeProfileRefId(), name: String(file.name || 'Реф').replace(/\.[^.]+$/, '').slice(0, 60), data };
+        profile.customAvatars.push(last);
+    }
+    if (last) selectProfileRef(profile, last.id);
+    return Boolean(last);
+}
+
+/** Re-render the profiles and open the same picture list again (after uploading or deleting a ref). */
+function reopenProfileAvatarPicker(kind) {
+    renderCharacterProfiles();
+    document.querySelector(`#iig_character_library .iig-profile-card[data-profile-kind="${kind}"] .iig-profile-avatar-btn`)?.click();
+}
+
+function profileRefsHtml(profile) {
+    const tiles = profile.customAvatars.map(ref => {
+        const selected = profile.avatarSource === 'custom' && profile.customAvatarId === ref.id;
+        return `<div class="iig-avatar-ref">
+                <button type="button" class="iig-avatar-choice${selected ? ' is-selected' : ''}" data-ref-id="${escapeHtml(ref.id)}" title="${escapeHtml(ref.name || 'Реф')}">
+                    <img src="data:${detectMimeType(ref.data)};base64,${ref.data}" alt="">
+                    <span>${escapeHtml(ref.name || 'Реф')}</span>
+                </button>
+                <button type="button" class="iig-avatar-ref-remove" data-ref-id="${escapeHtml(ref.id)}" title="Удалить реф" aria-label="Удалить реф ${escapeHtml(ref.name || '')}"><i class="fa-solid fa-xmark" aria-hidden="true"></i></button>
+            </div>`;
+    }).join('');
+    return `
+        <div class="iig-avatar-picker-label">Свои рефы <small>— выбранный заменяет основную аватарку</small></div>
+        <div class="iig-avatar-picker-grid iig-avatar-refs-grid">
+            ${tiles}
+            <button type="button" class="iig-avatar-choice iig-avatar-upload" title="Загрузить свои рефы (можно несколько)">
+                <span class="iig-avatar-upload-icon"><i class="fa-solid fa-plus" aria-hidden="true"></i></span>
+                <span>Загрузить</span>
+            </button>
+            <input type="file" class="iig-avatar-ref-file" accept="image/*" multiple hidden>
+        </div>`;
 }
 
 async function openProfileAvatarPicker(card, kind, profile) {
@@ -6563,7 +6764,9 @@ async function openProfileAvatarPicker(card, kind, profile) {
             <input type="search" class="text_pole iig-avatar-picker-search" placeholder="${kind === 'user' ? 'Поиск персоны' : 'Поиск персонажа'}" aria-label="Поиск">
             <button type="button" class="menu_button iig-avatar-picker-close" title="Закрыть" aria-label="Закрыть"><i class="fa-solid fa-xmark" aria-hidden="true"></i></button>
         </div>
-        <div class="iig-avatar-picker-grid">${choices.map(choice => `
+        ${profileRefsHtml(profile)}
+        <div class="iig-avatar-picker-label">${kind === 'user' ? 'Персоны' : 'Обложка карточки и другие персонажи'}</div>
+        <div class="iig-avatar-picker-grid iig-avatar-choices-list">${choices.map(choice => `
             <button type="button" class="iig-avatar-choice${choice.selected ? ' is-selected' : ''}" data-id="${escapeHtml(choice.id)}" title="${escapeHtml(choice.name)}">
                 <img src="${escapeHtml(choice.thumb)}" alt="" loading="lazy" onerror="this.style.visibility='hidden'">
                 <span>${escapeHtml(choice.name)}</span>
@@ -6572,22 +6775,52 @@ async function openProfileAvatarPicker(card, kind, profile) {
     picker.querySelector('.iig-avatar-picker-close')?.addEventListener('click', () => { picker.hidden = true; opener?.setAttribute('aria-expanded', 'false'); });
     picker.querySelector('.iig-avatar-picker-search')?.addEventListener('input', event => {
         const needle = event.target.value.trim().toLowerCase();
-        picker.querySelectorAll('.iig-avatar-choice').forEach(button => {
+        picker.querySelectorAll('.iig-avatar-choices-list .iig-avatar-choice').forEach(button => {
             button.hidden = Boolean(needle) && !button.title.toLowerCase().includes(needle);
         });
     });
-    picker.querySelectorAll('.iig-avatar-choice').forEach(button => button.addEventListener('click', async () => {
+    // Own refs: pick one, delete one, upload new ones.
+    picker.querySelectorAll('.iig-avatar-choice[data-ref-id]').forEach(button => button.addEventListener('click', () => {
+        if (!selectProfileRef(profile, button.dataset.refId)) return;
+        saveSettings();
+        renderCharacterProfiles();
+    }));
+    picker.querySelectorAll('.iig-avatar-ref-remove').forEach(button => button.addEventListener('click', () => {
+        const ref = profile.customAvatars.find(item => item.id === button.dataset.refId);
+        if (!ref || !confirm(`Удалить реф «${ref.name || 'Реф'}»?`)) return;
+        removeProfileRef(profile, ref.id);
+        saveSettings();
+        reopenProfileAvatarPicker(kind);
+    }));
+    const refInput = picker.querySelector('.iig-avatar-ref-file');
+    picker.querySelector('.iig-avatar-upload')?.addEventListener('click', () => refInput?.click());
+    refInput?.addEventListener('change', async event => {
+        const files = Array.from(event.target.files || []);
+        if (!files.length) return;
+        try {
+            if (!await addProfileRefs(profile, files)) throw new Error('это не картинка');
+            saveSettings();
+            reopenProfileAvatarPicker(kind);
+        } catch (error) {
+            toastr.error(`Не удалось загрузить: ${error.message}`, 'Профили');
+        }
+    });
+    picker.querySelectorAll('.iig-avatar-choice[data-id]').forEach(button => button.addEventListener('click', async () => {
         const id = button.dataset.id;
         try {
             if (kind === 'user') {
-                selectAvatar(id);
+                // The same persona again → back to its main avatar; another persona → that persona's profile.
+                if (id === getSettings().userAvatarFile) useMainProfileAvatar(profile);
+                else selectAvatar(id);
             } else if (id === '__card__') {
-                profile.avatarSource = 'card';
+                useMainProfileAvatar(profile);
             } else {
                 button.classList.add('is-loading');
                 const raw = await imageUrlToBase64(`/characters/${encodeURIComponent(id)}`);
                 if (!raw) throw new Error('картинка не загрузилась');
                 profile.customAvatarData = await resizeImageBase64(raw, 768);
+                profile.customAvatarId = '';
+                profile.pickedCharacter = id;
                 profile.avatarSource = 'custom';
             }
             saveSettings();
@@ -6632,24 +6865,6 @@ function bindCharacterProfileEvents(container, profiles, owners = {}) {
     container.querySelectorAll('.iig-profile-card[data-profile-kind]').forEach(card => {
         const profile = profiles[card.dataset.profileKind];
         if (!profile) return;
-        card.querySelector('.iig-profile-source')?.addEventListener('change', event => {
-            profile.avatarSource = event.target.value === 'custom' ? 'custom' : 'card';
-            saveSettings();
-            renderCharacterProfiles();
-        });
-        card.querySelector('.iig-profile-upload')?.addEventListener('click', () => card.querySelector('.iig-profile-file')?.click());
-        card.querySelector('.iig-profile-file')?.addEventListener('change', async event => {
-            const file = event.target.files?.[0];
-            if (!file) return;
-            profile.customAvatarData = await readProfileImage(file);
-            saveSettings();
-            renderCharacterProfiles();
-        });
-        card.querySelector('.iig-profile-clear')?.addEventListener('click', () => {
-            profile.customAvatarData = '';
-            saveSettings();
-            renderCharacterProfiles();
-        });
         card.querySelector('.iig-profile-appearance')?.addEventListener('input', event => {
             profile.appearance = event.target.value;
             saveSettings();
@@ -7309,7 +7524,7 @@ function createSettingsUI() {
                             <span>👤 Профили персонажей</span>
                         </div>
                         <div class="iig-collapsible-content">
-                            <p class="hint">Выбор источника аватара (обложка карточки или загруженный реф) и описание внешности для бота и персоны. RPG-режим позволяет добавить несколько персонажей в одну карточку бота — их рефы и описания отправляются, только если имя встречается в промпте.</p>
+                            <p class="hint">Нажмите на большую аватарку, чтобы выбрать картинку: основную аватарку, другую персону или персонажа, или свои рефы — их можно загрузить несколько и выбирать из списка. Имена, «+ описание внешности из карточки» и поиск имени в промпте берутся у персоны и бота, выбранных здесь, а не у активной персоны таверны. RPG-режим позволяет добавить несколько персонажей в одну карточку бота — их рефы и описания отправляются, только если имя встречается в промпте.</p>
                             <div id="iig_character_library"></div>
                         </div>
                     </div>

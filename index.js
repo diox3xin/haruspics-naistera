@@ -8836,8 +8836,36 @@ function bindReferenceGenerator(content) {
 // touches module-level `let` state declared above (TDZ otherwise).
 // ============================================================
 
+/**
+ * Sites behind a CDN (Cloudflare: "cache-control: public, max-age=14400") keep serving the browser an old
+ * style.css for hours after the extension is updated, while index.js is already new — then new elements show
+ * without their styles (e.g. a full-size avatar in the profiles). Load style.css again with its version in the
+ * address and drop the stale copy.
+ */
+async function refreshExtensionStylesheet() {
+    try {
+        const href = new URL('./style.css', import.meta.url).href;
+        // Revalidates the plain address with the server (cheap 304 when nothing changed).
+        const response = await fetch(href, { cache: 'no-cache' });
+        if (!response.ok) return;
+        const stamp = response.headers.get('etag') || response.headers.get('last-modified') || String((await response.text()).length);
+        const fresh = `${href}?v=${encodeURIComponent(stamp.replace(/\W+/g, ''))}`;
+        const stale = [...document.querySelectorAll('link[rel="stylesheet"]')].filter(link => link.href.split('?')[0] === href);
+        if (stale.some(link => link.href === fresh)) return;
+        const link = document.createElement('link');
+        link.rel = 'stylesheet';
+        link.href = fresh;
+        link.dataset.iigStyle = 'fresh';
+        link.addEventListener('load', () => stale.forEach(old => old.remove()), { once: true });
+        document.head.appendChild(link);
+    } catch (error) {
+        iigLog('WARN', `Cannot refresh style.css: ${error.message}`);
+    }
+}
+
 (function init() {
     const context = SillyTavern.getContext();
+    refreshExtensionStylesheet();
     getSettings();
 
     context.eventSource.on(context.event_types.APP_READY, () => {

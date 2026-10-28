@@ -46,3 +46,9 @@ test('the picture block keeps the spot it chose instead of jumping while the rep
     assert.match(source, /if \(entry && entry\.anchor == null\) entry\.anchor = /);
     assert.match(source, /placePromptPanel\(entry\.mesEl, entry\.panel, entry\)/);
 });
+
+test('style.css is loaded again with its version so a CDN-cached old copy does not stay', () => {
+    assert.match(source, /async function refreshExtensionStylesheet\(/);
+    assert.match(source, /fetch\(href, \{ cache: 'no-cache' \}\)/);
+    assert.match(source, /\(function init\(\) \{\r?\n    const context = SillyTavern\.getContext\(\);\r?\n    refreshExtensionStylesheet\(\);/);
+});

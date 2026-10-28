@@ -1972,3 +1972,43 @@ body.iig-mode-inline .mes_text .iig-image-wrapper {
 .iig-profile-avatar-slot .iig-avatar-preview { margin-bottom: 0 !important; }
 .iig-profiles-describe-settings #iig_avatar_part_common { margin-top: 10px; padding-top: 10px; border-top: 1px dashed rgba(255, 255, 255, .1); }
 .iig-profiles-describe-settings #iig_avatar_part_common p.hint { margin-bottom: 0; }
+
+/* ===== Profile head: big avatar that opens a picker, «всегда отправлять» next to the name ===== */
+.iig-profile-head { display: flex; align-items: center; gap: 14px; }
+.iig-profile-avatar-btn { all: unset; position: relative; flex: 0 0 88px; width: 88px; height: 88px; border-radius: 14px; overflow: hidden; cursor: pointer; background: rgba(0, 0, 0, .25); box-shadow: 0 0 0 1px rgba(255, 255, 255, .1); }
+.iig-profile-avatar-btn img { width: 100%; height: 100%; object-fit: cover; object-position: top center; display: block; }
+.iig-profile-avatar-empty { width: 100%; height: 100%; display: grid; place-items: center; font-size: 26px; color: #888; }
+.iig-profile-avatar-edit { position: absolute; right: 5px; bottom: 5px; width: 26px; height: 26px; display: grid; place-items: center; border-radius: 999px; font-size: 12px; color: #fff; background: rgba(15, 12, 18, .7); opacity: .85; transition: opacity .15s ease; }
+.iig-profile-avatar-btn:hover .iig-profile-avatar-edit, .iig-profile-avatar-btn:focus-visible .iig-profile-avatar-edit { opacity: 1; background: color-mix(in srgb, var(--iig-accent) 55%, rgba(15, 12, 18, .7)); }
+.iig-profile-avatar-btn:focus-visible { outline: 2px solid var(--iig-accent); outline-offset: 2px; }
+.iig-profile-head-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1; }
+.iig-profile-head-text h4 { margin: 0; font-size: 16px; }
+.iig-profile-head-text small { font-size: 13px; opacity: .75; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.iig-profile-head-controls { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 6px; }
+.iig-profile-head-controls .checkbox_label { margin: 0; }
+.iig-profile-head-controls .menu_button { margin: 0; width: 32px; height: 32px; padding: 0; display: inline-flex; align-items: center; justify-content: center; }
+/* Picker */
+.iig-profile-avatar-picker { margin-top: 10px; padding: 10px; border: 1px solid rgba(255, 182, 193, .22); border-radius: 10px; background: rgba(0, 0, 0, .2); }
+.iig-avatar-picker-head { display: flex; gap: 8px; margin-bottom: 8px; }
+.iig-avatar-picker-head .text_pole { flex: 1; margin: 0; }
+.iig-avatar-picker-head .menu_button { margin: 0; width: 34px; padding: 0; display: inline-flex; align-items: center; justify-content: center; }
+.iig-avatar-picker-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(84px, 1fr)); gap: 8px; max-height: 320px; overflow-y: auto; }
+.iig-avatar-choice { all: unset; box-sizing: border-box; display: flex; flex-direction: column; gap: 4px; padding: 4px; border-radius: 10px; cursor: pointer; border: 1px solid transparent; text-align: center; }
+.iig-avatar-choice[hidden] { display: none; }
+.iig-avatar-choice img { width: 100%; aspect-ratio: 1; object-fit: cover; object-position: top center; border-radius: 8px; background: rgba(0, 0, 0, .25); }
+.iig-avatar-choice span { font-size: 12px; line-height: 1.25; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.iig-avatar-choice:hover { background: rgba(255, 255, 255, .05); }
+.iig-avatar-choice.is-selected { border-color: color-mix(in srgb, var(--iig-accent) 70%, transparent); background: color-mix(in srgb, var(--iig-accent) 10%, transparent); }
+.iig-avatar-choice.is-loading { opacity: .5; pointer-events: none; }
+.iig-avatar-choice:focus-visible { outline: 2px solid var(--iig-accent); outline-offset: 1px; }
+.iig-avatar-picker-note { font-size: 13px; opacity: .75; padding: 6px; }
+@media (max-width: 600px) {
+    .iig-profile-avatar-btn { flex-basis: 76px; width: 76px; height: 76px; }
+    .iig-avatar-picker-grid { grid-template-columns: repeat(auto-fill, minmax(72px, 1fr)); }
+}
+
+/* Checkbox next to the format dropdown: same height, centred on it */
+.iig-profiles-describe-controls { align-items: center; }
+.iig-profiles-describe-controls .iig-select-wrap > select { height: 36px; }
+.iig-profiles-describe-controls .iig-profile-use-card { height: 36px; margin: 0; display: inline-flex; align-items: center; gap: 8px; white-space: normal; line-height: 1.25; }
+.iig-profiles-describe-controls .iig-profile-use-card input { margin: 0; flex: 0 0 auto; transform: none; }

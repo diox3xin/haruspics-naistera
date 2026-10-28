@@ -6386,15 +6386,28 @@ function describeFormatSelectHtml(id, cls, value) {
 }
 
 function profileCardHtml(kind, entity, profile, cardPreview) {
+    const settings = getSettings();
     const customPreview = profile.customAvatarData ? `data:${detectMimeType(profile.customAvatarData)};base64,${profile.customAvatarData}` : '';
     const preview = profile.avatarSource === 'custom' ? customPreview : cardPreview;
     const label = kind === 'user' ? 'Персона' : 'Бот';
+    const always = kind === 'user' ? settings.sendUserAvatar : settings.sendCharAvatar;
     return `
         <div class="iig-profile-card" data-profile-kind="${kind}">
             <div class="iig-profile-head">
-                <div class="iig-library-editor-avatar">${libraryPreviewHtml(preview, kind === 'user' ? 'fa-user' : 'fa-user-pen')}</div>
-                <div><h4>${escapeHtml(entity.title)}</h4><small>${label}</small></div>
+                <button type="button" class="iig-profile-avatar-btn" title="${kind === 'user' ? 'Выбрать аватарку персоны' : 'Выбрать картинку бота из персонажей'}" aria-haspopup="true" aria-expanded="false">
+                    ${preview ? `<img src="${escapeHtml(preview)}" alt="" onerror="this.style.display='none'">` : `<span class="iig-profile-avatar-empty"><i class="fa-solid ${kind === 'user' ? 'fa-user' : 'fa-user-pen'}" aria-hidden="true"></i></span>`}
+                    <span class="iig-profile-avatar-edit" aria-hidden="true"><i class="fa-solid fa-pen"></i></span>
+                </button>
+                <div class="iig-profile-head-text">
+                    <h4>${escapeHtml(entity.title)}</h4>
+                    <small>${label}${kind === 'user' && settings.userAvatarFile ? ` · ${escapeHtml(settings.userAvatarFile)}` : ''}</small>
+                    <div class="iig-profile-head-controls">
+                        <label class="checkbox_label iig-profile-always" title="Отправлять ${kind === 'user' ? 'аватар юзера' : 'аватар персонажа'} во все картинки, даже если имени нет в промпте (для NovelAI не действует)"><input type="checkbox" class="iig-profile-always-input" ${always ? 'checked' : ''}><span>Всегда отправлять аватар</span></label>
+                        <button type="button" class="menu_button iig-profile-avatar-refresh" title="Обновить аватарку и список" aria-label="Обновить"><i class="fa-solid fa-arrows-rotate" aria-hidden="true"></i></button>
+                    </div>
+                </div>
             </div>
+            <div class="iig-profile-avatar-picker" hidden></div>
             <div class="iig-profile-field">
                 <label>Референс</label>
                 <select class="iig-profile-source">
@@ -6421,7 +6434,6 @@ function profileCardHtml(kind, entity, profile, cardPreview) {
                     <button type="button" class="menu_button iig-profile-describe" title="Описать внешность по ${profile.avatarSource === 'custom' ? 'загруженному рефу' : 'аватарке'} — формат и «+ описание» выбираются вверху"><i class="fa-solid fa-eye" aria-hidden="true"></i> Описать по ${profile.avatarSource === 'custom' ? 'рефу' : 'аватарке'}</button>
                 </div>
             </div>
-            <div class="iig-profile-avatar-slot"></div>
         </div>`;
 }
 
@@ -6472,12 +6484,15 @@ function renderCharacterProfiles() {
     const userProfile = getCharacterProfile('user', userEntity.key, settings, true);
     userEntity.title = context.name1 || userEntity.title;
 
-    // «Аватары и референсы» live inside the profiles now: keep their nodes (and listeners) across re-renders.
-    const avatarParts = ['common', 'char', 'user'].map(part => document.getElementById(`iig_avatar_part_${part}`));
-    avatarParts.forEach(node => node?.remove());
+    // «Авто-определение имён» lives in the profiles' top block now: keep its node (and listener) across re-renders.
+    const commonPart = document.getElementById('iig_avatar_part_common');
+    commonPart?.remove();
+    const personaName = settings.userAvatarFile ? context.powerUserSettings?.personas?.[settings.userAvatarFile] : '';
+    if (personaName) userEntity.title = personaName;
 
-    const charPreview = character?.avatar ? `/thumbnail?type=avatar&file=${encodeURIComponent(character.avatar)}` : '';
-    const userPreview = settings.userAvatarFile ? `/thumbnail?type=persona&file=${encodeURIComponent(settings.userAvatarFile)}` : '';
+    // Full-size pictures: the small thumbnails looked blurry at this size.
+    const charPreview = character?.avatar ? `/characters/${encodeURIComponent(character.avatar)}` : '';
+    const userPreview = settings.userAvatarFile ? `/User Avatars/${encodeURIComponent(settings.userAvatarFile)}` : '';
 
     container.innerHTML = `
         <div class="iig-profiles">
@@ -6486,7 +6501,7 @@ function renderCharacterProfiles() {
                     <label for="iig_profile_desc_format">Как описывать внешность по аватарке</label>
                     <div class="iig-profiles-describe-controls">
                         ${describeFormatSelectHtml('iig_profile_desc_format', 'iig-profile-desc-format', getProfileDescFormat())}
-                        <label class="checkbox_label iig-profile-use-card" title="Вместе с картинкой учитывать внешность из описания карточки бота и описания персоны. Выключено — только по картинке."><input type="checkbox" class="iig-profile-use-card-input" ${settings.profileDescribeWithCard ? 'checked' : ''}><span>+ описание карточки и персоны</span></label>
+                        <label class="checkbox_label iig-profile-use-card" title="Вместе с картинкой учитывать внешность из описания карточки бота и описания персоны. Выключено — только по картинке."><input type="checkbox" class="iig-profile-use-card-input" ${settings.profileDescribeWithCard ? 'checked' : ''}><span>+ описание внешности из карточки персонажей</span></label>
                     </div>
                 </div>
             </div>
@@ -6495,11 +6510,7 @@ function renderCharacterProfiles() {
             ${charProfile ? rpgCharactersHtml(charProfile) : ''}
         </div>`;
 
-    const [commonPart, charPart, userPart] = avatarParts;
     if (commonPart) container.querySelector('.iig-profiles-describe-settings')?.appendChild(commonPart);
-    const charSlot = container.querySelector('.iig-profile-card[data-profile-kind="char"] .iig-profile-avatar-slot');
-    if (charPart) (charSlot || container.querySelector('.iig-profiles-describe-settings'))?.appendChild(charPart);
-    if (userPart) container.querySelector('.iig-profile-card[data-profile-kind="user"] .iig-profile-avatar-slot')?.appendChild(userPart);
 
     bindCharacterProfileEvents(container, { char: charProfile, user: userProfile }, {
         char: { name: character?.name || charEntity.title, notes: character?.description || '' },
@@ -6507,7 +6518,108 @@ function renderCharacterProfiles() {
     });
 }
 
+/** Pictures to choose from: the user's personas, or the characters (plus «обложка карточки») for the bot. */
+async function profileAvatarChoices(kind, profile) {
+    const context = SillyTavern.getContext();
+    const settings = getSettings();
+    if (kind === 'user') {
+        const names = context.powerUserSettings?.personas || {};
+        return (await fetchUserAvatars()).map(file => ({
+            id: file,
+            name: names[file] || file,
+            thumb: `/thumbnail?type=persona&file=${encodeURIComponent(file)}`,
+            selected: file === settings.userAvatarFile,
+        }));
+    }
+    const current = context.characters?.[context.characterId];
+    return [
+        ...(current?.avatar ? [{ id: '__card__', name: 'Обложка карточки', thumb: `/thumbnail?type=avatar&file=${encodeURIComponent(current.avatar)}`, selected: profile.avatarSource !== 'custom' }] : []),
+        ...(context.characters || []).filter(character => character?.avatar && character.avatar !== 'none').map(character => ({
+            id: character.avatar,
+            name: character.name || character.avatar,
+            thumb: `/thumbnail?type=avatar&file=${encodeURIComponent(character.avatar)}`,
+            selected: false,
+        })),
+    ];
+}
+
+async function openProfileAvatarPicker(card, kind, profile) {
+    const picker = card.querySelector('.iig-profile-avatar-picker');
+    const opener = card.querySelector('.iig-profile-avatar-btn');
+    if (!picker) return;
+    if (!picker.hidden) { picker.hidden = true; opener?.setAttribute('aria-expanded', 'false'); return; }
+    picker.hidden = false;
+    opener?.setAttribute('aria-expanded', 'true');
+    picker.innerHTML = '<div class="iig-avatar-picker-note">Загрузка…</div>';
+    let choices = [];
+    try {
+        choices = await profileAvatarChoices(kind, profile);
+    } catch (error) {
+        picker.innerHTML = `<div class="iig-avatar-picker-note">Не удалось загрузить список: ${escapeHtml(error.message)}</div>`;
+        return;
+    }
+    picker.innerHTML = `
+        <div class="iig-avatar-picker-head">
+            <input type="search" class="text_pole iig-avatar-picker-search" placeholder="${kind === 'user' ? 'Поиск персоны' : 'Поиск персонажа'}" aria-label="Поиск">
+            <button type="button" class="menu_button iig-avatar-picker-close" title="Закрыть" aria-label="Закрыть"><i class="fa-solid fa-xmark" aria-hidden="true"></i></button>
+        </div>
+        <div class="iig-avatar-picker-grid">${choices.map(choice => `
+            <button type="button" class="iig-avatar-choice${choice.selected ? ' is-selected' : ''}" data-id="${escapeHtml(choice.id)}" title="${escapeHtml(choice.name)}">
+                <img src="${escapeHtml(choice.thumb)}" alt="" loading="lazy" onerror="this.style.visibility='hidden'">
+                <span>${escapeHtml(choice.name)}</span>
+            </button>`).join('') || '<div class="iig-avatar-picker-note">Список пуст</div>'}
+        </div>`;
+    picker.querySelector('.iig-avatar-picker-close')?.addEventListener('click', () => { picker.hidden = true; opener?.setAttribute('aria-expanded', 'false'); });
+    picker.querySelector('.iig-avatar-picker-search')?.addEventListener('input', event => {
+        const needle = event.target.value.trim().toLowerCase();
+        picker.querySelectorAll('.iig-avatar-choice').forEach(button => {
+            button.hidden = Boolean(needle) && !button.title.toLowerCase().includes(needle);
+        });
+    });
+    picker.querySelectorAll('.iig-avatar-choice').forEach(button => button.addEventListener('click', async () => {
+        const id = button.dataset.id;
+        try {
+            if (kind === 'user') {
+                selectAvatar(id);
+            } else if (id === '__card__') {
+                profile.avatarSource = 'card';
+            } else {
+                button.classList.add('is-loading');
+                const raw = await imageUrlToBase64(`/characters/${encodeURIComponent(id)}`);
+                if (!raw) throw new Error('картинка не загрузилась');
+                profile.customAvatarData = await resizeImageBase64(raw, 768);
+                profile.avatarSource = 'custom';
+            }
+            saveSettings();
+            renderCharacterProfiles();
+        } catch (error) {
+            button.classList.remove('is-loading');
+            toastr.error(`Не удалось выбрать: ${error.message}`, 'Профили');
+        }
+    }));
+    picker.querySelector('.iig-avatar-picker-search')?.focus();
+}
+
 function bindCharacterProfileEvents(container, profiles, owners = {}) {
+    container.querySelectorAll('.iig-profile-card[data-profile-kind]').forEach(card => {
+        const kind = card.dataset.profileKind;
+        const profile = profiles[kind];
+        if (!profile) return;
+        card.querySelector('.iig-profile-avatar-btn')?.addEventListener('click', () => openProfileAvatarPicker(card, kind, profile));
+        card.querySelector('.iig-profile-always-input')?.addEventListener('change', event => {
+            const settings = getSettings();
+            const key = kind === 'user' ? 'sendUserAvatar' : 'sendCharAvatar';
+            settings[key] = event.target.checked;
+            const legacy = document.getElementById(kind === 'user' ? 'iig_send_user_avatar' : 'iig_send_char_avatar');
+            if (legacy) legacy.checked = event.target.checked;
+            saveSettings();
+        });
+        card.querySelector('.iig-profile-avatar-refresh')?.addEventListener('click', () => {
+            if (kind === 'user') loadAndRenderAvatars();
+            renderCharacterProfiles();
+            toastr.info('Обновлено', 'Профили');
+        });
+    });
     container.querySelector('.iig-profile-desc-format')?.addEventListener('change', event => {
         const settings = getSettings();
         settings.profileDescFormat = event.target.value === 'novelai' ? 'novelai' : 'banana';

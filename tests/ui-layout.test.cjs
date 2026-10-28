@@ -12,7 +12,10 @@ test('settings tabs go Основное → Персонажи → Промпт 
     assert.match(source, /label: 'Профили персонажей'[^\n]*sections: \['character_library'\]/);
     // the avatar settings are moved into the profile cards, not shown as a separate section
     assert.match(source, /id="iig_avatar_part_user"/);
-    assert.match(source, /class="iig-profile-avatar-slot"/);
+    // the big avatar in the profile head picks the picture; «всегда отправлять» sits next to the name
+    assert.match(source, /class="iig-profile-avatar-btn"/);
+    assert.match(source, /function openProfileAvatarPicker\(/);
+    assert.match(source, /class="iig-profile-always-input"/);
 });
 
 test('the picture block can sit in the middle of the reply and is put back after re-renders', () => {

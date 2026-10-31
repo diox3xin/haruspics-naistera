@@ -29,7 +29,9 @@ function collector(settings, { profileNames = { char: [], user: [] } } = {}) {
         ensureNpcDefaults: () => {},
         detectMimeType: () => 'image/png', iigLog: () => {}, MAX_IMAGE_REFS: 4,
     });
+    vm.runInContext(source.slice(source.indexOf('function otherDescFormat('), source.indexOf('/** Format for describing the bot')), context);
     vm.runInContext(section('const NAME_IGNORED_WORDS', '// ============================================================\r\n// 4-SLOT') , context);
+    vm.runInContext(source.slice(source.indexOf('function otherDescFormat('), source.indexOf('/** Format for describing the bot')), context);
     vm.runInContext(section('async function collectReferenceImages(', '// IMAGE GENERATION: OpenAI'), context);
     return context.collectReferenceImages.bind(context);
 }

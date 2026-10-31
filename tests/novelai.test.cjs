@@ -29,6 +29,7 @@ function setup(response, settings = {}) {
         namesAppearInPrompt: (names, text) => names.some(name => String(text).toLowerCase().includes(String(name).toLowerCase())),
         nameLeadsTagIndex: (names, text) => String(text).split(',').findIndex(tag => names.some(name => tag.trim().toLowerCase().startsWith(String(name).toLowerCase()))),
     });
+    vm.runInContext(source.slice(source.indexOf('function otherDescFormat('), source.indexOf('/** Format for describing the bot')), context);
     vm.runInContext(source.slice(start, end), context);
     return { generate: context.generateImageNovelAI, requests };
 }
@@ -147,6 +148,7 @@ test('collector forwards library and wardrobe descriptions, not images, to offic
         iigLog: () => {},
         MAX_IMAGE_REFS: 4,
     });
+    vm.runInContext(source.slice(source.indexOf('function otherDescFormat('), source.indexOf('/** Format for describing the bot')), context);
     vm.runInContext(source.slice(collectorStart, collectorEnd), context);
     const result = await context.collectReferenceImages('Hero in a forest');
     assert.equal(result.imageRefs.length, 0);

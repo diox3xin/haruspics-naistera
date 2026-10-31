@@ -18,6 +18,7 @@ function grab(name) {
 
 function load(stContext, settings = {}) {
     const context = vm.createContext({ getSettings: () => settings, SillyTavern: { getContext: () => stContext } });
+    vm.runInContext(source.slice(source.indexOf('function otherDescFormat('), source.indexOf('/** Format for describing the bot')), context);
     vm.runInContext([
         'makeProfileRefId', 'makeCharacterProfile', 'getCharacterProfile', 'getCharacterLibraryKey', 'getCurrentCharacterLibraryKey',
         'getExtensionPersona', 'getExtensionCharacter', 'fillCardMacros', 'useMainProfileAvatar', 'selectProfileRef', 'removeProfileRef',

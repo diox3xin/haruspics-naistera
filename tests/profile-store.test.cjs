@@ -19,13 +19,14 @@ function grab(name) {
 
 const settings = {};
 const context = vm.createContext({ getSettings: () => settings });
+vm.runInContext(source.slice(source.indexOf('function otherDescFormat('), source.indexOf('/** Format for describing the bot')), context);
 vm.runInContext(`${grab('makeCharacterProfile')}\n${grab('getCharacterProfile')}\nglobalThis.get = getCharacterProfile;`, context);
 
 test('edits made through an earlier reference survive later lookups', () => {
     const shown = context.get('char', 'avatar:Novak.png', settings, true);
     context.get('char', 'avatar:Novak.png', settings);
     shown.aliases = 'Novak, Новак';
-    shown.appearance = 'grey eyes';
+    context.setProfileAppearance(shown, 'banana', 'grey eyes');
     const again = context.get('char', 'avatar:Novak.png', settings);
     assert.equal(again, shown);
     assert.equal(settings.characterProfiles.characters['avatar:Novak.png'].aliases, 'Novak, Новак');

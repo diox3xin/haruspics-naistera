@@ -27,6 +27,7 @@ function collector(config = {}, outfit = {}, hair = null, refs = [], prompt = 'f
         getActiveHairstyleItem: kind => kind === 'char' ? hair : null,
         detectMimeType: () => 'image/png', iigLog: () => {}, MAX_IMAGE_REFS: 4,
     });
+    vm.runInContext(source.slice(source.indexOf('function otherDescFormat('), source.indexOf('/** Format for describing the bot')), context);
     vm.runInContext(section('async function collectReferenceImages(', '// IMAGE GENERATION: OpenAI'), context);
     // NovelAI never uses «Всегда отправлять»: there people are included only when the prompt names them.
     const isNovelAI = ['novelai', 'novelai-direct'].includes(config.apiType);
@@ -78,9 +79,13 @@ test('NovelAI uses hairstyle text and reports missing wardrobe descriptions', as
 
 test('generated legacy tags retain prompt, style and options for regeneration', async () => {
     const context = vm.createContext({ iigLog: () => {} });
+    vm.runInContext(source.slice(source.indexOf('function otherDescFormat('), source.indexOf('/** Format for describing the bot')), context);
     vm.runInContext(section('function escapeHtml(', '// SETTINGS'), context);
+    vm.runInContext(source.slice(source.indexOf('function otherDescFormat('), source.indexOf('/** Format for describing the bot')), context);
     vm.runInContext(section('const NAME_IGNORED_WORDS', 'function getNpcAliases('), context);
+    vm.runInContext(source.slice(source.indexOf('function otherDescFormat('), source.indexOf('/** Format for describing the bot')), context);
     vm.runInContext(section('function buildGeneratedImageTag(', 'async function restoreImageRegenButtons('), context);
+    vm.runInContext(source.slice(source.indexOf('function otherDescFormat('), source.indexOf('/** Format for describing the bot')), context);
     vm.runInContext(section('async function parseImageTags(', '// DOM HELPERS'), context);
     const tag = { prompt: `Hero's "coat" <red> & blue`, style: 'anime', aspectRatio: '2:3', negativePrompt: 'blur' };
     const html = context.buildGeneratedImageTag(tag, '/images/result.png');
@@ -119,6 +124,7 @@ test('restores visible regen buttons after rendering, without duplicate wrappers
         processingMessages: new Set(),
         parseImageTags: async () => images.map(() => ({ existingSrc: '/images/generated.png' })),
     });
+    vm.runInContext(source.slice(source.indexOf('function otherDescFormat('), source.indexOf('/** Format for describing the bot')), context);
     vm.runInContext(section('function wrapImageWithRegen(', '// MESSAGE PROCESSING'), context);
     const message = { isConnected: true, querySelectorAll: () => images };
     await context.restoreImageRegenButtons(message, 7);
@@ -138,6 +144,7 @@ test('restores visible regen buttons after rendering, without duplicate wrappers
 
 test('crop coordinates support reverse dragging and clamp to image boundaries', () => {
     const context = vm.createContext({});
+    vm.runInContext(source.slice(source.indexOf('function otherDescFormat('), source.indexOf('/** Format for describing the bot')), context);
     vm.runInContext(section('function getCropRectangle(', '// Returns null on cancel'), context);
     const crop = context.getCropRectangle({ x: 900, y: 500 }, { x: -10, y: 20 }, 800, 400);
     assert.deepEqual(JSON.parse(JSON.stringify(crop)), { x: 0, y: 20, width: 800, height: 380 });
@@ -151,6 +158,7 @@ test('saved image is changed only after confirmation, preserving name and descri
             resizeImageBase64: async image => image,
             saveSettings: () => saved++, renderQuickWardrobeList() {}, toastr: { success() {} },
         });
+        vm.runInContext(source.slice(source.indexOf('function otherDescFormat('), source.indexOf('/** Format for describing the bot')), context);
         vm.runInContext(section('function editSavedReferenceImage(', 'function buildReferenceCard('), context);
         const item = { imageData: 'ORIGINAL', name: 'Coat', description: 'red coat' };
         await context.editSavedReferenceImage(item, () => {});

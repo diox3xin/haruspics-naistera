@@ -428,6 +428,7 @@ function makeProfileRefId() {
 
 function makeCharacterProfile(raw = {}) {
     const rpgCharacters = Array.isArray(raw.rpgCharacters) ? raw.rpgCharacters : [];
+    const appearances = descriptionPair(raw.appearances, raw.appearance);
     // Own refs uploaded for this bot / persona: a list to pick from. The chosen one replaces the main avatar.
     const customAvatars = (Array.isArray(raw.customAvatars) ? raw.customAvatars : [])
         .map(item => ({
@@ -454,7 +455,9 @@ function makeCharacterProfile(raw = {}) {
         customAvatars,
         customAvatarId,
         pickedCharacter,
-        appearance: String(raw.appearance || '').trim(),
+        // Two appearances (text / NovelAI tags); `appearance` is the one for the current image API.
+        appearances,
+        appearance: pickDescription(appearances, imageApiDescFormat()),
         // Extra names to look for in the image prompt (e.g. "Ivan, Vanya, Petrov"), comma-separated.
         aliases: String(raw.aliases || '').trim(),
         // «Описать по аватарке» also reads the card / persona description.
@@ -1519,11 +1522,11 @@ function getActiveHairstyleItem(target) {
     return activeId ? (settings.hairstyleItems?.find(i => i.id === activeId) || null) : null;
 }
 
-function updateHairstyleItemDescription(itemId, description) {
+function updateHairstyleItemDescription(itemId, description, format = getVisionDescFormat()) {
     const settings = getSettings();
     const item = settings.hairstyleItems?.find(i => i.id === itemId);
     if (item) {
-        item.description = description;
+        setItemDescription(item, format, description);
         saveSettings();
     }
 }
@@ -1548,6 +1551,108 @@ function getVisionDescFormat(settings = getSettings()) {
 function getNpcDescFormat(settings = getSettings()) {
     if (settings.npcDescFormat === 'novelai' || settings.npcDescFormat === 'banana') return settings.npcDescFormat;
     return getVisionDescFormat(settings);
+}
+
+// ============================================================
+// TWO DESCRIPTIONS: TEXT (Nano Banana) AND TAGS (NovelAI)
+// ============================================================
+// Appearance, outfits and hairstyles keep one description per format. The switch next to a field shows / edits
+// one of them; the picture gets the one that fits the image API (tags for NovelAI, text for the others) and
+// falls back to the other one when it is empty.
+
+function otherDescFormat(format) {
+    return format === 'novelai' ? 'banana' : 'novelai';
+}
+
+/** Which description goes into the picture: NovelAI tags for NovelAI, text for every other API. */
+function imageApiDescFormat(settings) {
+    try {
+        return isNovelAIPromptTarget(settings || getSettings()) ? 'novelai' : 'banana';
+    } catch (_) {
+        return 'banana';
+    }
+}
+
+/** Old single descriptions are sorted into a format: a short comma list is NovelAI tags, sentences are text. */
+function looksLikeTagList(text) {
+    const value = String(text || '').trim();
+    if (!value) return false;
+    if (/[.!?](?:\s|$)/.test(value.replace(/\d\.\d/g, ''))) return false;
+    const parts = value.split(',').map(part => part.trim()).filter(Boolean);
+    if (parts.length < 2) return value.split(/\s+/).length <= 4;
+    return parts.reduce((sum, part) => sum + part.split(/\s+/).length, 0) / parts.length <= 4;
+}
+
+/** { banana, novelai }; without a stored pair the old single description goes into the matching slot. */
+function descriptionPair(raw, legacy = '') {
+    if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+        return { banana: String(raw.banana || ''), novelai: String(raw.novelai || '') };
+    }
+    const pair = { banana: '', novelai: '' };
+    const old = String(legacy || '').trim();
+    if (old) pair[looksLikeTagList(old) ? 'novelai' : 'banana'] = old;
+    return pair;
+}
+
+function pickDescription(pair, format, fallback = true) {
+    const own = String(pair?.[format] || '').trim();
+    return own || !fallback ? own : String(pair?.[otherDescFormat(format)] || '').trim();
+}
+
+/** Wardrobe / hairstyle item: makes sure it has both descriptions (old items are migrated on first use). */
+function ensureItemDescriptions(item) {
+    if (item) item.descriptions = descriptionPair(item.descriptions, item.description);
+    return item;
+}
+
+function getItemDescription(item, format, fallback = true) {
+    if (!item) return '';
+    return pickDescription(ensureItemDescriptions(item).descriptions, format, fallback);
+}
+
+function setItemDescription(item, format, value) {
+    if (!item) return;
+    ensureItemDescriptions(item).descriptions[format === 'novelai' ? 'novelai' : 'banana'] = String(value || '');
+    // `description` stays as the one for the current image API (search, «с описанием» labels, older code).
+    item.description = getItemDescription(item, imageApiDescFormat());
+}
+
+/** Profile appearance in one format, without falling back to the other one (what the switch shows). */
+function getProfileAppearanceText(profile, format) {
+    return pickDescription(descriptionPair(profile?.appearances, profile?.appearance), format, false);
+}
+
+function setProfileAppearance(profile, format, value) {
+    if (!profile) return;
+    profile.appearances = descriptionPair(profile.appearances, profile.appearance);
+    profile.appearances[format === 'novelai' ? 'novelai' : 'banana'] = String(value || '');
+    profile.appearance = pickDescription(profile.appearances, imageApiDescFormat());
+}
+
+/** «Текст · Banana | Теги · NovelAI» switch; a dot marks the format that already has a description. */
+function descFormatSwitchHtml(format, pair = null) {
+    const button = (value, label) => `<button type="button" class="iig-desc-switch-btn${format === value ? ' is-active' : ''}" data-format="${value}" aria-pressed="${format === value}">${label}${String(pair?.[value] || '').trim() ? '<span class="iig-desc-switch-dot" title="Есть описание" aria-label="есть описание"></span>' : ''}</button>`;
+    return `<span class="iig-desc-switch" role="group" aria-label="Какое описание показать">${button('banana', 'Текст · Banana')}${button('novelai', 'Теги · NovelAI')}</span>`;
+}
+
+function bindDescFormatSwitch(root, onPick) {
+    root?.querySelectorAll('.iig-desc-switch-btn').forEach(button => button.addEventListener('click', event => {
+        event.preventDefault();
+        event.stopPropagation();
+        if (button.classList.contains('is-active')) return;
+        onPick(button.dataset.format === 'novelai' ? 'novelai' : 'banana');
+    }));
+}
+
+/** Wardrobe and hairstyles share one switch (the same setting as «Формат описания» of the wardrobe model). */
+function setWardrobeDescFormat(format) {
+    const settings = getSettings();
+    settings.wardrobeDescFormat = format === 'novelai' ? 'novelai' : 'banana';
+    const select = document.getElementById('iig_wardrobe_desc_format');
+    if (select) select.value = settings.wardrobeDescFormat;
+    document.getElementById('iig_wardrobe_desc_prompt_row')?.classList.toggle('hidden', settings.wardrobeDescFormat !== 'banana');
+    document.getElementById('iig_wardrobe_desc_prompt_novelai_row')?.classList.toggle('hidden', settings.wardrobeDescFormat !== 'novelai');
+    saveSettings();
 }
 
 /** Format for describing the bot / persona appearance in profiles. */
@@ -1579,6 +1684,76 @@ function cleanVisionAnswer(text, settings = getSettings(), format = getVisionDes
         .map(tag => tag.trim().replace(/[.;]+$/, '').replace(/(\p{L})_(?=\p{L})/gu, '$1 ').replace(/\s+/g, ' ').toLowerCase())
         .filter((tag, index, all) => tag && all.indexOf(tag) === index)
         .join(', ');
+}
+
+/**
+ * «Уточнить внешность»: the request for the text model. It rewrites the NovelAI tag appearance with the user's wishes
+ * (any language) — keeps what is not changed, replaces what is contradicted, adds exact tags and NovelAI emphasis.
+ */
+function buildAppearanceRefineRequest(current, wishes) {
+    return [
+        'You edit the appearance of ONE character for the NovelAI anime image model (V4/V4.5). The appearance is a list of Danbooru-style tags.',
+        `<current_appearance>\n${String(current || '').trim()}\n</current_appearance>`,
+        `<requested_changes>\n${String(wishes || '').trim()}\n</requested_changes>`,
+        'The requested changes are written by the user in their own words, possibly in Russian. Apply ALL of them to the current appearance.',
+        'Rules:',
+        '1. Output ONLY the new appearance: one line of comma-separated tags in English. No sentences, no explanations, no headings, no quotes, no line breaks, no final period.',
+        '2. Tags are lowercase, words separated by spaces (not underscores). Use real Danbooru tags wherever one exists (e.g. "long hair", "wavy hair", "hair over one eye", "streaked hair", "multicolored hair", "colored inner hair", "white eyelashes", "mole under eye", "freckles", "pale skin", "tall female", "mature female", "long fingernails", "pink nails", "arm tattoo", "ear piercing"). Only when no tag exists, write a short tag-like phrase NovelAI understands (e.g. "pastel pink hair", "single white streak", "white tattoo").',
+        '3. Keep every current tag the request does not touch. When the request changes a trait (hair color, length, age look, eye color…), REPLACE the old tag — never keep two contradicting tags.',
+        '4. Be specific: split a vague wish into the exact visual tags (e.g. "softer, cuter face" → "soft features, round face, gentle eyes"; "one white strand at the face" → "streaked hair, white streak, hair strand"). Do not invent traits that were not asked for and are not in the current list.',
+        '5. Order the tags by category: body and age look (adult only) → skin → face (shape, eyelashes, makeup, lips, moles, freckles) → eyes → hair (length, color, multicolor/streaks, texture, style, bangs) → permanent marks and body details (tattoos with place and color, piercings, scars, nails).',
+        '6. Appearance only: NO clothing, accessories that are not part of the body, pose, expression, action, background, lighting, camera, art style or quality tags, and NO character names.',
+        '7. Emphasis: the traits the user stresses or newly asked for, which must not get lost, are wrapped in NovelAI weight syntax "1.2::tag, tag::" — weight 1.1 to 1.5 (never above 1.6); to tone a trait down use 0.8::tag::. Use it sparingly: at most 4 weighted groups, never the whole line, never nested.',
+        '8. The character is an adult. Never use tags that make someone a child (loli, shota, child, kid, toddler, aged down, underage). "Younger" means a younger-looking adult: use tags like "young adult", "youthful face". "Older" means tags like "mature female" / "mature male".',
+        'Output the edited tag line now.',
+    ].join('\n\n');
+}
+
+/** Tags that would turn the character into a child are never kept in a refined appearance. */
+const REFINE_FORBIDDEN_TAG = /\b(?:loli|lolicon|shota|shotacon|child|children|kid|kids|toddler|underage|aged down|minor)\b/i;
+
+/**
+ * Cleans the model's answer into one NovelAI tag line: no labels / fences / numbering, lowercase, spaces instead
+ * of underscores, no duplicates; "weight::tags::" groups are kept as one piece with the weight limited to 0.5–1.6.
+ */
+function cleanRefinedAppearance(text) {
+    const groups = [];
+    let line = String(text || '')
+        .replace(/```[a-z]*|```/gi, '')
+        .replace(/^\s*(?:new\s+)?(?:tags?|appearance|output)\s*:\s*/i, '')
+        .split(/\n+/).map(row => row.replace(/^\s*(?:[-*•]\s*|\d+[.)]\s+)/, '').trim()).filter(Boolean).join(', ');
+    const normalizeTag = tag => tag.trim().replace(/^["'«»]+|["'«»]+$/g, '').replace(/[.;]+$/, '')
+        .replace(/(\p{L})_(?=\p{L})/gu, '$1 ').replace(/\s+/g, ' ').toLowerCase();
+    const normalizeList = list => list.split(',').map(normalizeTag)
+        .filter((tag, index, all) => tag && !REFINE_FORBIDDEN_TAG.test(tag) && all.indexOf(tag) === index);
+    line = line.replace(/(-?\d+(?:\.\d+)?)\s*::([^:]+?)::/g, (match, weight, inner) => {
+        const tags = normalizeList(inner);
+        if (!tags.length) return '';
+        const value = Math.min(1.6, Math.max(0.5, Number(weight) || 1));
+        groups.push(`${Number(value.toFixed(2))}::${tags.join(', ')}::`);
+        return `,\u0000${groups.length - 1}\u0000,`;
+    });
+    const seen = new Set(groups.flatMap(group => group.replace(/^[\d.-]+::|::$/g, '').split(', ')));
+    return line.split(',').map(part => part.trim()).filter(Boolean).map(part => {
+        const group = part.match(/^\u0000(\d+)\u0000$/);
+        if (group) return groups[Number(group[1])];
+        const tag = normalizeTag(part.replace(/::/g, ''));
+        if (!tag || REFINE_FORBIDDEN_TAG.test(tag) || seen.has(tag)) return '';
+        seen.add(tag);
+        return tag;
+    }).filter(Boolean).join(', ');
+}
+
+async function refineAppearanceTags(current, wishes) {
+    const base = String(current || '').trim();
+    const request = String(wishes || '').trim();
+    if (!base) throw new Error('Сначала заполните внешность или нажмите «Описать по аватарке»');
+    if (!request) throw new Error('Напишите, что уточнить');
+    const answer = await generateShortTextWithModel(buildAppearanceRefineRequest(base, request), { maxTokens: 700 });
+    const refined = cleanRefinedAppearance(answer);
+    if (!refined) throw new Error('Модель не вернула теги');
+    iigLog('INFO', `Appearance refined: ${refined}`);
+    return refined;
 }
 
 /** Card text of the current bot, or the persona description, with {{char}}/{{user}} filled in. */
@@ -1714,11 +1889,11 @@ function getCurrentRpgWardrobeTargets(settings = getSettings()) {
         .map(c => ({ target: `rpg:${c.id}`, id: c.id, name: String(c.name).trim() }));
 }
 
-function updateWardrobeItemDescription(itemId, description) {
+function updateWardrobeItemDescription(itemId, description, format = getVisionDescFormat()) {
     const settings = getSettings();
     const item = settings.wardrobeItems.find(i => i.id === itemId);
     if (item) {
-        item.description = description;
+        setItemDescription(item, format, description);
         // Don't call saveSettings() here to prevent panel collapse - caller will save after render
         updateWardrobeInjection();
     }
@@ -1971,20 +2146,24 @@ function updateWardrobeInjection() {
         const parts = [];
 
         const charItem = getActiveWardrobeItem('char');
-        if (charItem?.description) {
+        // The chat model reads prose better than tags: the text description first.
+        const charText = getItemDescription(charItem, 'banana');
+        if (charText) {
             const charName = context.characters?.[context.characterId]?.name || 'Character';
-            parts.push(`[${charName} is currently wearing: ${charItem.description}]`);
+            parts.push(`[${charName} is currently wearing: ${charText}]`);
         }
 
         const userItem = getActiveWardrobeItem('user');
-        if (userItem?.description) {
+        const userText = getItemDescription(userItem, 'banana');
+        if (userText) {
             const userName = getExtensionPersona(settings).name;
-            parts.push(`[${userName} is currently wearing: ${userItem.description}]`);
+            parts.push(`[${userName} is currently wearing: ${userText}]`);
         }
 
         for (const rpg of getCurrentRpgWardrobeTargets(settings)) {
             const rpgItem = getActiveWardrobeItem(rpg.target);
-            if (rpgItem?.description) parts.push(`[${rpg.name} is currently wearing: ${rpgItem.description}]`);
+            const rpgText = getItemDescription(rpgItem, 'banana');
+            if (rpgText) parts.push(`[${rpg.name} is currently wearing: ${rpgText}]`);
         }
 
         const depth = settings.wardrobeInjectionDepth || 1;
@@ -3006,15 +3185,18 @@ async function collectReferenceImages(prompt) {
 
     const textOnlyProvider = ['novelai', 'novelai-direct'].includes(settings.apiType);
     const wardrobeMode = settings.wardrobeSendMode || 'both';
+    // Tags for NovelAI, text for the other APIs (the other one when that one is empty).
+    const apiDescFormat = imageApiDescFormat(settings);
     const pushOutfit = (name, outfit) => {
         if (!outfit || wardrobeMode === 'none') return;
+        const outfitDescription = getItemDescription(outfit, apiDescFormat);
         if (outfit.imageData && wardrobeMode === 'both' && !textOnlyProvider) {
             clothingRefs.push({
                 data: outfit.imageData, mimeType: detectMimeType(outfit.imageData),
-                name, outfitName: outfit.name, description: outfit.description || '', type: 'clothing'
+                name, outfitName: outfit.name, description: outfitDescription, type: 'clothing'
             });
-        } else if (outfit.description?.trim()) {
-            textOnlyClothing.push({ charName: name, outfitName: outfit.name, description: outfit.description });
+        } else if (outfitDescription) {
+            textOnlyClothing.push({ charName: name, outfitName: outfit.name, description: outfitDescription });
         } else {
             warnings.push(`Одежда "${outfit.name}" для ${name} не отправлена: добавьте текстовое описание.`);
         }
@@ -3030,15 +3212,16 @@ async function collectReferenceImages(prompt) {
         const hairstyle = getActiveHairstyleItem(target);
         const hairMode = settings.hairstyleSendMode || 'both';
         if (hairstyle && hairMode !== 'none') {
-            if (hairstyle.description?.trim()) {
-                addPersonDirective(name, hairstyle.description, `[HAIRSTYLE INSTRUCTION for "${name}"]: ${hairstyle.description}`, 'hairstyle');
+            const hairDescription = getItemDescription(hairstyle, apiDescFormat);
+            if (hairDescription) {
+                addPersonDirective(name, hairDescription, `[HAIRSTYLE INSTRUCTION for "${name}"]: ${hairDescription}`, 'hairstyle');
             }
             if (hairstyle.imageData && hairMode === 'both' && !textOnlyProvider) {
                 clothingRefs.push({
                     data: hairstyle.imageData, mimeType: detectMimeType(hairstyle.imageData),
-                    name, outfitName: hairstyle.name, description: `Hairstyle for ${name}: ${hairstyle.description || hairstyle.name}`, type: 'hairstyle'
+                    name, outfitName: hairstyle.name, description: `Hairstyle for ${name}: ${hairDescription || hairstyle.name}`, type: 'hairstyle'
                 });
-            } else if (!hairstyle.description?.trim()) {
+            } else if (!hairDescription) {
                 warnings.push(`Причёска "${hairstyle.name}" для ${name} не отправлена: добавьте текстовое описание.`);
             }
         }
@@ -4948,15 +5131,22 @@ function promptAppearanceHtml(settings = getSettings()) {
     const rows = [];
     if (character) {
         const profile = getCharacterProfile('char', getCurrentLibraryEntity('char', settings).key, settings, true);
-        rows.push({ kind: 'char', name: character.name, value: profile?.appearance || '' });
+        rows.push({ kind: 'char', name: character.name, value: getProfileAppearanceText(profile, imageApiDescFormat(settings)) });
     }
     const userProfile = getCharacterProfile('user', getCurrentLibraryEntity('user', settings).key, settings, true);
-    rows.push({ kind: 'user', name: getExtensionPersona(settings).name || 'Персона', value: userProfile?.appearance || '' });
+    rows.push({ kind: 'user', name: getExtensionPersona(settings).name || 'Персона', value: getProfileAppearanceText(userProfile, imageApiDescFormat(settings)) });
+    const formatLabel = imageApiDescFormat(settings) === 'novelai' ? 'теги NovelAI' : 'текст';
     return `<details class="iig-prompt-appearance" ${settings.promptAppearanceOpen ? 'open' : ''}>
             <summary title="Точная внешность: модель промпта не придумывает её заново, расширение само добавляет её в картинку"><i class="fa-solid fa-user-pen" aria-hidden="true"></i> Внешность</summary>
-            ${rows.map(row => `<label class="iig-prompt-appearance-row"><span>${row.kind === 'user' ? 'Персона' : 'Бот'}: ${escapeHtml(row.name)}</span>
+            ${rows.map(row => `<label class="iig-prompt-appearance-row"><span>${row.kind === 'user' ? 'Персона' : 'Бот'}: ${escapeHtml(row.name)} <small>· ${formatLabel}</small></span>
                 <textarea class="text_pole iig-prompt-appearance-input" data-kind="${row.kind}" rows="2" placeholder="Пусто — заполните здесь или кнопкой «Описать по аватарке» в Персонажи → Профили">${escapeHtml(row.value)}</textarea></label>`).join('')}
         </details>`;
+}
+
+/** The «Внешность» fields under prompts show the appearance that goes into the picture. */
+function syncPromptAppearanceInputs(kind, profile) {
+    const value = getProfileAppearanceText(profile, imageApiDescFormat());
+    document.querySelectorAll(`.iig-prompt-appearance-input[data-kind="${kind}"]`).forEach(input => { input.value = value; });
 }
 
 function bindPromptAppearance(panel) {
@@ -4972,12 +5162,13 @@ function bindPromptAppearance(panel) {
             const kind = input.dataset.kind === 'user' ? 'user' : 'char';
             const profile = getCharacterProfile(kind, getCurrentLibraryEntity(kind, settings).key, settings, true);
             if (!profile) return;
-            profile.appearance = input.value;
+            const format = imageApiDescFormat(settings);
+            setProfileAppearance(profile, format, input.value);
             saveSettings();
-            // Other open panels and the settings card show the same profile.
+            // Other open panels and the settings card (when it shows the same format) show the same text.
             document.querySelectorAll(`.iig-prompt-appearance-input[data-kind="${kind}"]`).forEach(other => { if (other !== input) other.value = input.value; });
             const settingsField = document.querySelector(`.iig-profile-card[data-profile-kind="${kind}"] .iig-profile-appearance`);
-            if (settingsField) settingsField.value = input.value;
+            if (settingsField && getProfileDescFormat(settings) === format) settingsField.value = input.value;
         });
     });
 }
@@ -5133,6 +5324,24 @@ async function runPromptGeneration(messageId, { auto = false } = {}) {
 }
 
 /** «Авто»: a new bot reply gets its image prompt once, unless it already has one for this exact text. */
+/** Message types SillyTavern sends with MESSAGE_RECEIVED that are not a reply the bot has just written. */
+const NOT_A_FRESH_REPLY = new Set(['first_message', 'command', 'extension', 'impersonate', 'quiet']);
+
+/**
+ * «Авто» works only for a reply the bot generated after the user's message: not for the greeting of a new chat
+ * (or its alternatives), not for messages added by commands / other extensions, not for old messages of a loaded chat.
+ */
+function isFreshBotReply(messageId, type) {
+    const id = Number(messageId);
+    if (!Number.isInteger(id) || id < 0) return false;
+    if (type && NOT_A_FRESH_REPLY.has(String(type))) return false;
+    const chat = SillyTavern.getContext().chat || [];
+    const message = chat[id];
+    if (!message || message.is_user || message.is_system) return false;
+    // The greeting (and anything before the first user message) is part of the card, not a generated reply.
+    return chat.slice(0, id).some(item => item?.is_user && !item.is_system);
+}
+
 function maybeAutoGeneratePrompt(messageId) {
     const settings = getSettings();
     if (!settings.promptAutoGenerate) return;
@@ -5993,9 +6202,9 @@ function renderWardrobeDescriptionPanel(target) {
     panel.style.display = 'block';
     panel.style.cssText = 'margin:8px 0;padding:8px;border:1px solid rgba(255,182,193,0.15);border-radius:8px;background:rgba(255,182,193,0.03);';
     panel.innerHTML = `
-        <div style="font-size:13px;color:#e8e0e0;margin-bottom:4px;">
-            <i class="fa-solid fa-shirt" style="margin-right:4px;"></i>
-            Описание: <b>${escapeHtml(activeItem.name)}</b>
+        <div class="iig-desc-head" style="font-size:13px;color:#e8e0e0;margin-bottom:4px;">
+            <span><i class="fa-solid fa-shirt" style="margin-right:4px;"></i> Описание: <b>${escapeHtml(activeItem.name)}</b></span>
+            ${descFormatSwitchHtml(getVisionDescFormat(), ensureItemDescriptions(activeItem).descriptions)}
         </div>
         <div class="flex-row" style="margin-bottom:4px;">
             <label for="iig_ward_category_${target}" style="font-size:13px;">Категория</label>
@@ -6005,7 +6214,7 @@ function renderWardrobeDescriptionPanel(target) {
         </div>
         <textarea class="text_pole" rows="3" style="width:100%;font-size:13px;resize:vertical;"
             placeholder="Введите описание одежды вручную или сгенерируйте через AI..."
-            data-wardrobe-id="${activeItem.id}">${escapeHtml(activeItem.description)}</textarea>
+            data-wardrobe-id="${activeItem.id}">${escapeHtml(getItemDescription(activeItem, getVisionDescFormat(), false))}</textarea>
         <div style="display:flex;gap:6px;margin-top:4px;">
             <div class="menu_button iig-ward-desc-generate" data-wardrobe-id="${activeItem.id}" style="flex:1;font-size:13px;">
                 <i class="fa-solid fa-robot"></i> Сгенерировать
@@ -6021,6 +6230,10 @@ function renderWardrobeDescriptionPanel(target) {
     `;
 
     const textarea = panel.querySelector('textarea');
+    bindDescFormatSwitch(panel, format => {
+        setWardrobeDescFormat(format);
+        renderWardrobeDescriptionPanel(target);
+    });
 
     panel.querySelector('.iig-ward-category')?.addEventListener('change', event => {
         const settings = getSettings();
@@ -6138,13 +6351,13 @@ function renderHairstyleDescriptionPanel(target) {
     panel.style.display = 'block';
     panel.style.cssText = 'margin:8px 0;padding:8px;border:1px solid rgba(255,182,193,0.15);border-radius:8px;background:rgba(255,182,193,0.03);';
     panel.innerHTML = `
-        <div style="font-size:13px;color:#e8e0e0;margin-bottom:4px;">
-            <i class="fa-solid fa-scissors" style="margin-right:4px;"></i>
-            Описание: <b>${escapeHtml(activeItem.name)}</b>
+        <div class="iig-desc-head" style="font-size:13px;color:#e8e0e0;margin-bottom:4px;">
+            <span><i class="fa-solid fa-scissors" style="margin-right:4px;"></i> Описание: <b>${escapeHtml(activeItem.name)}</b></span>
+            ${descFormatSwitchHtml(getVisionDescFormat(), ensureItemDescriptions(activeItem).descriptions)}
         </div>
         <textarea class="text_pole" rows="3" style="width:100%;font-size:13px;resize:vertical;"
             placeholder="Введите описание причёски вручную или сгенерируйте через AI..."
-            data-hairstyle-id="${activeItem.id}">${escapeHtml(activeItem.description)}</textarea>
+            data-hairstyle-id="${activeItem.id}">${escapeHtml(getItemDescription(activeItem, getVisionDescFormat(), false))}</textarea>
         <div style="display:flex;gap:6px;margin-top:4px;">
             <div class="menu_button iig-hair-desc-generate" data-hairstyle-id="${activeItem.id}" style="flex:1;font-size:13px;">
                 <i class="fa-solid fa-robot"></i> Сгенерировать
@@ -6160,6 +6373,10 @@ function renderHairstyleDescriptionPanel(target) {
     `;
 
     const textarea = panel.querySelector('textarea');
+    bindDescFormatSwitch(panel, format => {
+        setWardrobeDescFormat(format);
+        renderHairstyleDescriptionPanel(target);
+    });
 
     textarea?.addEventListener('blur', () => {
         updateHairstyleItemDescription(textarea.dataset.hairstyleId, textarea.value);
@@ -6559,10 +6776,26 @@ function profileCardHtml(kind, entity, profile, cardPreview) {
                 </div>
             </div>
             <div class="iig-profile-field">
-                <label>Внешность</label>
-                <textarea class="text_pole iig-profile-appearance" rows="3" placeholder="Волосы, глаза, кожа, телосложение, приметы...">${escapeHtml(profile.appearance)}</textarea>
+                <div class="iig-desc-head iig-profile-appearance-head">
+                    <label>Внешность</label>
+                    ${descFormatSwitchHtml(getProfileDescFormat(), profile.appearances)}
+                </div>
+                <textarea class="text_pole iig-profile-appearance" rows="3" placeholder="${getProfileDescFormat() === 'novelai' ? 'Теги: pink hair, long hair, white eyelashes…' : 'Волосы, глаза, кожа, телосложение, приметы...'}">${escapeHtml(getProfileAppearanceText(profile, getProfileDescFormat()))}</textarea>
+                <small class="iig-profile-appearance-used">В картинку сейчас идёт: ${imageApiDescFormat(settings) === 'novelai' ? 'теги (NovelAI)' : 'текст'}; если он пуст — другой вариант</small>
                 <div class="iig-profile-describe-row">
-                    <button type="button" class="menu_button iig-profile-describe" title="Описать внешность по ${profile.avatarSource === 'custom' ? 'загруженному рефу' : 'аватарке'} — формат и «+ описание» выбираются вверху"><i class="fa-solid fa-eye" aria-hidden="true"></i> Описать по ${profile.avatarSource === 'custom' ? 'рефу' : 'аватарке'}</button>
+                    <button type="button" class="menu_button iig-profile-describe" title="Описать внешность по ${profile.avatarSource === 'custom' ? 'загруженному рефу' : 'аватарке'} — формат выбирается вверху"><i class="fa-solid fa-eye" aria-hidden="true"></i> Описать по ${profile.avatarSource === 'custom' ? 'рефу' : 'аватарке'}</button>
+                    <button type="button" class="menu_button iig-profile-refine" aria-expanded="false"><i class="fa-solid fa-wand-magic-sparkles" aria-hidden="true"></i> Уточнить внешность</button>
+                </div>
+                <label class="checkbox_label iig-profile-use-card" title="Вместе с картинкой учитывать внешность из описания карточки бота и описания персоны. Выключено — только по картинке."><input type="checkbox" class="iig-profile-use-card-input" ${settings.profileDescribeWithCard ? 'checked' : ''}><span>+ описание внешности из карточки персонажей</span></label>
+                <div class="iig-profile-refine-box" hidden>
+                    <label class="iig-profile-refine-label">Что уточнить или добавить — своими словами</label>
+                    <textarea class="text_pole iig-profile-refine-input" rows="3" placeholder="Например: волосы пастельнее, одна белая прядь у лица, белые тату на руках, длинные розовые ногти, лицо помиловиднее, выглядит чуть старше"></textarea>
+                    <div class="iig-profile-refine-actions">
+                        <button type="button" class="menu_button iig-profile-refine-run"><i class="fa-solid fa-check" aria-hidden="true"></i> Уточнить</button>
+                        <button type="button" class="menu_button iig-profile-refine-undo" hidden><i class="fa-solid fa-rotate-left" aria-hidden="true"></i> Вернуть как было</button>
+                        <button type="button" class="menu_button iig-profile-refine-cancel">Закрыть</button>
+                    </div>
+                    <small class="iig-profile-refine-note">Модель перепишет теги внешности: оставит то, что не просили менять, заменит противоречащее, добавит точные теги NovelAI и усилит главное (1.2::…::).</small>
                 </div>
             </div>
         </div>`;
@@ -6626,15 +6859,7 @@ function renderCharacterProfiles() {
 
     container.innerHTML = `
         <div class="iig-profiles">
-            <div class="iig-profiles-describe-settings">
-                <div class="iig-profile-field">
-                    <label for="iig_profile_desc_format">Как описывать внешность по аватарке</label>
-                    <div class="iig-profiles-describe-controls">
-                        ${describeFormatSelectHtml('iig_profile_desc_format', 'iig-profile-desc-format', getProfileDescFormat())}
-                        <label class="checkbox_label iig-profile-use-card" title="Вместе с картинкой учитывать внешность из описания карточки бота и описания персоны. Выключено — только по картинке."><input type="checkbox" class="iig-profile-use-card-input" ${settings.profileDescribeWithCard ? 'checked' : ''}><span>+ описание внешности из карточки персонажей</span></label>
-                    </div>
-                </div>
-            </div>
+            <div class="iig-profiles-describe-settings"></div>
             ${charProfile ? profileCardHtml('char', charEntity, charProfile, charPreview) : '<div class="iig-library-empty">Откройте чат с персонажем, чтобы настроить бота.</div>'}
             ${profileCardHtml('user', userEntity, userProfile, userPreview)}
             ${charProfile ? rpgCharactersHtml(charProfile) : ''}
@@ -6857,18 +7082,28 @@ function bindCharacterProfileEvents(container, profiles, owners = {}) {
         const settings = getSettings();
         settings.profileDescFormat = event.target.value === 'novelai' ? 'novelai' : 'banana';
         saveSettings();
+        updateProfileRefineButtons(container);
     });
-    container.querySelector('.iig-profile-use-card-input')?.addEventListener('change', event => {
+    // One setting, shown under «Описать по аватарке» in every card.
+    container.querySelectorAll('.iig-profile-use-card-input').forEach(input => input.addEventListener('change', event => {
         getSettings().profileDescribeWithCard = event.target.checked;
+        container.querySelectorAll('.iig-profile-use-card-input').forEach(other => { other.checked = event.target.checked; });
         saveSettings();
-    });
+    }));
+    bindProfileRefine(container, profiles);
+    container.querySelectorAll('.iig-profile-appearance-head').forEach(head => bindDescFormatSwitch(head, format => {
+        getSettings().profileDescFormat = format;
+        saveSettings();
+        renderCharacterProfiles();
+    }));
     container.querySelectorAll('.iig-profile-card[data-profile-kind]').forEach(card => {
         const profile = profiles[card.dataset.profileKind];
         if (!profile) return;
         card.querySelector('.iig-profile-appearance')?.addEventListener('input', event => {
-            profile.appearance = event.target.value;
+            setProfileAppearance(profile, getProfileDescFormat(), event.target.value);
             saveSettings();
-            document.querySelectorAll(`.iig-prompt-appearance-input[data-kind="${card.dataset.profileKind}"]`).forEach(input => { input.value = event.target.value; });
+            updateProfileRefineButtons(container);
+            syncPromptAppearanceInputs(card.dataset.profileKind, profile);
         });
         card.querySelector('.iig-profile-aliases')?.addEventListener('change', event => {
             profile.aliases = String(event.target.value || '').trim();
@@ -6891,9 +7126,10 @@ function bindCharacterProfileEvents(container, profiles, owners = {}) {
                 if (!image && !cardText) throw new Error(kind === 'user' ? 'Не найдена аватарка персоны — выберите её в «Аватары»' : 'Не найдена аватарка бота');
                 if (withCard && !cardText) toastr.info(`Описание ${kind === 'user' ? 'персоны' : 'карточки'} пустое — описываю только по картинке`, 'Профили');
                 const description = await describeAppearance({ image: image ? await resizeImageBase64(image, 768) : '', cardText, format: getProfileDescFormat() });
-                profile.appearance = description;
+                setProfileAppearance(profile, getProfileDescFormat(), description);
                 if (textarea) textarea.value = description;
-                document.querySelectorAll(`.iig-prompt-appearance-input[data-kind="${kind}"]`).forEach(input => { input.value = description; });
+                updateProfileRefineButtons(container);
+                syncPromptAppearanceInputs(kind, profile);
                 saveSettings();
                 toastr.success('Описание внешности готово', 'Профили');
             } catch (error) {
@@ -6916,6 +7152,86 @@ function bindCharacterProfileEvents(container, profiles, owners = {}) {
         });
     });
     bindRpgCharacterEvents(container, profiles.char);
+}
+
+/** «Уточнить внешность» is active only with an appearance to refine and the NovelAI tag format. */
+function updateProfileRefineButtons(container) {
+    const novelAI = getProfileDescFormat() === 'novelai';
+    container.querySelectorAll('.iig-profile-card[data-profile-kind]').forEach(card => {
+        const button = card.querySelector('.iig-profile-refine');
+        if (!button) return;
+        const empty = !String(card.querySelector('.iig-profile-appearance')?.value || '').trim();
+        button.disabled = empty || !novelAI;
+        button.title = !novelAI
+            ? 'Только для тегов NovelAI — переключите «Внешность» на «Теги · NovelAI»'
+            : empty ? 'Сначала заполните внешность или нажмите «Описать по аватарке»'
+                : 'Дописать и усилить теги внешности своими словами';
+        if (button.disabled) {
+            const box = card.querySelector('.iig-profile-refine-box');
+            if (box && !box.hidden && !box.classList.contains('is-busy')) { box.hidden = true; button.setAttribute('aria-expanded', 'false'); }
+        }
+    });
+}
+
+function bindProfileRefine(container, profiles) {
+    container.querySelectorAll('.iig-profile-card[data-profile-kind]').forEach(card => {
+        const kind = card.dataset.profileKind;
+        const profile = profiles[kind];
+        const button = card.querySelector('.iig-profile-refine');
+        const box = card.querySelector('.iig-profile-refine-box');
+        const input = card.querySelector('.iig-profile-refine-input');
+        const run = card.querySelector('.iig-profile-refine-run');
+        const undo = card.querySelector('.iig-profile-refine-undo');
+        const textarea = card.querySelector('.iig-profile-appearance');
+        if (!profile || !button || !box || !run) return;
+        let previous = null;
+        const setAppearance = value => {
+            setProfileAppearance(profile, 'novelai', value);
+            if (textarea) textarea.value = value;
+            syncPromptAppearanceInputs(kind, profile);
+            saveSettings();
+            updateProfileRefineButtons(container);
+        };
+        button.addEventListener('click', () => {
+            if (button.disabled) return;
+            box.hidden = !box.hidden;
+            button.setAttribute('aria-expanded', String(!box.hidden));
+            if (!box.hidden) input?.focus();
+        });
+        card.querySelector('.iig-profile-refine-cancel')?.addEventListener('click', () => {
+            box.hidden = true;
+            button.setAttribute('aria-expanded', 'false');
+        });
+        undo?.addEventListener('click', () => {
+            if (previous == null) return;
+            setAppearance(previous);
+            previous = null;
+            undo.hidden = true;
+            toastr.info('Внешность возвращена', 'Профили');
+        });
+        run.addEventListener('click', async () => {
+            if (run.disabled) return;
+            const html = run.innerHTML;
+            run.disabled = true;
+            box.classList.add('is-busy');
+            run.innerHTML = '<i class="fa-solid fa-spinner fa-spin" aria-hidden="true"></i> Уточняю…';
+            try {
+                const before = String(textarea?.value || getProfileAppearanceText(profile, 'novelai')).trim();
+                const refined = await refineAppearanceTags(before, input?.value);
+                previous = before;
+                setAppearance(refined);
+                if (undo) undo.hidden = false;
+                toastr.success('Внешность уточнена', 'Профили');
+            } catch (error) {
+                iigLog('ERROR', `Appearance refine failed: ${error.message}`);
+                toastr.error(`Ошибка: ${error.message}`, 'Профили');
+            } finally {
+                box.classList.remove('is-busy');
+                if (run.isConnected) { run.disabled = false; run.innerHTML = html; }
+            }
+        });
+    });
+    updateProfileRefineButtons(container);
 }
 
 function bindRpgCharacterEvents(container, charProfile) {
@@ -8376,13 +8692,20 @@ function renderQuickWardrobeList() {
         </div>
         ${activeItem ? `
         <div class="iig-wardrobe-description">
-            <label for="iig_wardrobe_desc_${escapeHtml(activeItem.id)}"><i class="fa-solid fa-align-left"></i> Описание для промпта:</label>
-            <textarea id="iig_wardrobe_desc_${escapeHtml(activeItem.id)}" class="text_pole" rows="3" placeholder="Описание одежды, которое будет передано в промпт">${escapeHtml(activeItem.description || '')}</textarea>
+            <div class="iig-desc-head">
+                <label for="iig_wardrobe_desc_${escapeHtml(activeItem.id)}"><i class="fa-solid fa-align-left"></i> Описание для промпта:</label>
+                ${descFormatSwitchHtml(getVisionDescFormat(), ensureItemDescriptions(activeItem).descriptions)}
+            </div>
+            <textarea id="iig_wardrobe_desc_${escapeHtml(activeItem.id)}" class="text_pole" rows="3" placeholder="Описание одежды, которое будет передано в промпт">${escapeHtml(getItemDescription(activeItem, getVisionDescFormat(), false))}</textarea>
         </div>` : ''}`;
 
     content.innerHTML = kindSwitch + toolbar + body + footer;
     bindWardrobeKindSwitch(content);
     bindWardrobeToolbar(content);
+    bindDescFormatSwitch(content.querySelector('.iig-wardrobe-description'), format => {
+        setWardrobeDescFormat(format);
+        renderQuickWardrobeList();
+    });
     bindWardrobeCards(content, target, activeItem);
     bindWardrobeAdd(content, target);
 }
@@ -8446,13 +8769,20 @@ function renderQuickHairstyleList(content, target, kindSwitch) {
         </div>
         ${activeItem ? `
         <div class="iig-wardrobe-description">
-            <label for="iig_hair_desc_${escapeHtml(activeItem.id)}"><i class="fa-solid fa-align-left"></i> Описание для промпта:</label>
-            <textarea id="iig_hair_desc_${escapeHtml(activeItem.id)}" class="text_pole iig-hair-desc" rows="3" placeholder="Описание причёски, которое будет передано в промпт">${escapeHtml(activeItem.description || '')}</textarea>
+            <div class="iig-desc-head">
+                <label for="iig_hair_desc_${escapeHtml(activeItem.id)}"><i class="fa-solid fa-align-left"></i> Описание для промпта:</label>
+                ${descFormatSwitchHtml(getVisionDescFormat(), ensureItemDescriptions(activeItem).descriptions)}
+            </div>
+            <textarea id="iig_hair_desc_${escapeHtml(activeItem.id)}" class="text_pole iig-hair-desc" rows="3" placeholder="Описание причёски, которое будет передано в промпт">${escapeHtml(getItemDescription(activeItem, getVisionDescFormat(), false))}</textarea>
         </div>` : ''}`;
 
     content.innerHTML = kindSwitch + toolbar + body + footer;
     bindWardrobeKindSwitch(content);
     bindWardrobeToolbar(content);
+    bindDescFormatSwitch(content.querySelector('.iig-wardrobe-description'), format => {
+        setWardrobeDescFormat(format);
+        renderQuickWardrobeList();
+    });
 
     const toggle = itemId => {
         const wasActive = activeId === itemId;
@@ -8912,8 +9242,8 @@ async function refreshExtensionStylesheet() {
     });
 
     // Only freshly generated replies (not old messages rendered on chat load) get an automatic prompt.
-    context.eventSource.on(context.event_types.MESSAGE_RECEIVED, (messageId) => {
-        if (getSettings().promptAutoGenerate && Number.isInteger(Number(messageId))) pendingAutoPrompts.add(Number(messageId));
+    context.eventSource.on(context.event_types.MESSAGE_RECEIVED, (messageId, type) => {
+        if (getSettings().promptAutoGenerate && isFreshBotReply(messageId, type)) pendingAutoPrompts.add(Number(messageId));
     });
 
     context.eventSource.makeLast(context.event_types.CHARACTER_MESSAGE_RENDERED, async (messageId) => {

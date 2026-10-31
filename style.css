@@ -2029,3 +2029,30 @@ body.iig-mode-inline .mes_text .iig-image-wrapper {
 .iig-avatar-ref-remove { all: unset; box-sizing: border-box; position: absolute; top: 6px; right: 6px; width: 22px; height: 22px; border-radius: 50%; display: inline-flex; align-items: center; justify-content: center; background: rgba(0, 0, 0, .65); color: #fff; font-size: 12px; cursor: pointer; opacity: .85; }
 .iig-avatar-ref-remove:hover, .iig-avatar-ref-remove:focus-visible { opacity: 1; background: #b3364a; }
 .iig-avatar-upload-icon { width: 100%; aspect-ratio: 1; border-radius: 8px; border: 1px dashed color-mix(in srgb, var(--iig-accent) 60%, transparent); display: flex; align-items: center; justify-content: center; font-size: 20px; color: var(--iig-accent); background: rgba(255, 255, 255, .03); }
+
+/* ===== «Уточнить внешность» and the card checkbox under «Описать по аватарке» ===== */
+.iig-profile-card > .iig-profile-field > .iig-profile-use-card { display: flex; align-items: center; gap: 8px; margin: 8px 0 0; white-space: normal; line-height: 1.25; font-size: 13px; }
+.iig-profile-card > .iig-profile-field > .iig-profile-use-card input { margin: 0; flex: 0 0 auto; }
+.iig-profile-refine:disabled { opacity: .45; cursor: not-allowed; }
+.iig-profile-refine[aria-expanded="true"] { border-color: color-mix(in srgb, var(--iig-accent) 60%, transparent); }
+.iig-profile-refine-box { margin-top: 10px; padding: 10px; border: 1px solid rgba(255, 182, 193, .22); border-radius: 10px; background: rgba(0, 0, 0, .2); display: flex; flex-direction: column; gap: 8px; }
+.iig-profile-refine-box[hidden] { display: none; }
+.iig-profile-refine-label { font-size: 13px; font-weight: 600; }
+.iig-profile-refine-input { margin: 0; min-height: 64px; resize: vertical; }
+.iig-profile-refine-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.iig-profile-refine-actions .menu_button { margin: 0; display: inline-flex; align-items: center; gap: 6px; padding: 0 12px; min-height: 32px; white-space: nowrap; }
+.iig-profile-refine-actions .menu_button[hidden] { display: none; }
+.iig-profile-refine-note { font-size: 12px; opacity: .7; line-height: 1.35; }
+
+/* ===== Two descriptions: Текст · Banana / Теги · NovelAI switch ===== */
+.iig-desc-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
+.iig-desc-head > label, .iig-desc-head > span:first-child { margin: 0; }
+.iig-desc-switch { display: inline-flex; padding: 2px; gap: 2px; border-radius: 999px; background: rgba(0, 0, 0, .3); border: 1px solid rgba(255, 255, 255, .1); flex: 0 0 auto; }
+.iig-desc-switch-btn { all: unset; box-sizing: border-box; display: inline-flex; align-items: center; gap: 5px; padding: 3px 10px; border-radius: 999px; font-size: 12px; line-height: 1.3; color: var(--iig-text-muted, #aba3a6); cursor: pointer; white-space: nowrap; }
+.iig-desc-switch-btn:hover { color: var(--iig-text, #e8e0e0); }
+.iig-desc-switch-btn:focus-visible { outline: 2px solid var(--iig-accent); outline-offset: 1px; }
+.iig-desc-switch-btn.is-active { background: color-mix(in srgb, var(--iig-accent) 75%, transparent); color: #1a1418; font-weight: 600; }
+.iig-desc-switch-dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; opacity: .75; }
+.iig-profile-appearance-used { font-size: 12px; opacity: .65; }
+.iig-wardrobe-description .iig-desc-head { margin-bottom: 4px; }
+.iig-prompt-appearance-row small { opacity: .65; font-weight: 400; }

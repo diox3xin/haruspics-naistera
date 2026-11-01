@@ -6,7 +6,8 @@ let calls = 0;
 let images = 0;
 let promptOk = true;
 const settings = { promptAutoGenerate: true };
-const ctx = vm.createContext({ getSettings: () => settings, SillyTavern: { getContext: () => ({ chat }) }, runPromptGeneration: () => { calls++; return Promise.resolve(promptOk); }, runImageFromPrompt: () => { images++; } });
+let novelAI = true;
+const ctx = vm.createContext({ getSettings: () => settings, SillyTavern: { getContext: () => ({ chat }) }, runPromptGeneration: () => { calls++; return Promise.resolve(promptOk); }, runImageFromPrompt: () => { images++; }, usesPromptPanel: () => novelAI });
 vm.runInContext(grab('promptSourceHash') + '\n' + grab('maybeAutoGeneratePrompt') + '\nglobalThis.auto = maybeAutoGeneratePrompt; globalThis.hash = promptSourceHash;', ctx);
 test('«Авто» writes a prompt once per reply text and only when switched on', () => {
 ctx.auto(0); assert.equal(calls, 1);
@@ -30,3 +31,12 @@ test('«Авто» draws the picture right after a successful prompt, not after 
     assert.equal(images, 1);
 });
 
+test('«Авто» does nothing with Nano Banana: there the picture comes from the tag in the reply', () => {
+    const before = calls;
+    novelAI = false;
+    settings.promptAutoGenerate = true;
+    chat[0].mes = 'Banana reply';
+    ctx.auto(0);
+    assert.equal(calls, before);
+    novelAI = true;
+});

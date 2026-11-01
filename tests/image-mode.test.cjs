@@ -64,3 +64,18 @@ test('applyImageDisplayMode toggles body classes', () => {
     context.applyImageDisplayMode('inline');
     assert.ok(classes.has('iig-mode-inline') && !classes.has('iig-mode-extblocks'));
 });
+
+test('the instruction lists the names the model must use, so references are attached', () => {
+    const { context } = setup({});
+    const text = context.buildImageModeInstruction('inline', ['Novak', 'Eva', 'Marta']);
+    assert.match(text, /Character list \(write these names exactly[^)]*\): Novak, Eva, Marta\./);
+    assert.doesNotMatch(context.buildImageModeInstruction('inline'), /Character list/);
+});
+
+test('the prompt block is for NovelAI only; Nano Banana keeps the picture inside the reply', () => {
+    assert.match(source, /function usesPromptPanel\(settings = getSettings\(\)\) \{\r?\n    return isNovelAIPromptTarget\(settings\);/);
+    const ensure = source.slice(source.indexOf('function ensurePromptPanelForMessage('), source.indexOf('function placePromptPanel('));
+    assert.match(ensure, /if \(!usesPromptPanel\(\)\) \{/);
+    assert.match(source, /checkPromptPanelMode\(\);/);
+    assert.doesNotMatch(source, /Debug Gemini|Debug OpenAI\/Router/);
+});

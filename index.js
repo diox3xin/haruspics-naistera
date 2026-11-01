@@ -370,6 +370,8 @@ function saveSettings() {
     const context = SillyTavern.getContext();
     syncActivePresetFromSettings(context.extensionSettings?.[MODULE_NAME]);
     context.saveSettingsDebounced();
+    // Switching between NovelAI and Nano Banana (API, model or preset) shows / hides the prompt blocks.
+    if (typeof checkPromptPanelMode === 'function') checkPromptPanelMode();
 }
 
 function normalizeNaisteraModel(model) {
@@ -1114,20 +1116,31 @@ async function imageUrlToBase64(url) {
     }
 }
 
+/** Base64 longer than this (~300 KB of image) is re-encoded even when the picture is already small enough. */
+const REF_IMAGE_MAX_BASE64 = 400000;
+
+/**
+ * References are shrunk to maxSize and saved as JPEG (~100 KB instead of ~1 MB PNG): heavy requests are slow,
+ * time out on phones and some routers reject them. Transparent parts get a white background.
+ */
 async function resizeImageBase64(base64, maxSize = 512) {
     return new Promise((resolve) => {
         const img = new Image();
         img.onload = () => {
             let { width, height } = img;
-            if (width <= maxSize && height <= maxSize) { resolve(base64); return; }
-            const ratio = Math.min(maxSize / width, maxSize / height);
+            const fits = width <= maxSize && height <= maxSize;
+            if (fits && String(base64).length <= REF_IMAGE_MAX_BASE64) { resolve(base64); return; }
+            const ratio = fits ? 1 : Math.min(maxSize / width, maxSize / height);
             width = Math.round(width * ratio);
             height = Math.round(height * ratio);
             const canvas = document.createElement('canvas');
             canvas.width = width;
             canvas.height = height;
-            canvas.getContext('2d').drawImage(img, 0, 0, width, height);
-            resolve(canvas.toDataURL('image/png').split(',')[1]);
+            const g = canvas.getContext('2d');
+            g.fillStyle = '#ffffff';
+            g.fillRect(0, 0, width, height);
+            g.drawImage(img, 0, 0, width, height);
+            resolve(canvas.toDataURL('image/jpeg', 0.9).split(',')[1]);
         };
         img.onerror = () => resolve(base64);
         img.src = `data:image/png;base64,${base64}`;
@@ -2090,21 +2103,43 @@ const IMAGE_TAG_RULES = [
     'src="[IMG:GEN]" marks a NEW image. Never copy paths of already generated images.',
 ].join('\n- ');
 
+/**
+ * Names the chat model must use in image prompts: references and appearance are attached only to people
+ * whose name is in the prompt. The bot, the persona (chat and extension) and the enabled NPCs.
+ */
+function imagePromptCharacterNames() {
+    const context = SillyTavern.getContext();
+    const settings = getSettings();
+    const names = [];
+    const add = name => {
+        const value = String(name || '').trim();
+        if (value && !names.some(item => item.toLowerCase() === value.toLowerCase())) names.push(value);
+    };
+    add(context.characters?.[context.characterId]?.name);
+    add(context.name1);
+    if (typeof getExtensionPersona === 'function') add(getExtensionPersona(settings).name);
+    for (const npc of settings.npcReferences || []) if (npc?.enabled) add(npc.name);
+    return names.slice(0, 20);
+}
+
 function normalizeImageDisplayMode(mode) {
     return mode === 'extblocks' ? 'extblocks' : 'inline';
 }
 
-function buildImageModeInstruction(mode) {
+function buildImageModeInstruction(mode, names = []) {
+    const nameRule = names.length
+        ? `\n- Character list (write these names exactly, at the start of each person's description — face references are attached by name): ${names.join(', ')}.`
+        : '';
     if (normalizeImageDisplayMode(mode) === 'extblocks') {
         return `[Image generation — external blocks mode]
 Embed a visual HTML/CSS artifact (no JavaScript, no markdown code blocks) into the response, thematically tied to the scene. Use a unique wrapper id, mobile-first sizing. Place 1-5 generated images inside the artifact using this exact tag:
 ${IMAGE_TAG_FORMAT}
-- ${IMAGE_TAG_RULES}`;
+- ${IMAGE_TAG_RULES}${nameRule}`;
     }
     return `[Image generation — inline mode]
 When a scene deserves an illustration, insert the image tag directly into the narrative text, on its own line, between paragraphs. Do NOT wrap it in HTML blocks, artifacts, tables or code blocks. Use this exact tag:
 ${IMAGE_TAG_FORMAT}
-- ${IMAGE_TAG_RULES}`;
+- ${IMAGE_TAG_RULES}${nameRule}`;
 }
 
 function updateImageModeInjection() {
@@ -2118,7 +2153,9 @@ function updateImageModeInjection() {
             return;
         }
         const depth = Math.max(0, Math.min(100, parseInt(settings.imageModeInjectionDepth, 10) || 1));
-        context.setExtensionPrompt(key, buildImageModeInstruction(settings.imageDisplayMode), 1, depth);
+        let names = [];
+        try { names = imagePromptCharacterNames(); } catch (_) { names = []; }
+        context.setExtensionPrompt(key, buildImageModeInstruction(settings.imageDisplayMode, names), 1, depth);
     } catch (error) {
         iigLog('ERROR', 'Error updating image mode injection:', error);
     }
@@ -3057,8 +3094,10 @@ async function collectReferenceImages(prompt) {
     };
 
     const charName = context.characters?.[context.characterId]?.name || null;
-    // The persona chosen in the extension, not the one active in SillyTavern.
+    // The persona chosen in the extension, not the one active in SillyTavern; the chat model writes the chat persona
+    // name, so that one finds her too.
     const userName = getExtensionPersona(settings).name || null;
+    const userExtraNames = context.name1 && String(context.name1).trim() !== userName ? [String(context.name1).trim()] : [];
     // A bot whose picture was taken from another card is also found by that card's name.
     const charOwner = getExtensionCharacter(settings);
     const charExtraNames = charOwner?.picked && charOwner.name !== charName ? [charOwner.name] : [];
@@ -3076,7 +3115,7 @@ async function collectReferenceImages(prompt) {
     const charAlways = !textOnly && Boolean(useNaisteraRefs ? settings.naisteraSendCharAvatar : settings.sendCharAvatar);
     const userAlways = !textOnly && Boolean(useNaisteraRefs ? settings.naisteraSendUserAvatar : settings.sendUserAvatar);
     const charMentioned = Boolean(charName) && namesAppearInPrompt([charName, ...charExtraNames, ...characterLibrary.names], prompt);
-    const userMentioned = Boolean(userName) && namesAppearInPrompt([userName, ...userLibrary.names], prompt);
+    const userMentioned = Boolean(userName) && namesAppearInPrompt([userName, ...userExtraNames, ...userLibrary.names], prompt);
     const includeChar = Boolean(charName) && (charAlways || (settings.autoDetectNames && charMentioned));
     const includeUser = Boolean(userName) && (userAlways || (settings.autoDetectNames && userMentioned));
     iigLog('INFO', `In scene: char "${charName}" ${includeChar ? 'yes' : 'no'} (mentioned: ${charMentioned}), user "${userName}" ${includeUser ? 'yes' : 'no'} (mentioned: ${userMentioned})`);
@@ -3089,7 +3128,7 @@ async function collectReferenceImages(prompt) {
     const people = [];
     const appearanceDirectives = new Set([...characterLibrary.descriptions, ...userLibrary.descriptions]);
     if (includeChar) people.push({ name: charName, names: [charName, ...charExtraNames, ...characterLibrary.names], appearance: characterLibrary.appearance || '' });
-    if (includeUser) people.push({ name: userName, names: [userName, ...userLibrary.names], appearance: userLibrary.appearance || '' });
+    if (includeUser) people.push({ name: userName, names: [userName, ...userExtraNames, ...userLibrary.names], appearance: userLibrary.appearance || '' });
 
     // RPG characters (multi-character bots)
     const rpgRefs = await collectRpgCharacterReferences(prompt, settings);
@@ -3962,7 +4001,7 @@ async function generateImageOpenAIChat(prompt, style, refData, options = {}) {
     // Add aspect ratio instruction to prevent reference image aspect from being copied
     promptParts.push(`[IMAGE SPECIFICATIONS: aspect ratio ${aspectRatio}, do NOT copy the aspect ratio from reference images, use ${aspectRatio} for the final output]`);
     
-    if (style) promptParts.push(`[Art Style: ${style}]`);
+    if (style) promptParts.push(`[STYLE: ${style}]`);
     for (const directive of textDirectives) promptParts.push(directive);
     for (const c of textOnlyClothing) promptParts.push(`[CLOTHING: ${c.charName} is wearing: ${c.description}]`);
     if (imageRefs.length) promptParts.push(buildReferenceLegend(imageRefs));
@@ -3981,16 +4020,7 @@ async function generateImageOpenAIChat(prompt, style, refData, options = {}) {
         });
     }
 
-    // Debug: show ref counts on mobile (temporary diagnostic)
-    const faceCount = imageRefs.filter(r => r.type === 'face').length;
-    const clothingCount = imageRefs.filter(r => r.type === 'clothing').length;
-    const hairstyleCount = imageRefs.filter(r => r.type === 'hairstyle').length;
-    const estimatedSizeKB = Math.round(imageRefs.reduce((sum, r) => sum + (r.data?.length || 0), 0) / 1024);
-    toastr.info(
-        `Refs: ${faceCount} faces, ${clothingCount} clothes, ${hairstyleCount} hair | ~${estimatedSizeKB}KB`,
-        `Debug OpenAI/Router (${settings.model})`,
-        { timeOut: 15000, extendedTimeOut: 10000 }
-    );
+    iigLog('INFO', `Router refs: ${imageRefs.map(ref => `${ref.type}:${ref.name}`).join(', ') || 'none'}`);
 
     const body = {
         model: settings.model,
@@ -4065,81 +4095,14 @@ async function generateImageGemini(prompt, style, refData, options = {}) {
     // Log reference breakdown for debugging "refs not visible" issues
     iigLog('INFO', `Gemini refs: faces=${faceRefs.length}, clothingImages=${clothingImageRefs.length}, hairstyles=${hairstyleRefs.length}, textClothing=${textOnlyClothing.length}, textDirectives=${textDirectives.length}`);
 
-    // Debug: show ref counts on mobile (temporary diagnostic)
-    const estimatedSizeKB = Math.round(imageRefs.reduce((sum, r) => sum + (r.data?.length || 0), 0) / 1024);
-    toastr.info(
-        `Refs: ${faceRefs.length} faces, ${clothingImageRefs.length} clothes, ${hairstyleRefs.length} hair | ~${estimatedSizeKB}KB`,
-        `Debug Gemini (${settings.model})`,
-        { timeOut: 15000, extendedTimeOut: 10000 }
-    );
-
-    const parts = [];
-
-    // ===== PRE-INSTRUCTION =====
-    if (imageRefs.length > 0) {
-        let preInstruction = `[CRITICAL INSTRUCTIONS FOR REFERENCE IMAGES]\n`;
-        preInstruction += `You will receive ${imageRefs.length} reference image(s).\n`;
-        preInstruction += `RULES:\n`;
-        preInstruction += `1. FACE references have ABSOLUTE PRIORITY. Copy faces EXACTLY from face reference images.\n`;
-        preInstruction += `2. CLOTHING references show ONLY the outfit design. Do NOT copy faces or body shapes from clothing images.\n`;
-        preInstruction += `3. If a face in a clothing reference conflicts with a face reference, ALWAYS use the FACE reference.\n`;
-        parts.push({ text: preInstruction });
-    }
-
-    // ===== FACE REFERENCES (HIGHEST PRIORITY, FIRST) =====
-    let refCounter = 0;
-    for (const ref of faceRefs) {
-        refCounter++;
-        parts.push({
-            inlineData: { mimeType: ref.mimeType, data: ref.data }
-        });
-        parts.push({
-            text: `[FACE REFERENCE #${refCounter}: "${ref.name}"]\n` +
-                `This is the EXACT face and appearance of "${ref.name}".\n` +
-                `COPY IDENTICALLY: face shape, eye shape & color, nose, mouth, jawline, hair color & style, skin tone.\n` +
-                `Include ALL distinctive features (freckles, scars, moles, etc).\n` +
-                `DO NOT modify, stylize, or "improve" this face. REPRODUCE IT EXACTLY AS SHOWN.\n`
-        });
-    }
-
-    // ===== CLOTHING IMAGE REFERENCES (LOWER PRIORITY) =====
-    for (const ref of clothingImageRefs) {
-        refCounter++;
-        parts.push({
-            inlineData: { mimeType: ref.mimeType, data: ref.data }
-        });
-        let clothingLabel = `[CLOTHING-ONLY REFERENCE #${refCounter} for "${ref.name}": "${ref.outfitName || 'outfit'}"]\n`;
-        clothingLabel += `⚠️ THIS IMAGE SHOWS ONLY CLOTHING/OUTFIT DESIGN.\n`;
-        clothingLabel += `DO NOT copy any face, body shape, or person from this image.\n`;
-        clothingLabel += `ONLY copy: garment type, fabric, colors, patterns, accessories, and overall style.\n`;
-        clothingLabel += `"${ref.name}" MUST be wearing exactly this outfit.\n`;
-        if (ref.description) {
-            clothingLabel += `Outfit details: ${ref.description}\n`;
-        }
-        parts.push({ text: clothingLabel });
-    }
-
-    for (const ref of hairstyleRefs) {
-        parts.push({ inlineData: { mimeType: ref.mimeType, data: ref.data } });
-        parts.push({ text: `[HAIRSTYLE REFERENCE for "${ref.name}"]: Copy only the hair, not the face. ${ref.description || ''}` });
-    }
+    // Pictures first (faces, then outfits, then hairstyles), then ONE text with a numbered list that matches that order.
+    const orderedRefs = [...faceRefs, ...clothingImageRefs, ...hairstyleRefs];
+    const parts = orderedRefs.map(ref => ({ inlineData: { mimeType: ref.mimeType, data: ref.data } }));
 
     // ===== BUILD MAIN PROMPT =====
     let fullPrompt = '';
-
-    // Character mapping
-    if (imageRefs.length > 0) {
-        fullPrompt += `[CHARACTER & CLOTHING MAPPING]\n`;
-        let idx = 0;
-        for (const ref of faceRefs) {
-            idx++;
-            fullPrompt += `• "${ref.name}" = Face Reference #${idx} (COPY FACE EXACTLY)\n`;
-        }
-        for (const ref of clothingImageRefs) {
-            idx++;
-            fullPrompt += `• "${ref.name}'s outfit" = Clothing Reference #${idx} (COPY GARMENT ONLY, NOT FACE)\n`;
-        }
-        fullPrompt += `\nCRITICAL: Face features must be IDENTICAL to face references. Clothing references affect ONLY what characters wear.\n\n`;
+    if (orderedRefs.length > 0) {
+        fullPrompt += `${buildReferenceLegend(orderedRefs)}\nFaces must match their face references exactly; outfit pictures change only the clothes.\n\n`;
     }
 
     // Text-only clothing instructions
@@ -4157,7 +4120,7 @@ async function generateImageGemini(prompt, style, refData, options = {}) {
 
     // Style
     if (style) {
-        fullPrompt += `[Art Style: ${style}]\n\n`;
+        fullPrompt += `[STYLE: ${style}]\n\n`;
     }
     const galleryNegative = getEffectiveNegativePrompt(options.negativePrompt);
     if (galleryNegative) fullPrompt += `[NEGATIVE PROMPT: ${galleryNegative}]\n\n`;
@@ -4165,14 +4128,8 @@ async function generateImageGemini(prompt, style, refData, options = {}) {
     // Main scene prompt
     fullPrompt += `[SCENE TO GENERATE]\n${prompt}\n[END SCENE]`;
 
-    // Final reminder
     if (faceRefs.length > 0) {
-        fullPrompt += `\n\n[FINAL REMINDER]\n`;
-        fullPrompt += `The characters in this scene MUST look EXACTLY like their face reference images.\n`;
-        fullPrompt += `Check each character's face against their reference before finalizing.\n`;
-        if (clothingImageRefs.length > 0) {
-            fullPrompt += `Clothing references affect ONLY the garments, NOT faces or body shapes.\n`;
-        }
+        fullPrompt += `\n\nKeep every face faithful to its reference image.`;
     }
 
     parts.push({ text: fullPrompt });
@@ -5003,6 +4960,37 @@ function addButtonsToExistingMessages() {
     }
 }
 
+/**
+ * The «Промпт картинки» block (a separate model writes a tag prompt after the reply) is for NovelAI only:
+ * Naistera NovelAI models, NovelAI directly, NovelAI through SillyTavern. With Nano Banana and the other image APIs
+ * the chat model writes the image tag inside its reply and the picture appears right there in the text.
+ */
+function usesPromptPanel(settings = getSettings()) {
+    return isNovelAIPromptTarget(settings);
+}
+
+let lastPromptPanelMode = null;
+
+/** After switching the API / model / preset: add the blocks for NovelAI, take them away for the others. */
+function refreshPromptPanelsForMode() {
+    const on = usesPromptPanel();
+    lastPromptPanelMode = on;
+    if (on) {
+        addPromptPanelsToExistingMessages();
+        return;
+    }
+    for (const entry of promptPanels.values()) entry.panel.remove();
+    promptPanels.clear();
+    pendingAutoPrompts.clear();
+    document.querySelectorAll('#chat .iig-prompt-panel').forEach(panel => panel.remove());
+}
+
+function checkPromptPanelMode() {
+    const on = usesPromptPanel();
+    if (lastPromptPanelMode === null) { lastPromptPanelMode = on; return; }
+    if (on !== lastPromptPanelMode) setTimeout(refreshPromptPanelsForMode, 0);
+}
+
 /** Is this reply being written right now (streaming)? The block waits for the end instead of riding along. */
 function isMessageStreaming(messageId) {
     const processor = SillyTavern.getContext().streamingProcessor;
@@ -5017,6 +5005,12 @@ function ensurePromptPanelForMessage(messageElement, messageId, { rerender = fal
     const message = context.chat?.[messageId];
     if (!message || message.is_user) return null;
     const known = promptPanels.get(messageId);
+    if (!usesPromptPanel()) {
+        known?.panel.remove();
+        promptPanels.delete(messageId);
+        messageElement.querySelectorAll('.iig-prompt-panel').forEach(panel => panel.remove());
+        return null;
+    }
     // While the reply streams, the block is not shown: its spot is chosen once the whole text is there
     // (otherwise it lands after the first paragraphs, i.e. at the top, and stays there).
     if (isMessageStreaming(messageId)) {
@@ -5344,7 +5338,7 @@ function isFreshBotReply(messageId, type) {
 
 function maybeAutoGeneratePrompt(messageId) {
     const settings = getSettings();
-    if (!settings.promptAutoGenerate) return;
+    if (!settings.promptAutoGenerate || !usesPromptPanel(settings)) return;
     const message = SillyTavern.getContext().chat?.[messageId];
     if (!message || message.is_user || message.is_system || !String(message.mes || '').trim()) return;
     if (message.extra?.iig_prompt_block?.sourceHash === promptSourceHash(message.mes)) return;
@@ -9202,6 +9196,7 @@ async function refreshExtensionStylesheet() {
         createSettingsUI();
         observeImageRegenButtons();
         addButtonsToExistingMessages();
+        lastPromptPanelMode = usesPromptPanel();
         addPromptPanelsToExistingMessages();
         applyImageDisplayMode();
         updateWardrobeInjection();
@@ -9243,7 +9238,8 @@ async function refreshExtensionStylesheet() {
 
     // Only freshly generated replies (not old messages rendered on chat load) get an automatic prompt.
     context.eventSource.on(context.event_types.MESSAGE_RECEIVED, (messageId, type) => {
-        if (getSettings().promptAutoGenerate && isFreshBotReply(messageId, type)) pendingAutoPrompts.add(Number(messageId));
+        const settings = getSettings();
+        if (settings.promptAutoGenerate && usesPromptPanel(settings) && isFreshBotReply(messageId, type)) pendingAutoPrompts.add(Number(messageId));
     });
 
     context.eventSource.makeLast(context.event_types.CHARACTER_MESSAGE_RENDERED, async (messageId) => {

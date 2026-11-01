@@ -46,6 +46,12 @@ function setup(apiType = 'openai-chat', endpoint = 'https://api.openai.com') {
         },
     });
     
+    const helpers = ['isUnsupportedParamsError', 'imageConfigFallbacks'].map(name => {
+        const start = source.indexOf(`function ${name}(`);
+        const end = source.slice(start).search(/\r?\n\}\r?\n/);
+        return source.slice(start, start + end + source.slice(start + end).indexOf('}') + 1);
+    }).join('\n');
+    vm.runInContext(helpers, context);
     vm.runInContext(extractFunction('generateImageOpenAIChat'), context);
     return { generate: context.generateImageOpenAIChat, requests, config };
 }

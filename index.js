@@ -3976,6 +3976,22 @@ function buildReferenceLegend(imageRefs) {
     return `[REFERENCE IMAGES, in the order they are attached]\n${lines.join('\n')}\nUse each reference only for its own named person. Draw only the people the scene mentions.`;
 }
 
+/**
+ * Not every image model takes every size: e.g. a «lite» Nano Banana answers 400 «Invalid request for this model.
+ * Please remove unsupported parameters» to image_size 2K. Such an answer is retried with smaller settings.
+ */
+function isUnsupportedParamsError(status, text) {
+    return status === 400 && /unsupported param|invalid request for this model|image_size|imageSize|image size|aspect/i.test(String(text || ''));
+}
+
+/** Image settings to try, from what was asked down to the safest: asked → 1K → aspect ratio only. */
+function imageConfigFallbacks(aspectRatio, imageSize) {
+    const list = [{ aspectRatio, imageSize }];
+    if (imageSize && imageSize !== '1K') list.push({ aspectRatio, imageSize: '1K' });
+    list.push({ aspectRatio, imageSize: null });
+    return list;
+}
+
 async function generateImageOpenAIChat(prompt, style, refData, options = {}) {
     const settings = getSettings();
     const url = buildOpenAIUrl(settings.endpoint, 'chat/completions');
@@ -4028,25 +4044,37 @@ async function generateImageOpenAIChat(prompt, style, refData, options = {}) {
         modalities: ['image', 'text']
     };
 
-    // Add image_config for Gemini models via Router (OpenRouter, CloseRouter, rout.my)
-    if (isRouterEndpoint(settings.endpoint)) {
-        body.image_config = {
-            aspect_ratio: aspectRatio,
-            image_size: imageSize
-        };
-    }
-
     iigLog('INFO', `OpenAI Chat/Router Request: model=${body.model}, refs=${imageRefs.length}, aspect=${aspectRatio}, size=${imageSize}, prompt=${fullPrompt.length} chars`);
 
-    const response = await fetch(url, {
-        method: 'POST',
-        headers: buildAuthHeaders(settings.apiKey, { 'Content-Type': 'application/json' }),
-        body: JSON.stringify(body),
-        signal: options.signal
-    });
-
-    if (!response.ok) {
+    // Add image_config for Gemini models via Router (OpenRouter, CloseRouter, rout.my); a model that rejects the
+    // size gets the request again in 1K, then with the aspect ratio only.
+    const router = isRouterEndpoint(settings.endpoint);
+    const attempts = router ? imageConfigFallbacks(aspectRatio, imageSize) : [null];
+    let response = null;
+    for (let i = 0; i < attempts.length; i++) {
+        const attempt = attempts[i];
+        if (attempt) {
+            body.image_config = { aspect_ratio: attempt.aspectRatio };
+            if (attempt.imageSize) body.image_config.image_size = attempt.imageSize;
+        }
+        response = await fetch(url, {
+            method: 'POST',
+            headers: buildAuthHeaders(settings.apiKey, { 'Content-Type': 'application/json' }),
+            body: JSON.stringify(body),
+            signal: options.signal
+        });
+        if (response.ok) {
+            if (i > 0) {
+                iigLog('WARN', `Model ${settings.model} rejected size ${imageSize}; drawn with ${attempt.imageSize || 'its default size'}`);
+                toastr.info(`Модель не поддерживает размер ${imageSize} — нарисовано в ${attempt.imageSize || 'размере по умолчанию'}`, 'Генерация картинок', { timeOut: 5000 });
+            }
+            break;
+        }
         const text = await response.text().catch(() => '');
+        if (i < attempts.length - 1 && isUnsupportedParamsError(response.status, text)) {
+            iigLog('WARN', `Router rejected image_config ${JSON.stringify(body.image_config)}: ${text.slice(0, 200)}`);
+            continue;
+        }
         throw new Error(`API Error (${response.status}): ${text.slice(0, 500)}`);
     }
 
@@ -4143,6 +4171,7 @@ async function generateImageGemini(prompt, style, refData, options = {}) {
             imageConfig: { aspectRatio, imageSize }
         }
     };
+    const sizeFallbacks = imageConfigFallbacks(aspectRatio, imageSize).slice(1);
 
         // Safety: serialize body and check size
     let bodyString;
@@ -4175,6 +4204,23 @@ async function generateImageGemini(prompt, style, refData, options = {}) {
         lastStatus = res.status;
         lastText = await res.text().catch(() => '');
         iigLog('WARN', `Gemini endpoint failed (${res.status}) ${candidate.url} :: ${lastText.substring(0, 200)}`);
+    }
+
+    // The model does not take this size: again in 1K, then with the aspect ratio only.
+    while (!response && sizeFallbacks.length && isUnsupportedParamsError(lastStatus, lastText)) {
+        const next = sizeFallbacks.shift();
+        body.generationConfig.imageConfig = next.imageSize ? { aspectRatio: next.aspectRatio, imageSize: next.imageSize } : { aspectRatio: next.aspectRatio };
+        bodyString = JSON.stringify(body);
+        for (const candidate of requestCandidates) {
+            const res = await fetch(candidate.url, { method: 'POST', headers: candidate.headers, body: bodyString, signal: options.signal });
+            if (res.ok) {
+                response = res;
+                toastr.info(`Модель не поддерживает размер ${imageSize} — нарисовано в ${next.imageSize || 'размере по умолчанию'}`, 'Генерация картинок', { timeOut: 5000 });
+                break;
+            }
+            lastStatus = res.status;
+            lastText = await res.text().catch(() => '');
+        }
     }
 
     if (!response) {

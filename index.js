@@ -2341,7 +2341,7 @@ async function generateReferenceImage(state, onStatus, signal) {
         toastr.warning('NovelAI не принимает картинки-референсы: будет использован только текст', 'Генератор');
     }
     const refData = { imageRefs, textOnlyClothing: [], textDirectives: [], warnings: [] };
-    const result = await generateImageWithRetry(prompt, '', onStatus, { refData, negativePrompt: '', aspectRatio: '2:3', signal });
+    const result = await generateImageWithRetry(prompt, '', onStatus, { refData, negativePrompt: '', aspectRatio: '2:3', keepAspectRatio: true, signal });
     return imageResultToBase64(result);
 }
 
@@ -3447,14 +3447,8 @@ async function generateImageNaistera(prompt, style, refData, options = {}) {
     promptParts.push(prompt);
 
 
-    // Random aspect ratio for nano-banana models in Naistera (respects prompt-specified ratio)
-    let aspectRatio = options.aspectRatio || settings.naisteraAspectRatio || '1:1';
-    const isNaisteraNanaBanana = isGeminiModel(model);
-    if (isNaisteraNanaBanana && settings.geminiRandomFormat && !options.aspectRatio) {
-        const validRatios = ['1:1', '2:3', '3:2', '3:4', '4:3', '4:5', '5:4', '9:16', '16:9', '21:9'];
-        aspectRatio = validRatios[Math.floor(Math.random() * validRatios.length)];
-        iigLog('INFO', `Naistera random format (nano-banana): ${aspectRatio}`);
-    }
+    // «Случайный формат» is already applied in generateImageWithRetry (options.aspectRatio).
+    const aspectRatio = options.aspectRatio || settings.naisteraAspectRatio || '1:1';
 
     const body = {
         prompt: promptParts.join('\n\n'),
@@ -4013,13 +4007,6 @@ async function generateImageOpenAIChat(prompt, style, refData, options = {}) {
     let imageSize = options.imageSize || settings.imageSize || '1K';
     if (!VALID_IMAGE_SIZES.includes(imageSize)) imageSize = '1K';
 
-    // Random format for Gemini models: randomize aspect ratio only (image size stays from settings).
-    // If the prompt tag already specified an aspect ratio, keep it.
-    const isGemini = isGeminiModel(settings.model || '') || settings.apiType === 'gemini';
-    if (isGemini && settings.geminiRandomFormat && !options.aspectRatio) {
-        aspectRatio = VALID_ASPECT_RATIOS[Math.floor(Math.random() * VALID_ASPECT_RATIOS.length)];
-        iigLog('INFO', `Gemini random format (router): ${aspectRatio} ${imageSize}`);
-    }
 
     const promptParts = [];
     promptParts.push('Generate an image from the following instruction. Return the generated image in the response.');
@@ -4116,12 +4103,6 @@ async function generateImageGemini(prompt, style, refData, options = {}) {
     let imageSize = options.imageSize || settings.imageSize || '1K';
     if (!VALID_IMAGE_SIZES.includes(imageSize)) imageSize = '1K';
 
-    // Gemini random format: pick random aspect ratio per request (image size stays from settings).
-    // If the prompt tag already specified an aspect ratio, keep it.
-    if (settings.apiType === 'gemini' && settings.geminiRandomFormat && !options.aspectRatio) {
-        aspectRatio = VALID_ASPECT_RATIOS[Math.floor(Math.random() * VALID_ASPECT_RATIOS.length)];
-        iigLog('INFO', `Gemini random format: ${aspectRatio} ${imageSize}`);
-    }
 
     const { imageRefs = [], textOnlyClothing = [], textDirectives = [] } = refData;
 
@@ -4273,9 +4254,28 @@ function validateSettings() {
     if (errors.length > 0) throw new Error(`Ошибка настроек: ${errors.join(', ')}`);
 }
 
+/**
+ * «Случайный формат»: a new aspect ratio for every picture (image size stays from settings). It wins over the ratio
+ * in the image tag — the chat model writes one in every tag, usually the same, so «only when the tag has none»
+ * never fired. Works for Nano Banana, GPT Image (mapped to its 3 sizes), Naistera and the routers; NovelAI keeps
+ * its own width / height. Reference generation passes keepAspectRatio.
+ */
+function usesRandomAspectRatio(settings, options = {}) {
+    return Boolean(settings.geminiRandomFormat) && !options.keepAspectRatio && !NOVELAI_API_TYPES.includes(settings.apiType);
+}
+
+function pickRandomAspectRatio() {
+    return VALID_ASPECT_RATIOS[Math.floor(Math.random() * VALID_ASPECT_RATIOS.length)];
+}
+
 async function generateImageWithRetry(prompt, style, onStatusUpdate, options = {}) {
     validateSettings();
     const settings = getSettings();
+    if (usesRandomAspectRatio(settings, options)) {
+        // Chosen once per picture: retries keep the same format.
+        options = { ...options, aspectRatio: pickRandomAspectRatio() };
+        iigLog('INFO', `Random format: ${options.aspectRatio}`);
+    }
 
     // Use pre-collected refData or collect now
     let refData = options.refData;
@@ -5437,7 +5437,7 @@ function renderPromptPanel(panel, messageId) {
     const expanded = expandedPromptPanels.has(messageId);
     const style = state.style || buildEffectiveStyle('') || '';
     const negative = state.negativePrompt || getActiveNegativePrompt() || '';
-    const showFormat = settings.apiType === 'gemini' || isGeminiModel(settings.model || '');
+    const showFormat = !NOVELAI_API_TYPES.includes(settings.apiType);
     const image = state.imagePath ? escapeHtml(state.imagePath) : '';
 
     panel.classList.add('iig-pp');
@@ -5488,7 +5488,7 @@ function renderPromptPanel(panel, messageId) {
                 <span class="iig-pp-toggles">
                     <button type="button" class="menu_button iig-pp-pill iig-prompt-auto-toggle${settings.promptAutoGenerate ? ' is-on' : ''}" aria-pressed="${!!settings.promptAutoGenerate}" title="Авто: промпт и картинка сами после каждого нового ответа"><i class="fa-solid fa-robot" aria-hidden="true"></i> Авто</button>
                     <button type="button" class="menu_button iig-pp-pill iig-prompt-stream-toggle${settings.promptGenStream ? ' iig-stream-on is-on' : ''}" aria-pressed="${!!settings.promptGenStream}" title="Показывать промпт, пока он пишется"><i class="fa-solid fa-bolt" aria-hidden="true"></i> Стрим</button>
-                    ${showFormat ? `<button type="button" class="menu_button iig-pp-pill iig-gemini-format-toggle${settings.geminiRandomFormat ? ' iig-format-on is-on' : ''}" aria-pressed="${!!settings.geminiRandomFormat}" title="Случайный формат Gemini (каждый запрос)"><i class="fa-solid fa-dice" aria-hidden="true"></i> Формат</button>` : ''}
+                    ${showFormat ? `<button type="button" class="menu_button iig-pp-pill iig-gemini-format-toggle${settings.geminiRandomFormat ? ' iig-format-on is-on' : ''}" aria-pressed="${!!settings.geminiRandomFormat}" title="Случайный формат (aspect ratio) для каждой картинки, даже если в теге указан свой"><i class="fa-solid fa-dice" aria-hidden="true"></i> Формат</button>` : ''}
                 </span>
             </div>
             <textarea class="text_pole iig-prompt-value" rows="5" placeholder="Нажмите «Промпт» или напишите свой — картинка нарисуется по этому тексту"></textarea>
@@ -5570,7 +5570,7 @@ function renderPromptPanel(panel, messageId) {
         settings.geminiRandomFormat = !settings.geminiRandomFormat;
         saveSettings();
         syncToggle('.iig-gemini-format-toggle', settings.geminiRandomFormat, 'iig-format-on');
-        toastr.info(settings.geminiRandomFormat ? 'Gemini: рандомный формат включён' : 'Gemini: фиксированный формат');
+        toastr.info(settings.geminiRandomFormat ? 'Случайный формат включён' : 'Формат из тега / настроек');
     });
 }
 
@@ -7572,7 +7572,7 @@ function createSettingsUI() {
                                 <p class="hint">Для Gemini и Router (OpenRouter/CloseRouter). 1K ≈ 1024px, 2K ≈ 2048px, 4K ≈ 4096px по длинной стороне.</p>
                                 <label class="checkbox_label">
                                     <input type="checkbox" id="iig_gemini_random_format" ${settings.geminiRandomFormat ? 'checked' : ''}>
-                                    <span>Формат из промпта или случайный (aspect ratio)</span>
+                                    <span>Случайный формат (aspect ratio) для каждой картинки</span>
                                 </label>
                             </div>
 

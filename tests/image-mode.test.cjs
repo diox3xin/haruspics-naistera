@@ -72,10 +72,14 @@ test('the instruction lists the names the model must use, so references are atta
     assert.doesNotMatch(context.buildImageModeInstruction('inline'), /Character list/);
 });
 
-test('the prompt block is for NovelAI only; Nano Banana keeps the picture inside the reply', () => {
-    assert.match(source, /function usesPromptPanel\(settings = getSettings\(\)\) \{\r?\n    return isNovelAIPromptTarget\(settings\);/);
+test('the prompt block works with every image API; NovelAI gets tags, the others a text prompt', () => {
+    assert.match(source, /function usesPromptPanel\(settings = getSettings\(\)\) \{\r?\n    return Boolean\(settings\);/);
     const ensure = source.slice(source.indexOf('function ensurePromptPanelForMessage('), source.indexOf('function placePromptPanel('));
     assert.match(ensure, /if \(!usesPromptPanel\(\)\) \{/);
+    const hint = source.slice(source.indexOf('function imagePromptTargetHint('), source.indexOf('function getFixedAppearances('));
+    assert.match(hint, /isNovelAIPromptTarget\(settings\)/);
+    assert.match(hint, /GPT Image/);
+    assert.match(hint, /Nano Banana/);
     assert.match(source, /checkPromptPanelMode\(\);/);
     assert.doesNotMatch(source, /Debug Gemini|Debug OpenAI\/Router/);
 });

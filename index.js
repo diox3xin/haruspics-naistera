@@ -921,6 +921,18 @@ function isNovelAIPromptTarget(settings = getSettings()) {
         || (settings.apiType === 'naistera' && isNaisteraNovelAIModel(settings.naisteraModel));
 }
 
+/** What the prompt model must write for the selected image API: tags for NovelAI, a text description for the rest. */
+function imagePromptTargetHint(settings = getSettings()) {
+    if (isNovelAIPromptTarget(settings)) {
+        return 'Target image model: NovelAI (anime, tag-based). Write comma-separated English tags. If several characters are in the picture, write the shared scene first, then one block per character, separated by " | ".';
+    }
+    const model = String((settings.apiType === 'naistera' ? settings.naisteraModel : settings.model) || '').toLowerCase();
+    const name = /gpt-image|dall-e|gpt-4o|gpt-5/.test(model) ? 'GPT Image'
+        : (/gemini|banana|imagen/.test(model) || settings.apiType === 'gemini') ? 'Nano Banana (Gemini)'
+        : 'a natural-language image model';
+    return `Target image model: ${name}. Write the prompt as a vivid natural-language description in English (full sentences, not tags): who is in the picture, pose, expression, clothing, action, setting, lighting, camera angle and mood. Refer to every character by their exact name — reference images are attached by name.`;
+}
+
 /**
  * Profile appearances of the people who can be in the picture: the bot, the persona, RPG characters and NPCs
  * mentioned in `text`. The prompt model gets them so it stops inventing a new look on every reroll —
@@ -957,9 +969,7 @@ function getPromptGenerationContext(message, instruction, settings = getSettings
         const role = item.is_user ? 'User' : item.is_system ? 'System' : (item.name || 'Character');
         return `${role}: ${String(item.mes || '').trim()}`;
     }).filter(Boolean).join('\n\n');
-    const novelAI = isNovelAIPromptTarget(settings)
-        ? 'Target image model: NovelAI (anime, tag-based). Write comma-separated English tags. If several characters are in the picture, write the shared scene first, then one block per character, separated by " | ".'
-        : '';
+    const targetHint = imagePromptTargetHint(settings);
     const fixed = getFixedAppearances(`${recentMessages}\n${String(message?.mes || '')}`, settings);
     const fixedBlock = fixed.length
         ? `<fixed_appearance>\n${fixed.map(item => `${item.name}: ${item.appearance}`).join('\n')}\n</fixed_appearance>\n`
@@ -972,7 +982,7 @@ function getPromptGenerationContext(message, instruction, settings = getSettings
         `<message_to_illustrate>\n${String(message?.mes || '').trim()}\n</message_to_illustrate>`,
         `<prompt_instruction>\n${instruction.prompt}\n</prompt_instruction>`,
         fixedBlock,
-        novelAI,
+        targetHint,
         'Do not continue the roleplay. Write ONLY the image-generation prompt for <message_to_illustrate> now.',
     ].filter(Boolean).join('\n\n');
 }
@@ -5007,12 +5017,12 @@ function addButtonsToExistingMessages() {
 }
 
 /**
- * The «Промпт картинки» block (a separate model writes a tag prompt after the reply) is for NovelAI only:
- * Naistera NovelAI models, NovelAI directly, NovelAI through SillyTavern. With Nano Banana and the other image APIs
- * the chat model writes the image tag inside its reply and the picture appears right there in the text.
+ * The «Промпт картинки» block (a separate model writes the image prompt after the reply) works with every image API:
+ * NovelAI gets comma-separated tags, Nano Banana / GPT Image and the other models get a plain-text description
+ * (see imagePromptTargetHint). The image tag the chat model writes inside its reply keeps working alongside.
  */
 function usesPromptPanel(settings = getSettings()) {
-    return isNovelAIPromptTarget(settings);
+    return Boolean(settings);
 }
 
 let lastPromptPanelMode = null;

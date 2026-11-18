@@ -46,6 +46,7 @@ vm.runInContext([
     grab('normalizeNaisteraModel'),
     grab('isNaisteraNovelAIModel'),
     grab('isNovelAIPromptTarget'),
+    grab('imagePromptTargetHint'),
     grab('getPromptGenerationContext'),
     grab('parseImageTags', 'async function'),
     grab('cleanGeneratedImagePrompt', 'async function'),
@@ -62,10 +63,14 @@ test('the request says not to continue the roleplay and keeps the message apart 
     assert.match(text, /Do not continue the roleplay/);
 });
 
-test('NovelAI gets a tag hint, other APIs do not', () => {
+test('NovelAI gets a tag hint, Nano Banana / GPT Image get a text-prompt hint', () => {
     assert.match(context.ctx(chat[3], { prompt: 'x' }, { apiType: 'novelai-direct' }), /Target image model: NovelAI/);
     assert.match(context.ctx(chat[3], { prompt: 'x' }, { apiType: 'naistera', naisteraModel: 'novelai-v4' }), /NovelAI/);
-    assert.doesNotMatch(context.ctx(chat[3], { prompt: 'x' }, { apiType: 'openai' }), /NovelAI/);
+    const gpt = context.ctx(chat[3], { prompt: 'x' }, { apiType: 'openai', model: 'gpt-image-1' });
+    assert.doesNotMatch(gpt, /NovelAI/);
+    assert.match(gpt, /Target image model: GPT Image\. .*natural-language/);
+    assert.match(context.ctx(chat[3], { prompt: 'x' }, { apiType: 'gemini', model: 'gemini-2.5-flash-image' }), /Target image model: Nano Banana/);
+    assert.match(context.ctx(chat[3], { prompt: 'x' }, { apiType: 'openai-chat', model: 'google/nano-banana-pro' }), /Nano Banana/);
 });
 
 test('a whole bot reply with an image tag is reduced to the prompt inside the tag', async () => {

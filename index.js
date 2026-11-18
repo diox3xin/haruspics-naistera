@@ -3448,7 +3448,8 @@ async function generateImageNaistera(prompt, style, refData, options = {}) {
 
 
     // «Случайный формат» is already applied in generateImageWithRetry (options.aspectRatio).
-    const aspectRatio = options.aspectRatio || settings.naisteraAspectRatio || '1:1';
+    const aspectRatio = options.aspectRatio
+        || (settings.naisteraAspectRatio && settings.naisteraAspectRatio !== RANDOM_ASPECT_RATIO ? settings.naisteraAspectRatio : '1:1');
 
     const body = {
         prompt: promptParts.join('\n\n'),
@@ -3845,7 +3846,10 @@ async function generateImageOpenAI(prompt, style, refData, options = {}) {
         : String(options.negativePrompt || '').trim();
     if (galleryNegative) body.negative_prompt = galleryNegative;
 
-    if (size && size !== 'auto') body.size = size;
+    if (size && size !== 'auto' && size !== RANDOM_ASPECT_RATIO) body.size = size;
+    // Nano Banana / Gemini through an images/generations router ignores `size` and draws 1:1 — give it the ratio too.
+    // Not for GPT Image / DALL·E: OpenAI rejects unknown fields.
+    if (options.aspectRatio && isGeminiModel(settings.model || '')) body.aspect_ratio = options.aspectRatio;
 
     // Send reference images via body.image (gpt-image-1 compatible)
     if (imageRefs.length === 1) {
@@ -4089,6 +4093,9 @@ async function generateImageOpenAIChat(prompt, style, refData, options = {}) {
 // IMAGE GENERATION: Gemini (nano-banana)
 // ============================================================
 
+/** Value of the «Случайный» option in the Aspect Ratio and Размер lists. */
+const RANDOM_ASPECT_RATIO = 'random';
+
 const VALID_ASPECT_RATIOS = ['1:1', '2:3', '3:2', '3:4', '4:3', '4:5', '5:4', '9:16', '16:9', '21:9'];
 const VALID_IMAGE_SIZES = ['1K', '2K', '4K'];
 
@@ -4261,7 +4268,12 @@ function validateSettings() {
  * its own width / height. Reference generation passes keepAspectRatio.
  */
 function usesRandomAspectRatio(settings, options = {}) {
-    return Boolean(settings.geminiRandomFormat) && !options.keepAspectRatio && !NOVELAI_API_TYPES.includes(settings.apiType);
+    if (options.keepAspectRatio || NOVELAI_API_TYPES.includes(settings.apiType)) return false;
+    if (settings.geminiRandomFormat) return true;
+    // «Случайный» chosen in the Aspect Ratio / Размер list of the selected API.
+    if (settings.apiType === 'naistera') return settings.naisteraAspectRatio === RANDOM_ASPECT_RATIO;
+    if (settings.apiType === 'openai') return settings.size === RANDOM_ASPECT_RATIO || settings.aspectRatio === RANDOM_ASPECT_RATIO;
+    return settings.aspectRatio === RANDOM_ASPECT_RATIO;
 }
 
 function pickRandomAspectRatio() {
@@ -7497,6 +7509,7 @@ function createSettingsUI() {
                                 <div class="flex-row">
                                     <label>Aspect Ratio</label>
                                     <select id="iig_naistera_aspect_ratio" class="flex1">
+                                        <option value="random" ${settings.naisteraAspectRatio === 'random' ? 'selected' : ''}>🎲 Случайный</option>
                                         ${['1:1','2:3','3:2','3:4','4:3','4:5','5:4','9:16','16:9','21:9'].map(r => `<option value="${r}" ${settings.naisteraAspectRatio === r ? 'selected' : ''}>${r}</option>`).join('')}
                                     </select>
                                 </div>
@@ -7540,6 +7553,7 @@ function createSettingsUI() {
                                     <option value="1536x1024" ${settings.size === '1536x1024' ? 'selected' : ''}>1536×1024 (широко)</option>
                                     <option value="1024x1536" ${settings.size === '1024x1536' ? 'selected' : ''}>1024×1536 (высоко)</option>
                                     <option value="auto" ${settings.size === 'auto' ? 'selected' : ''}>auto</option>
+                                    <option value="random" ${settings.size === 'random' ? 'selected' : ''}>🎲 Случайный (широко / высоко / квадрат)</option>
                                 </select>
                             </div>
 
@@ -7556,6 +7570,7 @@ function createSettingsUI() {
                                 <div class="flex-row">
                                     <label>Aspect Ratio</label>
                                     <select id="iig_aspect_ratio" class="flex1">
+                                        <option value="random" ${settings.aspectRatio === 'random' ? 'selected' : ''}>🎲 Случайный</option>
                                         ${['1:1','2:3','3:2','3:4','4:3','4:5','5:4','9:16','16:9','21:9'].map(r =>
                                             `<option value="${r}" ${settings.aspectRatio === r ? 'selected' : ''}>${r}</option>`
                                         ).join('')}

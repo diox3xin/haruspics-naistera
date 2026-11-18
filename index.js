@@ -4151,16 +4151,20 @@ async function generateImageGemini(prompt, style, refData, options = {}) {
     const galleryNegative = getEffectiveNegativePrompt(options.negativePrompt);
     if (galleryNegative) fullPrompt += `[NEGATIVE PROMPT: ${galleryNegative}]\n\n`;
 
+    // The format in words too: some proxies drop generationConfig.imageConfig, and with square face references
+    // the model then copies their 1:1 shape.
+    fullPrompt += `[IMAGE SPECIFICATIONS: aspect ratio ${aspectRatio}, do NOT copy the aspect ratio from reference images, use ${aspectRatio} for the final output]\n\n`;
+
     // Main scene prompt
     fullPrompt += `[SCENE TO GENERATE]\n${prompt}\n[END SCENE]`;
 
     if (faceRefs.length > 0) {
-        fullPrompt += `\n\nKeep every face faithful to its reference image.`;
+        fullPrompt += `\n\nKeep every face faithful to its reference image.${aspectRatio !== '1:1' ? ` The final image must be ${aspectRatio}, not square like the references.` : ''}`;
     }
 
     parts.push({ text: fullPrompt });
 
-    iigLog('INFO', `Gemini request: ${faceRefs.length} face(s), ${clothingImageRefs.length} clothing img(s), ${textOnlyClothing.length} clothing text(s), prompt ${fullPrompt.length} chars`);
+    iigLog('INFO', `Gemini request: aspect ${aspectRatio}, size ${imageSize}, ${faceRefs.length} face(s), ${clothingImageRefs.length} clothing img(s), ${textOnlyClothing.length} clothing text(s), prompt ${fullPrompt.length} chars`);
 
     const body = {
         contents: [{ role: 'user', parts }],

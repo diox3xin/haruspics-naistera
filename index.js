@@ -115,6 +115,10 @@ const defaultSettings = Object.freeze({
     characterLibrarySelectedKind: 'char',
     characterLibrarySelectedKey: '',
     wardrobeItems: [],
+    // «Авто» in the wardrobe: a newly added outfit picture is described by the description model right away.
+    wardrobeAutoDescribe: false,
+    // Tags on the outfit cards and the tag filter row are shown (the «Теги» button hides them).
+    wardrobeTagsVisible: true,
     wardrobeSendMode: 'both', // 'both', 'text', 'none'
     activeWardrobeChar: null,
     activeWardrobeUser: null,
@@ -1497,11 +1501,78 @@ function addWardrobeItem(name, imageData, target = 'char', category = 'full') {
         description: '',
         target,
         category: category in WARDROBE_CATEGORIES ? category : 'full',
+        tags: [],
         createdAt: Date.now()
     };
     settings.wardrobeItems.push(item);
     // Don't call saveSettings() here to prevent panel collapse - caller will save after render
     return item;
+}
+
+/** «лето, Casual; вечернее» → ['лето', 'Casual', 'вечернее']: trimmed, no duplicates (case-insensitive), at most 20. */
+function normalizeWardrobeTags(value) {
+    const list = Array.isArray(value) ? value : String(value || '').split(/[,;\n]/);
+    const tags = [];
+    for (const raw of list) {
+        const tag = String(raw || '').replace(/\s+/g, ' ').trim().replace(/^#+\s*/, '').slice(0, 40);
+        if (tag && !tags.some(item => item.toLowerCase() === tag.toLowerCase())) tags.push(tag);
+    }
+    return tags.slice(0, 20);
+}
+
+function getWardrobeTags(item) {
+    return Array.isArray(item?.tags) ? item.tags : [];
+}
+
+/** All tags of these outfits, each once, sorted. */
+function collectWardrobeTags(items) {
+    const tags = [];
+    for (const item of items) {
+        for (const tag of getWardrobeTags(item)) {
+            if (!tags.some(known => known.toLowerCase() === tag.toLowerCase())) tags.push(tag);
+        }
+    }
+    return tags.sort((a, b) => a.localeCompare(b, 'ru'));
+}
+
+/** Outfits being described by «Авто» right now: their cards show a spinner. */
+const wardrobeDescribing = new Set();
+
+/**
+ * «Авто»: describes freshly added outfits one after another with the outfit description model.
+ * Does nothing when the switch is off; without a model it says so once instead of failing on every picture.
+ */
+async function autoDescribeWardrobeItems(items) {
+    const settings = getSettings();
+    const queue = (items || []).filter(item => item?.imageData);
+    if (!settings.wardrobeAutoDescribe || queue.length === 0) return 0;
+    if (!settings.wardrobeDescModel) {
+        toastr.warning('«Авто»: не выбрана модель для описаний одежды (Настройки → Гардероб)', 'Гардероб');
+        return 0;
+    }
+    const rerender = () => {
+        renderQuickWardrobeList();
+        for (const target of ['char', 'user']) renderWardrobeGrid(target);
+    };
+    queue.forEach(item => wardrobeDescribing.add(item.id));
+    rerender();
+    let done = 0;
+    for (const item of queue) {
+        try {
+            if (!settings.wardrobeItems.some(known => known.id === item.id)) continue; // deleted meanwhile
+            updateWardrobeItemDescription(item.id, await generateWardrobeDescription(item.id));
+            done++;
+            saveSettings();
+        } catch (error) {
+            iigLog('ERROR', `Auto description failed for "${item.name}": ${error.message}`);
+            toastr.error(`Описание «${item.name}»: ${error.message}`, 'Гардероб');
+        } finally {
+            wardrobeDescribing.delete(item.id);
+            rerender();
+        }
+    }
+    if (done) toastr.success(queue.length > 1 ? `Описано автоматически: ${done} из ${queue.length}` : `Описание готово: ${queue[0].name}`, 'Гардероб', { timeOut: 4000 });
+    return done;
 }
 
 // ============================================================
@@ -6195,22 +6266,31 @@ function bindReferenceUpload(kind, target) {
         saveSettings();
     });
     fileInput?.addEventListener('change', async () => {
-        const file = fileInput.files[0];
-        if (!file) return;
+        const files = [...(fileInput.files || [])];
+        if (!files.length) return;
+        const added = [];
         try {
-            const original = await readLibraryFileAsBase64(file);
-            const edited = await openReferenceImageEditor(original, 'Просмотр и обрезка перед добавлением');
-            if (edited === null) return;
-            const resized = await resizeImageBase64(edited, 512);
-            const name = nameInput?.value?.trim() || file.name.replace(/\.[^.]+$/, '');
-            if (kind === 'wardrobe') addWardrobeItem(name, resized, target);
-            else addHairstyleItem(name, resized, target);
+            // One picture: the crop editor first. Several: added as they are (no editor per picture).
+            const single = files.length === 1;
+            for (const file of files) {
+                try {
+                    const original = await readLibraryFileAsBase64(file);
+                    const edited = single ? await openReferenceImageEditor(original, 'Просмотр и обрезка перед добавлением') : original;
+                    if (edited === null) continue;
+                    const resized = await resizeImageBase64(edited, 512);
+                    const fileName = file.name.replace(/\.[^.]+$/, '').trim();
+                    const name = (single && nameInput?.value?.trim()) || fileName || (kind === 'wardrobe' ? 'Outfit' : 'Hairstyle');
+                    added.push(kind === 'wardrobe' ? addWardrobeItem(name, resized, target) : addHairstyleItem(name, resized, target));
+                } catch (error) { toastr.error(`Не удалось добавить «${file.name}»: ${error.message}`); }
+            }
+            if (!added.length) return;
             if (nameInput) nameInput.value = '';
             render();
             renderQuickWardrobeList();
             saveSettings();
-        } catch (error) { toastr.error(`Не удалось добавить изображение: ${error.message}`); }
-        finally { fileInput.value = ''; }
+            if (files.length > 1) toastr.success(`Добавлено: ${added.length}`, 'Гардероб');
+            if (kind === 'wardrobe') autoDescribeWardrobeItems(added);
+        } finally { fileInput.value = ''; }
     });
 }
 
@@ -7713,7 +7793,7 @@ function createSettingsUI() {
                                 <input type="text" id="iig_wardrobe_char_name" class="text_pole flex1" placeholder="Название наряда...">
                                 <div class="menu_button" id="iig_wardrobe_char_add"><i class="fa-solid fa-plus"></i> Добавить</div>
                                 <button type="button" class="menu_button" id="iig_wardrobe_char_text" title="Создать наряд без изображения">Текст</button>
-                                <input type="file" id="iig_wardrobe_char_file" accept="image/*" style="display:none;">
+                                <input type="file" id="iig_wardrobe_char_file" accept="image/*" multiple style="display:none;">
                             </div>
                             <div id="iig_wardrobe_char"></div>
                         </div>
@@ -7730,7 +7810,7 @@ function createSettingsUI() {
                                 <input type="text" id="iig_wardrobe_user_name" class="text_pole flex1" placeholder="Название наряда...">
                                 <div class="menu_button" id="iig_wardrobe_user_add"><i class="fa-solid fa-plus"></i> Добавить</div>
                                 <button type="button" class="menu_button" id="iig_wardrobe_user_text" title="Создать наряд без изображения">Текст</button>
-                                <input type="file" id="iig_wardrobe_user_file" accept="image/*" style="display:none;">
+                                <input type="file" id="iig_wardrobe_user_file" accept="image/*" multiple style="display:none;">
                             </div>
                             <div id="iig_wardrobe_user"></div>
                         </div>
@@ -8506,7 +8586,7 @@ let iigWardrobeModal = null;
 let iigCurrentWardrobeTab = 'char';
 // «Одежда» or «Причёски» inside the bot / user tab of the wardrobe window.
 let iigWardrobeKind = 'outfit';
-let iigWardrobeFilter = { category: 'all', search: '' };
+let iigWardrobeFilter = { category: 'all', search: '', tag: '' };
 let iigRefGenState = {
     target: 'char',
     name: '',
@@ -8709,7 +8789,11 @@ function renderQuickWardrobeList() {
     const allItems = settings.wardrobeItems?.filter(i => i.target === target) || [];
     const activeId = getActiveWardrobeId(target, settings);
     const activeItem = allItems.find(i => i.id === activeId) || null;
-    const items = filterWardrobeItems(allItems, iigWardrobeFilter);
+    const tagsVisible = settings.wardrobeTagsVisible !== false;
+    const allTags = collectWardrobeTags(allItems);
+    // A tag that no outfit of this tab has any more (deleted / renamed) stops filtering.
+    if (iigWardrobeFilter.tag && !allTags.some(tag => tag.toLowerCase() === iigWardrobeFilter.tag.toLowerCase())) iigWardrobeFilter.tag = '';
+    const items = filterWardrobeItems(allItems, tagsVisible ? iigWardrobeFilter : { ...iigWardrobeFilter, tag: '' });
     const imgSrc = item => `data:${detectMimeType(item.imageData)};base64,${item.imageData}`;
 
     const toolbar = `
@@ -8722,9 +8806,16 @@ function renderQuickWardrobeList() {
                         <label><input type="radio" name="iig_wardrobe_cat" value="${key}" ${iigWardrobeFilter.category === key ? 'checked' : ''}> ${escapeHtml(label)}</label>`).join('')}
                 </div>
             </details>
-            <button type="button" class="menu_button iig-wardrobe-add" title="Добавить одежду" aria-label="Добавить одежду"><i class="fa-solid fa-plus" aria-hidden="true"></i></button>
-            <input type="file" class="iig-wardrobe-add-file" accept="image/*" hidden>
-        </div>`;
+            <button type="button" class="menu_button iig-wardrobe-pill iig-wardrobe-auto${settings.wardrobeAutoDescribe ? ' is-on' : ''}" aria-pressed="${!!settings.wardrobeAutoDescribe}" title="Авто: описывать наряд сразу после добавления картинки"><i class="fa-solid fa-wand-magic-sparkles" aria-hidden="true"></i><span>Авто</span></button>
+            <button type="button" class="menu_button iig-wardrobe-pill iig-wardrobe-tags-toggle${tagsVisible ? ' is-on' : ''}" aria-pressed="${tagsVisible}" title="${tagsVisible ? 'Скрыть теги' : 'Показать теги'}"><i class="fa-solid fa-tags" aria-hidden="true"></i><span>Теги</span></button>
+            <button type="button" class="menu_button iig-wardrobe-add" title="Добавить одежду (можно несколько картинок)" aria-label="Добавить одежду"><i class="fa-solid fa-plus" aria-hidden="true"></i></button>
+            <input type="file" class="iig-wardrobe-add-file" accept="image/*" multiple hidden>
+        </div>
+        ${tagsVisible && allTags.length ? `
+        <div class="iig-wardrobe-tagbar" role="group" aria-label="Фильтр по тегу">
+            <button type="button" class="iig-wardrobe-tag iig-wardrobe-tag-filter${iigWardrobeFilter.tag ? '' : ' is-active'}" data-tag="" aria-pressed="${!iigWardrobeFilter.tag}">все</button>
+            ${allTags.map(tag => `<button type="button" class="iig-wardrobe-tag iig-wardrobe-tag-filter${iigWardrobeFilter.tag.toLowerCase() === tag.toLowerCase() ? ' is-active' : ''}" data-tag="${escapeHtml(tag)}" aria-pressed="${iigWardrobeFilter.tag.toLowerCase() === tag.toLowerCase()}">#${escapeHtml(tag)}</button>`).join('')}
+        </div>` : ''}`;
 
     const body = items.length === 0
         ? `<div class="iig-no-outfits">
@@ -8739,7 +8830,8 @@ function renderQuickWardrobeList() {
                     : '<div class="iig-wardrobe-card-img iig-card-placeholder"><i class="fa-solid fa-shirt" aria-hidden="true"></i></div>'}
                 <div class="iig-wardrobe-card-body">
                     <div class="iig-wardrobe-card-title">${escapeHtml(item.name)}</div>
-                    <div class="iig-wardrobe-card-category">${escapeHtml(WARDROBE_CATEGORIES[item.category] || WARDROBE_CATEGORIES.full)}</div>
+                    <div class="iig-wardrobe-card-category">${wardrobeDescribing.has(item.id) ? '<i class="fa-solid fa-spinner fa-spin" aria-hidden="true"></i> описываю…' : escapeHtml(WARDROBE_CATEGORIES[item.category] || WARDROBE_CATEGORIES.full)}</div>
+                    ${tagsVisible && getWardrobeTags(item).length ? `<div class="iig-wardrobe-card-tags">${getWardrobeTags(item).map(tag => `<span class="iig-wardrobe-tag">#${escapeHtml(tag)}</span>`).join('')}</div>` : ''}
                 </div>
                 ${item.id === activeId ? '<div class="iig-card-check" aria-hidden="true"><i class="fa-solid fa-check"></i></div>' : ''}
                 <div class="iig-card-tools">
@@ -8766,6 +8858,8 @@ function renderQuickWardrobeList() {
                 ${descFormatSwitchHtml(getVisionDescFormat(), ensureItemDescriptions(activeItem).descriptions)}
             </div>
             <textarea id="iig_wardrobe_desc_${escapeHtml(activeItem.id)}" class="text_pole" rows="3" placeholder="Описание одежды, которое будет передано в промпт">${escapeHtml(getItemDescription(activeItem, getVisionDescFormat(), false))}</textarea>
+            ${tagsVisible ? `<label class="iig-wardrobe-tags-label"><span><i class="fa-solid fa-tags" aria-hidden="true"></i> Теги <small>(через запятую, в промпт не идут)</small></span>
+                <input type="text" class="text_pole iig-wardrobe-tags-input" value="${escapeHtml(getWardrobeTags(activeItem).join(', '))}" placeholder="лето, casual, вечернее"></label>` : ''}
         </div>` : ''}`;
 
     content.innerHTML = kindSwitch + toolbar + body + footer;
@@ -8928,18 +9022,31 @@ function bindWardrobeAdd(container, target) {
     const input = container.querySelector('.iig-wardrobe-add-file');
     button?.addEventListener('click', () => input?.click());
     input?.addEventListener('change', async () => {
-        const file = input.files?.[0];
-        if (!file) return;
+        const files = [...(input.files || [])];
+        if (!files.length) return;
+        const category = iigWardrobeFilter.category in WARDROBE_CATEGORIES ? iigWardrobeFilter.category : 'full';
+        // The tag being filtered goes onto the new outfits, so they stay in view.
+        const tags = getSettings().wardrobeTagsVisible !== false && iigWardrobeFilter.tag ? [iigWardrobeFilter.tag] : [];
+        const added = [];
         try {
-            const resized = await resizeImageBase64(await readLibraryFileAsBase64(file), 512);
-            const name = file.name.replace(/\.[^.]+$/, '').trim() || 'Outfit';
-            const category = iigWardrobeFilter.category in WARDROBE_CATEGORIES ? iigWardrobeFilter.category : 'full';
-            const item = addWardrobeItem(name, resized, target, category);
-            toastr.success(`Добавлено: ${item.name}. Описание можно задать в настройках или через генератор.`, 'Гардероб');
+            for (const file of files) {
+                try {
+                    const resized = await resizeImageBase64(await readLibraryFileAsBase64(file), 512);
+                    const item = addWardrobeItem(file.name.replace(/\.[^.]+$/, '').trim() || 'Outfit', resized, target, category);
+                    item.tags = [...tags];
+                    added.push(item);
+                } catch (error) {
+                    toastr.error(`Не удалось добавить «${file.name}»: ${error.message}`, 'Гардероб');
+                }
+            }
+            if (!added.length) return;
             renderQuickWardrobeList();
+            if (target === 'char' || target === 'user') renderWardrobeGrid(target);
             saveSettings();
-        } catch (error) {
-            toastr.error(`Не удалось добавить: ${error.message}`, 'Гардероб');
+            const auto = getSettings().wardrobeAutoDescribe;
+            const tail = auto ? ' — описываю…' : '';
+            toastr.success(added.length > 1 ? `Добавлено: ${added.length}${tail}` : `Добавлено: ${added[0].name}${tail}`, 'Гардероб');
+            autoDescribeWardrobeItems(added);
         } finally {
             input.value = '';
         }
@@ -8948,12 +9055,15 @@ function bindWardrobeAdd(container, target) {
 
 function filterWardrobeItems(items, filter) {
     const category = filter?.category || 'all';
-    const needle = String(filter?.search || '').trim().toLowerCase();
+    const needle = String(filter?.search || '').trim().toLowerCase().replace(/^#/, '');
+    const tag = String(filter?.tag || '').trim().toLowerCase();
     return items.filter(item => {
         if (category !== 'all' && (item.category || 'full') !== category) return false;
+        if (tag && !getWardrobeTags(item).some(known => known.toLowerCase() === tag)) return false;
         if (!needle) return true;
         return String(item.name || '').toLowerCase().includes(needle)
-            || String(item.description || '').toLowerCase().includes(needle);
+            || String(item.description || '').toLowerCase().includes(needle)
+            || getWardrobeTags(item).some(known => known.toLowerCase().includes(needle));
     });
 }
 
@@ -8973,6 +9083,26 @@ function bindWardrobeToolbar(container) {
     container.querySelectorAll('input[name="iig_wardrobe_cat"]').forEach(radio => {
         radio.addEventListener('change', () => {
             iigWardrobeFilter.category = radio.value;
+            renderQuickWardrobeList();
+        });
+    });
+    container.querySelector('.iig-wardrobe-auto')?.addEventListener('click', () => {
+        const settings = getSettings();
+        settings.wardrobeAutoDescribe = !settings.wardrobeAutoDescribe;
+        saveSettings();
+        renderQuickWardrobeList();
+        toastr.info(settings.wardrobeAutoDescribe ? 'Авто: новые наряды описываются сразу после добавления' : 'Авто выключено', 'Гардероб');
+    });
+    container.querySelector('.iig-wardrobe-tags-toggle')?.addEventListener('click', () => {
+        const settings = getSettings();
+        settings.wardrobeTagsVisible = settings.wardrobeTagsVisible === false;
+        saveSettings();
+        renderQuickWardrobeList();
+    });
+    container.querySelectorAll('.iig-wardrobe-tag-filter').forEach(button => {
+        button.addEventListener('click', () => {
+            const tag = button.dataset.tag || '';
+            iigWardrobeFilter.tag = iigWardrobeFilter.tag.toLowerCase() === tag.toLowerCase() ? '' : tag;
             renderQuickWardrobeList();
         });
     });
@@ -9046,6 +9176,20 @@ function bindWardrobeCards(container, target, activeItem) {
             updateWardrobeItemDescription(activeItem.id, descArea.value);
             saveSettings();
             toastr.info('Описание сохранено', 'Гардероб');
+        });
+    }
+
+    const tagsInput = container.querySelector('.iig-wardrobe-tags-input');
+    if (tagsInput && activeItem) {
+        tagsInput.addEventListener('change', () => {
+            const item = settings.wardrobeItems.find(i => i.id === activeItem.id);
+            if (!item) return;
+            item.tags = normalizeWardrobeTags(tagsInput.value);
+            saveSettings();
+            renderQuickWardrobeList();
+        });
+        tagsInput.addEventListener('keydown', event => {
+            if (event.key === 'Enter') { event.preventDefault(); tagsInput.blur(); }
         });
     }
 }

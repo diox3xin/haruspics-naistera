@@ -15,6 +15,7 @@ const section = (from, to) => {
 const context = vm.createContext({});
 vm.runInContext(
     section('const WARDROBE_CATEGORIES', 'function addWardrobeItem(').replace('const WARDROBE_CATEGORIES', 'globalThis.WARDROBE_CATEGORIES') +
+    section('function getWardrobeTags(', '/** All tags') +
     section('function filterWardrobeItems(', 'function bindWardrobeToolbar('),
     context,
 );

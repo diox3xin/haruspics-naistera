@@ -2056,3 +2056,69 @@ body.iig-mode-inline .mes_text .iig-image-wrapper {
 .iig-profile-appearance-used { font-size: 12px; opacity: .65; }
 .iig-wardrobe-description .iig-desc-head { margin-bottom: 4px; }
 .iig-prompt-appearance-row small { opacity: .65; font-weight: 400; }
+
+/* ===== Wardrobe: «Авто», tags ===== */
+.iig-wardrobe-toolbar { flex-wrap: wrap; }
+.iig-wardrobe-pill {
+    flex-shrink: 0;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    min-height: 32px;
+    padding: 0 10px !important;
+    font-size: 13px;
+    opacity: .7;
+}
+.iig-wardrobe-pill.is-on {
+    opacity: 1;
+    border-color: var(--iig-wr-accent) !important;
+    color: var(--iig-wr-accent);
+}
+@media (max-width: 480px) {
+    .iig-wardrobe-search { flex-basis: 100%; }
+    .iig-wardrobe-pill span { display: none; }
+}
+.iig-wardrobe-tagbar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin: -2px 0 10px;
+}
+.iig-wardrobe-tag {
+    display: inline-flex;
+    align-items: center;
+    max-width: 100%;
+    padding: 1px 8px;
+    border: 1px solid color-mix(in srgb, var(--iig-wr-border) 70%, transparent);
+    border-radius: 999px;
+    background: transparent;
+    color: color-mix(in srgb, var(--iig-wr-text) 75%, transparent);
+    font-size: 12px;
+    line-height: 1.6;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+button.iig-wardrobe-tag { cursor: pointer; }
+button.iig-wardrobe-tag:hover,
+button.iig-wardrobe-tag:focus-visible { border-color: var(--iig-wr-accent); outline: none; }
+.iig-wardrobe-tag.is-active {
+    border-color: var(--iig-wr-accent);
+    background: color-mix(in srgb, var(--iig-wr-accent) 20%, transparent);
+    color: var(--iig-wr-text);
+}
+.iig-wardrobe-card-tags {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 3px;
+    margin-top: 4px;
+}
+.iig-wardrobe-card-tags .iig-wardrobe-tag { font-size: 11px; padding: 0 6px; }
+.iig-wardrobe-tags-label {
+    display: flex !important;
+    flex-direction: column;
+    gap: 4px;
+    margin-top: 8px;
+}
+.iig-wardrobe-tags-label small { opacity: .65; font-weight: 400; }
+.iig-wardrobe-tags-input { margin: 0 !important; }

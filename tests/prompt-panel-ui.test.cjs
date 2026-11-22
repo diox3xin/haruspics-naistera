@@ -21,7 +21,7 @@ test('random format toggle appears for every API except NovelAI', () => {
 
 test('random format picks the aspect ratio once per picture, over the tag ratio, size stays', () => {
     const retry = source.slice(source.indexOf('async function generateImageWithRetry('), source.indexOf('const timeoutMs', source.indexOf('async function generateImageWithRetry(')));
-    assert.match(retry, /if \(usesRandomAspectRatio\(settings, options\)\) \{\s*\/\/[^\n]*\n\s*options = \{ \.\.\.options, aspectRatio: pickRandomAspectRatio\(\) \};/);
+    assert.match(retry, /if \(usesRandomAspectRatio\(settings, options\)\) \{\s*\/\/[^\n]*\n\s*options = \{ \.\.\.options, aspectRatio: pickRandomAspectRatio\([^)]*\) \};/);
     assert.match(source, /VALID_ASPECT_RATIOS\[Math\.floor\(Math\.random\(\)/);
     assert.doesNotMatch(source, /geminiRandomFormat && !options\.aspectRatio/);
     assert.doesNotMatch(source, /imageSize = VALID_IMAGE_SIZES\[Math\.floor\(Math\.random\(\)/);

@@ -22,6 +22,7 @@ function load(overrides = {}) {
         buildOpenAIUrl: (base, p) => `${base}/v1/${p}`,
         buildAuthHeaders: (key, extra) => ({ ...extra, Authorization: `Bearer ${key}` }),
         isCloseRouterEndpoint: endpoint => /closerouter/i.test(String(endpoint || '')),
+        normalizeReferenceImages: async refData => refData,
         parseImageFromApiResponse: r => r.image || null,
         toastr: { warning() {}, error() {}, success() {} },
         addWardrobeItem: (name, imageData, target, category) => {

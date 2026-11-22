@@ -1121,7 +1121,10 @@ async function generateImageFromPromptBlock(messageId, panel, signal) {
 async function imageUrlToBase64(url) {
     try {
         const response = await fetch(url);
+        // A missing avatar answers with an HTML page: its bytes must not be sent as a "picture".
+        if (!response.ok) { iigLog('WARN', `Image not loaded (${response.status}): ${url}`); return null; }
         const blob = await response.blob();
+        if (blob.type && !blob.type.startsWith('image/')) { iigLog('WARN', `Not an image (${blob.type}): ${url}`); return null; }
         return new Promise((resolve, reject) => {
             const reader = new FileReader();
             reader.onloadend = () => resolve(reader.result.split(',')[1]);
@@ -2611,7 +2614,8 @@ async function imageResultToBase64(result) {
 async function generateReferenceImage(state, onStatus, signal) {
     const settings = getSettings();
     const prompt = String(state.finalPrompt || '').trim() || buildReferenceGenPrompt(state);
-    const imageRefs = buildRefGenImageRefs(state);
+    // Same format rules as every other picture request (AVIF / GIF / BMP → JPEG, non-pictures dropped).
+    const imageRefs = (await normalizeReferenceImages({ imageRefs: buildRefGenImageRefs(state), warnings: [] })).imageRefs;
 
     if (settings.refGenSource === 'custom') {
         if (!settings.refGenEndpoint || !settings.refGenApiKey || !settings.refGenModel) {
@@ -3715,6 +3719,51 @@ async function pollNaisteraJob(endpoint, jobId, settings, signal) {
     throw new Error(`Naistera polling timed out after ${Math.round(timeoutMs / 1000)}s`);
 }
 
+/** What was sent, without the pictures themselves: goes into the error so a failure can be told apart. */
+function describeNaisteraRequest(body) {
+    const kind = image => {
+        const data = String(image || '').split(',')[1] || '';
+        const format = /^\/9j\//.test(data) ? 'jpeg' : /^iVBOR/.test(data) ? 'png' : /^UklGR/.test(data) ? 'webp' : /^R0lGOD/.test(data) ? 'gif' : 'unknown';
+        return `${format} ${Math.round(data.length * 0.75 / 1024)}KB`;
+    };
+    const refs = body.reference_objects || [];
+    const parts = [
+        `model ${body.model || '(none)'}`,
+        `format ${body.aspect_ratio}`,
+        `prompt ${String(body.prompt || '').length} chars`,
+        refs.length ? `refs ${refs.length}: ${refs.map(ref => kind(ref.image)).join(', ')}` : 'no refs',
+    ];
+    if (body.preset) parts.push(`preset ${body.preset}`);
+    if (body.negative_prompt) parts.push('negative');
+    if (body.sync === false) parts.push('polling');
+    return parts.join(' | ');
+}
+
+/** The only formats Naistera takes (its 400 says: «use 1:1, 16:9, 9:16, 3:2, 2:3, 4:3, 3:4»). */
+const NAISTERA_ASPECT_RATIOS = ['1:1', '16:9', '9:16', '3:2', '2:3', '4:3', '3:4'];
+
+/** "W:H" → the closest ratio of `allowed` (4:5 → 3:4, 21:9 → 16:9); unknown values → 1:1. */
+function nearestAspectRatio(aspectRatio, allowed) {
+    if (allowed.includes(aspectRatio)) return aspectRatio;
+    const [w, h] = String(aspectRatio || '').split(':').map(Number);
+    if (!(w > 0 && h > 0)) return allowed.includes('1:1') ? '1:1' : allowed[0];
+    const target = Math.log(w / h);
+    let best = allowed[0];
+    let bestDistance = Infinity;
+    for (const candidate of allowed) {
+        const [cw, ch] = candidate.split(':').map(Number);
+        const distance = Math.abs(Math.log(cw / ch) - target);
+        if (distance < bestDistance) { best = candidate; bestDistance = distance; }
+    }
+    return best;
+}
+
+/**
+ * Naistera models that answered 503 with reference pictures but drew fine without them (this session).
+ * They get their references as text from then on, until the page reloads.
+ */
+const naisteraNoRefModels = new Set();
+
 async function generateImageNaistera(prompt, style, refData, options = {}) {
     const settings = getSettings();
     const endpoint = normalizeNaisteraEndpoint(settings.endpoint);
@@ -3750,8 +3799,11 @@ async function generateImageNaistera(prompt, style, refData, options = {}) {
 
 
     // «Случайный формат» is already applied in generateImageWithRetry (options.aspectRatio).
-    const aspectRatio = options.aspectRatio
+    const askedRatio = options.aspectRatio
         || (settings.naisteraAspectRatio && settings.naisteraAspectRatio !== RANDOM_ASPECT_RATIO ? settings.naisteraAspectRatio : '1:1');
+    // 4:5, 5:4, 21:9 (old settings, «Случайный», tags) are refused with 400 — send the closest format Naistera has.
+    const aspectRatio = nearestAspectRatio(askedRatio, NAISTERA_ASPECT_RATIOS);
+    if (aspectRatio !== askedRatio) iigLog('INFO', `Naistera: aspect ratio ${askedRatio} → ${aspectRatio} (Naistera has no ${askedRatio})`);
 
     const body = {
         prompt: promptParts.join('\n\n'),
@@ -3767,12 +3819,20 @@ async function generateImageNaistera(prompt, style, refData, options = {}) {
     const preset = String(options.preset ?? settings.naisteraPreset ?? '').trim();
     if (preset) body.preset = preset;
 
-    if (imageRefs.length > 0 && modelInfo?.references !== false) {
+    const sendRefs = imageRefs.length > 0 && modelInfo?.references !== false && !options._noRefs && !naisteraNoRefModels.has(model);
+    const refsDropped = imageRefs.length > 0 && (options._noRefs || naisteraNoRefModels.has(model));
+    if (refsDropped && descriptionMode !== 'none') {
+        // References break this model today: outfit / hairstyle descriptions go into the prompt instead.
+        const lines = imageRefs.filter(ref => ref.type !== 'face' && ref.description).map(ref => `[${ref.type === 'hairstyle' ? 'HAIRSTYLE' : 'CLOTHING'} for ${ref.name}: ${ref.description}]`);
+        if (lines.length) body.prompt = `${lines.join('\n')}\n\n${body.prompt}`;
+    }
+    if (sendRefs) {
         body.reference_objects = imageRefs.map(ref => ({
             image: `data:${ref.mimeType || 'image/png'};base64,${ref.data}`,
+            // One line, like Naistera's own client (sillyimages) sends it.
             description: descriptionMode === 'none'
                 ? ''
-                : (ref.description || ref.outfitName || ref.name || ''),
+                : String(ref.description || ref.outfitName || ref.name || '').replace(/\s+/g, ' ').trim(),
         })).filter(ref => ref.image);
     }
     if (settings.naisteraPolling) body.sync = false;
@@ -3799,7 +3859,16 @@ async function generateImageNaistera(prompt, style, refData, options = {}) {
     });
     if (!response.ok) {
         const text = await response.text().catch(() => '');
-        throw new Error(`Naistera API error (${response.status}): ${text.slice(0, 800)}`);
+        // 503 «неизвестная ошибка» after the request passed validation: the generation itself failed. With reference
+        // pictures, try once without them — if that works, the references are what this model chokes on.
+        if (response.status === 503 && body.reference_objects?.length) {
+            iigLog('WARN', `Naistera ${model}: 503 with ${body.reference_objects.length} reference(s), retrying without them: ${text.slice(0, 300)}`);
+            const image = await generateImageNaistera(prompt, style, refData, { ...options, _noRefs: true });
+            naisteraNoRefModels.add(model);
+            toastr.warning(`С картинками-референсами Naistera вернула 503, без них картинка получилась. До перезагрузки страницы референсы для ${model} идут текстом. Если так каждый раз, пришлите текст ошибки из логов.`, 'Naistera', { timeOut: 10000 });
+            return image;
+        }
+        throw new Error(`Naistera API error (${response.status}): ${text.slice(0, 800)} [${describeNaisteraRequest(body)}]`);
     }
 
     let result = await response.json();
@@ -4774,8 +4843,67 @@ function usesRandomAspectRatio(settings, options = {}) {
     return settings.aspectRatio === RANDOM_ASPECT_RATIO;
 }
 
-function pickRandomAspectRatio() {
+function pickRandomAspectRatio(list = null) {
+    // Naistera passes its own, shorter list (it refuses 4:5, 5:4, 21:9).
+    if (Array.isArray(list) && list.length) return list[Math.floor(Math.random() * list.length)];
     return VALID_ASPECT_RATIOS[Math.floor(Math.random() * VALID_ASPECT_RATIOS.length)];
+}
+
+/**
+ * Reference pictures are labelled by their first bytes (detectMimeType), and anything that is not JPEG / PNG / WebP /
+ * GIF was labelled "image/png". A small picture is not re-encoded, so an AVIF outfit (what Pinterest and many sites
+ * serve), a BMP or a GIF went out as a "PNG" that is not one. Gemini takes only PNG, JPEG, WebP (and HEIC): such a
+ * reference makes the generation fail after the request was accepted (Naistera: 503 «неизвестная ошибка»).
+ */
+function isModelSafeImageBase64(base64) {
+    return /^(\/9j\/|iVBORw0KGgo|UklGR)/.test(String(base64 || ''));
+}
+
+/** Any picture the browser can open → JPEG base64 (white background, longest side ≤ maxSize); null if it is not a picture. */
+function reencodeImageAsJpeg(base64, maxSize = 1024) {
+    return new Promise(resolve => {
+        const img = new Image();
+        img.onload = () => {
+            const ratio = Math.min(1, maxSize / Math.max(img.width || 1, img.height || 1));
+            const width = Math.max(1, Math.round((img.width || 1) * ratio));
+            const height = Math.max(1, Math.round((img.height || 1) * ratio));
+            const canvas = document.createElement('canvas');
+            canvas.width = width;
+            canvas.height = height;
+            const g = canvas.getContext('2d');
+            g.fillStyle = '#ffffff';
+            g.fillRect(0, 0, width, height);
+            g.drawImage(img, 0, 0, width, height);
+            resolve(canvas.toDataURL('image/jpeg', 0.92).split(',')[1] || null);
+        };
+        img.onerror = () => resolve(null);
+        img.src = `data:image/png;base64,${base64}`;
+    });
+}
+
+/**
+ * Every reference picture goes out as JPEG / PNG / WebP with the right label: other formats are converted to JPEG,
+ * things that are not pictures at all (an HTML error page, an empty file) are dropped with a warning.
+ * JPEG / PNG / WebP pictures are left byte for byte as they are.
+ */
+async function normalizeReferenceImages(refData) {
+    const imageRefs = refData?.imageRefs || [];
+    if (!imageRefs.length || imageRefs.every(ref => isModelSafeImageBase64(ref.data))) return refData;
+    const kept = [];
+    const warnings = [...(refData.warnings || [])];
+    for (const ref of imageRefs) {
+        if (isModelSafeImageBase64(ref.data)) { kept.push(ref); continue; }
+        const label = ref.outfitName ? `${ref.name} («${ref.outfitName}»)` : ref.name;
+        const jpeg = ref.data ? await reencodeImageAsJpeg(ref.data) : null;
+        if (jpeg) {
+            iigLog('INFO', `Reference "${label}": unsupported format (${String(ref.data).slice(0, 12)}…) converted to JPEG`);
+            kept.push({ ...ref, data: jpeg, mimeType: 'image/jpeg' });
+        } else {
+            iigLog('WARN', `Reference "${label}" is not a readable picture, not sent`);
+            warnings.push(`Референс ${label} не открывается как картинка и не отправлен. Загрузите его заново.`);
+        }
+    }
+    return { ...refData, imageRefs: kept, warnings };
 }
 
 async function generateImageWithRetry(prompt, style, onStatusUpdate, options = {}) {
@@ -4783,7 +4911,7 @@ async function generateImageWithRetry(prompt, style, onStatusUpdate, options = {
     const settings = getSettings();
     if (usesRandomAspectRatio(settings, options)) {
         // Chosen once per picture: retries keep the same format.
-        options = { ...options, aspectRatio: pickRandomAspectRatio() };
+        options = { ...options, aspectRatio: pickRandomAspectRatio(settings.apiType === 'naistera' ? NAISTERA_ASPECT_RATIOS : null) };
         iigLog('INFO', `Random format: ${options.aspectRatio}`);
     }
 
@@ -4793,6 +4921,7 @@ async function generateImageWithRetry(prompt, style, onStatusUpdate, options = {
         onStatusUpdate?.('Сбор референсов...');
         refData = await collectReferenceImages(prompt);
     }
+    refData = await normalizeReferenceImages(refData);
 
     // Show warnings from ref collection
     if (refData.warnings?.length > 0) {
@@ -8025,7 +8154,7 @@ function createSettingsUI() {
                                     <label>Aspect Ratio</label>
                                     <select id="iig_naistera_aspect_ratio" class="flex1">
                                         <option value="random" ${settings.naisteraAspectRatio === 'random' ? 'selected' : ''}>🎲 Случайный</option>
-                                        ${['1:1','2:3','3:2','3:4','4:3','4:5','5:4','9:16','16:9','21:9'].map(r => `<option value="${r}" ${settings.naisteraAspectRatio === r ? 'selected' : ''}>${r}</option>`).join('')}
+                                        ${NAISTERA_ASPECT_RATIOS.map(r => `<option value="${r}" ${(settings.naisteraAspectRatio === RANDOM_ASPECT_RATIO ? '' : nearestAspectRatio(settings.naisteraAspectRatio, NAISTERA_ASPECT_RATIOS)) === r ? 'selected' : ''}>${r}</option>`).join('')}
                                     </select>
                                 </div>
                                 <div class="flex-row">

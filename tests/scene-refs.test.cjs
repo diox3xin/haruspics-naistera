@@ -27,7 +27,7 @@ function collector(settings, { profileNames = { char: [], user: [] } } = {}) {
         getActiveHairstyleItem: () => null,
         getActiveNpcOutfit: () => null,
         ensureNpcDefaults: () => {},
-        detectMimeType: () => 'image/png', iigLog: () => {}, MAX_IMAGE_REFS: 4,
+        detectMimeType: () => 'image/png', iigLog: () => {}, MAX_IMAGE_REFS: 4, ensureWardrobeImagesLoaded: async () => {}, 
     });
     vm.runInContext(source.slice(source.indexOf('function otherDescFormat('), source.indexOf('/** Format for describing the bot')), context);
     vm.runInContext(section('const NAME_IGNORED_WORDS', '// ============================================================\r\n// 4-SLOT') , context);

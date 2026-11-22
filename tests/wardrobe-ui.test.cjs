@@ -25,7 +25,7 @@ function collector(config = {}, outfit = {}, hair = null, refs = [], prompt = 'f
         collectRpgCharacterReferences: async () => ({ descriptions: [], refs: [] }),
         getActiveWardrobeItem: () => outfit,
         getActiveHairstyleItem: kind => kind === 'char' ? hair : null,
-        detectMimeType: () => 'image/png', iigLog: () => {}, MAX_IMAGE_REFS: 4,
+        detectMimeType: () => 'image/png', iigLog: () => {}, MAX_IMAGE_REFS: 4, ensureWardrobeImagesLoaded: async () => {}, 
     });
     vm.runInContext(source.slice(source.indexOf('function otherDescFormat('), source.indexOf('/** Format for describing the bot')), context);
     vm.runInContext(section('async function collectReferenceImages(', '// IMAGE GENERATION: OpenAI'), context);
@@ -155,11 +155,13 @@ test('saved image is changed only after confirmation, preserving name and descri
         let saved = 0;
         const context = vm.createContext({
             openReferenceImageEditor: async () => edited,
+            ensureItemImageLoaded: async item => Boolean(item.imageData),
+            setItemImage: (item, data) => { item.imageData = data; },
             resizeImageBase64: async image => image,
             saveSettings: () => saved++, renderQuickWardrobeList() {}, toastr: { success() {} },
         });
         vm.runInContext(source.slice(source.indexOf('function otherDescFormat('), source.indexOf('/** Format for describing the bot')), context);
-        vm.runInContext(section('function editSavedReferenceImage(', 'function buildReferenceCard('), context);
+        vm.runInContext(section('async function editSavedReferenceImage(', 'function buildReferenceCard('), context);
         const item = { imageData: 'ORIGINAL', name: 'Coat', description: 'red coat' };
         await context.editSavedReferenceImage(item, () => {});
         assert.equal(item.imageData, edited === 'CROPPED' ? edited : 'ORIGINAL');

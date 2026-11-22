@@ -25,6 +25,7 @@ function makeContext(settings, profile) {
         getSettings: () => settings,
         saveSettings: () => { calls.saved++; },
         updateWardrobeInjection: () => { calls.injected++; },
+        deleteWardrobeFilesOf: () => {},
         getCharacterProfile: () => profile,
         getCurrentCharacterLibraryKey: () => 'avatar:bot.png',
         migrateOldCharacterLibrary: () => {},

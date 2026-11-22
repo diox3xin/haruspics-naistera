@@ -2148,3 +2148,112 @@ button.iig-wardrobe-tag:focus-visible { border-color: var(--iig-wr-accent); outl
 }
 .iig-wardrobe-dock .iig-wardrobe-description { margin-top: 0; }
 .iig-wardrobe-dock .iig-wardrobe-description textarea { max-height: 30dvh; }
+
+/* ---- Wardrobe: filter menu sections («Категория», «Порядок», «Только избранные») and the «⋯» menu ---- */
+.iig-wardrobe-filter-menu { z-index: 7; max-height: min(60vh, 420px); overflow-y: auto; }
+.iig-wardrobe-filter-menu .iig-menu-group { display: flex; flex-direction: column; gap: 2px; }
+.iig-wardrobe-filter-menu .iig-menu-title {
+    padding: 6px 6px 2px;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: .02em;
+    text-transform: uppercase;
+    color: color-mix(in srgb, var(--iig-wr-text) 55%, transparent);
+}
+.iig-wardrobe-filter-menu .iig-menu-title small { text-transform: none; font-weight: 400; letter-spacing: 0; }
+.iig-wardrobe-filter-menu .iig-menu-divided {
+    margin-top: 4px;
+    border-top: 1px solid color-mix(in srgb, var(--iig-wr-border) 50%, transparent);
+    border-radius: 0 0 4px 4px;
+}
+.iig-wardrobe-filter-menu .fa-star,
+.iig-filter-fav-mark { color: #f5c542; }
+.iig-wardrobe-more > summary { padding: 0 11px; }
+.iig-wardrobe-more .iig-wardrobe-filter-menu { min-width: 200px; }
+.iig-menu-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    padding: 7px 8px;
+    border: 0;
+    border-radius: 4px;
+    background: transparent;
+    color: var(--iig-wr-text);
+    font: inherit;
+    font-size: 13px;
+    text-align: left;
+    cursor: pointer;
+}
+.iig-menu-item:hover,
+.iig-menu-item:focus-visible { background: color-mix(in srgb, var(--iig-wr-accent) 12%, transparent); outline: none; }
+.iig-menu-item:disabled { opacity: .5; cursor: wait; }
+.iig-menu-item i { width: 16px; text-align: center; color: var(--iig-wr-accent); }
+
+/* ---- Favourite star on a card ---- */
+.iig-card-tools .iig-card-fav.is-on { color: #f5c542; border-color: color-mix(in srgb, #f5c542 60%, transparent); }
+.iig-card-tools .iig-card-fav:hover,
+.iig-card-tools .iig-card-fav:focus-visible { background: #f5c542; border-color: #f5c542; color: #1a1a1e; outline: none; }
+.iig-card-fav-badge {
+    position: absolute;
+    bottom: 6px;
+    right: 6px;
+    color: #f5c542;
+    font-size: 12px;
+    text-shadow: 0 1px 3px rgba(0, 0, 0, .8);
+    pointer-events: none;
+}
+
+/* ---- «Выбрать несколько»: ticks on cards, actions in the bottom dock ---- */
+.iig-wardrobe-selecting .iig-wardrobe-card { cursor: pointer; }
+.iig-card-select-mark {
+    position: absolute;
+    top: 6px;
+    left: 6px;
+    width: 22px;
+    height: 22px;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 12px;
+    color: transparent;
+    background: color-mix(in srgb, var(--iig-wr-bg) 80%, transparent);
+    border: 2px solid color-mix(in srgb, var(--iig-wr-text) 70%, transparent);
+    box-shadow: 0 1px 4px rgba(0, 0, 0, .5);
+    pointer-events: none;
+}
+.iig-wardrobe-card.iig-card-selected {
+    border-color: var(--iig-wr-accent);
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--iig-wr-accent) 55%, transparent);
+}
+.iig-card-selected .iig-card-select-mark {
+    color: var(--iig-wr-bg);
+    background: var(--iig-wr-accent);
+    border-color: var(--iig-wr-accent);
+}
+.iig-wardrobe-bulk { padding-top: 8px; display: flex; flex-direction: column; gap: 6px; }
+.iig-bulk-head,
+.iig-bulk-row { display: flex; align-items: center; gap: 6px; }
+.iig-bulk-count { flex: 1; min-width: 0; font-size: 13px; color: var(--iig-wr-text); }
+.iig-bulk-count b { color: var(--iig-wr-accent); }
+.iig-wardrobe-bulk .menu_button {
+    margin: 0 !important;
+    min-height: 32px;
+    padding: 0 10px !important;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 13px;
+    white-space: nowrap;
+    flex-shrink: 0;
+}
+.iig-wardrobe-bulk .menu_button:disabled,
+.iig-wardrobe-bulk select:disabled,
+.iig-wardrobe-bulk input:disabled { opacity: .45; cursor: not-allowed; }
+.iig-wardrobe-bulk .iig-bulk-delete:not(:disabled):hover { background: #dc3545; color: #fff; }
+.iig-wardrobe-bulk .iig-bulk-category,
+.iig-wardrobe-bulk .iig-bulk-tag { flex: 1; min-width: 0; margin: 0 !important; min-height: 32px; font-size: 13px; }
+/* The filter button sits on the left (on phones it starts the second toolbar row): its menu opens to the right,
+   so it never leaves the window. «⋯» is near the right edge and keeps opening to the left. */
+.iig-wardrobe-filter:not(.iig-wardrobe-more) > .iig-wardrobe-filter-menu { left: 0; right: auto; }

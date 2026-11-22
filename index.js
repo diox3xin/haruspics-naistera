@@ -115,6 +115,7 @@ const defaultSettings = Object.freeze({
     characterLibrarySelectedKind: 'char',
     characterLibrarySelectedKey: '',
     wardrobeItems: [],
+    wardrobeSort: 'added',
     // «Авто» in the wardrobe: a newly added outfit picture is described by the description model right away.
     wardrobeAutoDescribe: false,
     // Tags on the outfit cards and the tag filter row are shown (the «Теги» button hides them).
@@ -574,7 +575,9 @@ function removeRpgCharacter(charId) {
     // Outfits of a removed RPG character are unreachable from any tab, so drop them with it.
     if (settings.activeWardrobeRpg) delete settings.activeWardrobeRpg[charId];
     if (Array.isArray(settings.wardrobeItems)) {
+        const removed = settings.wardrobeItems.filter(item => item.target === `rpg:${charId}`);
         settings.wardrobeItems = settings.wardrobeItems.filter(item => item.target !== `rpg:${charId}`);
+        if (typeof deleteWardrobeFilesOf === 'function') deleteWardrobeFilesOf(removed, settings);
     }
     saveSettings();
     if (typeof updateWardrobeInjection === 'function') updateWardrobeInjection();
@@ -1505,6 +1508,7 @@ function addWardrobeItem(name, imageData, target = 'char', category = 'full') {
         createdAt: Date.now()
     };
     settings.wardrobeItems.push(item);
+    if (imageData) setItemImage(item, imageData);
     // Don't call saveSettings() here to prevent panel collapse - caller will save after render
     return item;
 }
@@ -1543,11 +1547,17 @@ const wardrobeDescribing = new Set();
  * Does nothing when the switch is off; without a model it says so once instead of failing on every picture.
  */
 async function autoDescribeWardrobeItems(items) {
+    if (!getSettings().wardrobeAutoDescribe) return 0;
+    return describeWardrobeItems(items, { auto: true });
+}
+
+/** Describes these outfits one after another (cards show a spinner). Used by «Авто» and by «Описать» for selected outfits. */
+async function describeWardrobeItems(items, { auto = false } = {}) {
     const settings = getSettings();
-    const queue = (items || []).filter(item => item?.imageData);
-    if (!settings.wardrobeAutoDescribe || queue.length === 0) return 0;
+    const queue = (items || []).filter(item => hasItemImage(item) && !wardrobeDescribing.has(item.id));
+    if (queue.length === 0) return 0;
     if (!settings.wardrobeDescModel) {
-        toastr.warning('«Авто»: не выбрана модель для описаний одежды (Настройки → Гардероб)', 'Гардероб');
+        toastr.warning(`${auto ? '«Авто»: н' : 'Н'}е выбрана модель для описаний одежды (Настройки → Гардероб)`, 'Гардероб');
         return 0;
     }
     const rerender = () => {
@@ -1571,8 +1581,211 @@ async function autoDescribeWardrobeItems(items) {
             rerender();
         }
     }
-    if (done) toastr.success(queue.length > 1 ? `Описано автоматически: ${done} из ${queue.length}` : `Описание готово: ${queue[0].name}`, 'Гардероб', { timeOut: 4000 });
+    if (done) toastr.success(queue.length > 1 ? `${auto ? 'Описано автоматически' : 'Описано'}: ${done} из ${queue.length}` : `Описание готово: ${queue[0].name}`, 'Гардероб', { timeOut: 4000 });
     return done;
+}
+
+// ============================================================
+// WARDROBE IMAGE FILES
+// ============================================================
+//
+// Outfit and hairstyle pictures used to live as base64 inside the extension settings, so settings.json grew by
+// hundreds of KB per outfit and SillyTavern rewrote all of it on every click. Now each picture is a file in
+// user/images/haruspics-wardrobe/ and the item keeps only its path (`imageFile`).
+//
+// The base64 still sits on `item.imageData` in memory, so every reader (references, AI descriptions, crop editor)
+// works as before — the bytes sent to the image model are exactly the file's bytes. Once the file is written the
+// property becomes non-enumerable: JSON.stringify (= saving settings) skips it.
+//
+// Safety rule: a picture is always stored somewhere. It leaves settings.json only after the upload succeeded;
+// if the upload fails (old SillyTavern, no access) it simply stays in settings as before.
+
+const WARDROBE_FILES_FOLDER = 'haruspics-wardrobe';
+/** Files that could not be read this session (deleted by hand?): not requested again on every generation. */
+const wardrobeMissingFiles = new Set();
+const wardrobeFileLoads = new Map();
+let wardrobeMigrationRunning = false;
+let wardrobeMigrationAgain = false;
+
+function getWardrobeImageItems(settings = getSettings()) {
+    return [...(settings.wardrobeItems || []), ...(settings.hairstyleItems || [])];
+}
+
+/** The picture is in memory only (saved as a file), not in settings.json. */
+function hideItemImageFromSettings(item, data = item.imageData) {
+    Object.defineProperty(item, 'imageData', { value: data, writable: true, enumerable: false, configurable: true });
+}
+
+/** The picture is (still) stored inside settings.json. */
+function isItemImageInSettings(item) {
+    const own = Object.getOwnPropertyDescriptor(item || {}, 'imageData');
+    return Boolean(own?.enumerable && own.value);
+}
+
+function hasItemImage(item) {
+    return Boolean(item?.imageData || item?.imageFile);
+}
+
+function wardrobeFileUrl(filePath) {
+    const clean = String(filePath || '').replace(/\\/g, '/');
+    return clean.startsWith('/') ? clean : `/${clean}`;
+}
+
+/** <img src> for a card: the base64 when it is loaded, otherwise the file itself (no need to wait). */
+function itemImageSrc(item) {
+    if (item?.imageData) return `data:${detectMimeType(item.imageData)};base64,${item.imageData}`;
+    return item?.imageFile ? wardrobeFileUrl(item.imageFile) : '';
+}
+
+async function uploadWardrobeImageFile(item) {
+    const data = String(item?.imageData || '');
+    if (!data) throw new Error('Нет данных изображения');
+    const format = detectMimeType(data).split('/')[1] || 'png';
+    const context = SillyTavern.getContext();
+    const safeId = String(item.id || 'item').replace(/[^\w-]/g, '_');
+    const response = await fetch('/api/images/upload', {
+        method: 'POST',
+        headers: context.getRequestHeaders(),
+        body: JSON.stringify({ image: data, format, ch_name: WARDROBE_FILES_FOLDER, filename: `${safeId}_${Date.now()}` }),
+    });
+    if (!response.ok) throw new Error(`upload ${response.status}`);
+    const result = await response.json().catch(() => ({}));
+    if (!result?.path) throw new Error('upload: no path');
+    return String(result.path);
+}
+
+/** Best effort: a file left behind only costs disk space, so failures are just logged. */
+async function deleteWardrobeImageFile(filePath) {
+    if (!filePath) return;
+    try {
+        const context = SillyTavern.getContext();
+        const response = await fetch('/api/images/delete', {
+            method: 'POST',
+            headers: context.getRequestHeaders(),
+            body: JSON.stringify({ path: String(filePath).replace(/\\/g, '/').replace(/^\//, '') }),
+        });
+        if (!response.ok) iigLog('WARN', `Wardrobe file not deleted (${response.status}): ${filePath}`);
+    } catch (error) {
+        iigLog('WARN', `Wardrobe file not deleted: ${filePath}: ${error.message}`);
+    }
+}
+
+/** Items removed from the wardrobe: their files go too, unless another item still uses the same file. */
+function deleteWardrobeFilesOf(removedItems, settings = getSettings()) {
+    const stillUsed = new Set(getWardrobeImageItems(settings).map(item => item.imageFile).filter(Boolean));
+    for (const item of removedItems || []) {
+        if (item?.imageFile && !stillUsed.has(item.imageFile)) deleteWardrobeImageFile(item.imageFile);
+    }
+}
+
+/**
+ * Saves the item's in-memory picture as a file. On success the base64 leaves settings.json (and an older
+ * file of the same item is deleted); on failure nothing changes. Returns true when the file was written.
+ */
+async function storeItemImageAsFile(item) {
+    if (!item?.imageData) return false;
+    const data = item.imageData;
+    const oldFile = item.imageFile || '';
+    try {
+        const filePath = await uploadWardrobeImageFile(item);
+        // The picture was replaced again while uploading: that newer upload will win.
+        if (item.imageData !== data) { deleteWardrobeImageFile(filePath); return false; }
+        // Deleted from the wardrobe while uploading: don't leave the file behind.
+        if (!getWardrobeImageItems().includes(item)) { deleteWardrobeImageFile(filePath); return false; }
+        item.imageFile = filePath;
+        hideItemImageFromSettings(item, data);
+        wardrobeMissingFiles.delete(filePath);
+        if (oldFile && oldFile !== filePath) deleteWardrobeFilesOf([{ imageFile: oldFile }]);
+        return true;
+    } catch (error) {
+        iigLog('WARN', `Wardrobe picture "${item.name}" stays in settings: ${error.message}`);
+        return false;
+    }
+}
+
+/**
+ * New or edited picture: kept in settings.json right away (so nothing is lost if the page closes),
+ * then moved into a file in the background. Saves settings when the move is done.
+ */
+function setItemImage(item, data) {
+    Object.defineProperty(item, 'imageData', { value: data || null, writable: true, enumerable: true, configurable: true });
+    if (!data) return Promise.resolve(false);
+    return storeItemImageAsFile(item).then(stored => {
+        if (stored) saveSettings();
+        return stored;
+    });
+}
+
+async function readWardrobeImageFile(filePath) {
+    const response = await fetch(wardrobeFileUrl(filePath), { cache: 'no-cache' });
+    if (!response.ok) throw new Error(`${response.status}`);
+    const blob = await response.blob();
+    const dataUrl = await new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onloadend = () => resolve(reader.result);
+        reader.onerror = reject;
+        reader.readAsDataURL(blob);
+    });
+    const base64 = String(dataUrl).split(',')[1] || '';
+    if (!base64) throw new Error('empty file');
+    return base64;
+}
+
+/** Puts the file's picture into item.imageData (memory only). Resolves to true when the picture is available. */
+function ensureItemImageLoaded(item) {
+    if (!item) return Promise.resolve(false);
+    if (item.imageData) return Promise.resolve(true);
+    const filePath = item.imageFile;
+    if (!filePath || wardrobeMissingFiles.has(filePath)) return Promise.resolve(false);
+    if (!wardrobeFileLoads.has(filePath)) {
+        wardrobeFileLoads.set(filePath, readWardrobeImageFile(filePath)
+            .then(data => data)
+            .catch(error => {
+                wardrobeMissingFiles.add(filePath);
+                iigLog('WARN', `Wardrobe picture file is missing: ${filePath} (${error.message})`);
+                return null;
+            })
+            .finally(() => wardrobeFileLoads.delete(filePath)));
+    }
+    return wardrobeFileLoads.get(filePath).then(data => {
+        if (!data) return false;
+        if (!item.imageData && item.imageFile === filePath) hideItemImageFromSettings(item, data);
+        return Boolean(item.imageData);
+    });
+}
+
+/** All wardrobe pictures (outfits + hairstyles) in memory: called before collecting references for a picture. */
+async function ensureWardrobeImagesLoaded(settings = getSettings()) {
+    await Promise.all(getWardrobeImageItems(settings).map(item => ensureItemImageLoaded(item)));
+}
+
+/**
+ * One-time move of the old base64 pictures out of settings.json into files. Runs in the background after
+ * start-up, one picture at a time; stops at the first failed upload (the endpoint is missing or refuses) and
+ * tries again on the next start. Nothing is removed from settings before its file exists.
+ */
+async function migrateWardrobeImagesToFiles() {
+    if (wardrobeMigrationRunning) { wardrobeMigrationAgain = true; return 0; }
+    wardrobeMigrationRunning = true;
+    let moved = 0;
+    try {
+        const pending = getWardrobeImageItems().filter(isItemImageInSettings);
+        for (const item of pending) {
+            if (!isItemImageInSettings(item)) continue;
+            if (!await storeItemImageAsFile(item)) break;
+            moved++;
+        }
+        if (moved) {
+            saveSettings();
+            iigLog('INFO', `Wardrobe: ${moved} picture(s) moved from settings.json into files`);
+        }
+    } catch (error) {
+        iigLog('WARN', `Wardrobe picture migration stopped: ${error.message}`);
+    } finally {
+        wardrobeMigrationRunning = false;
+        if (wardrobeMigrationAgain) { wardrobeMigrationAgain = false; setTimeout(() => migrateWardrobeImagesToFiles(), 0); }
+    }
+    return moved;
 }
 
 // ============================================================
@@ -1591,6 +1804,7 @@ function addHairstyleItem(name, imageData, target = 'char') {
     };
     if (!settings.hairstyleItems) settings.hairstyleItems = [];
     settings.hairstyleItems.push(item);
+    if (imageData) setItemImage(item, imageData);
     saveSettings();
     return item;
 }
@@ -1599,7 +1813,9 @@ function removeHairstyleItem(itemId) {
     const settings = getSettings();
     if (settings.activeHairstyleChar === itemId) settings.activeHairstyleChar = null;
     if (settings.activeHairstyleUser === itemId) settings.activeHairstyleUser = null;
+    const removed = settings.hairstyleItems.filter(i => i.id === itemId);
     settings.hairstyleItems = settings.hairstyleItems.filter(i => i.id !== itemId);
+    deleteWardrobeFilesOf(removed, settings);
     saveSettings();
 }
 
@@ -1894,7 +2110,8 @@ async function describeAppearance({ image = '', cardText = '', format = getProfi
 async function generateHairstyleDescription(itemId) {
     const settings = getSettings();
     const item = settings.hairstyleItems?.find(i => i.id === itemId);
-    if (!item?.imageData) throw new Error('Нет данных изображения');
+    await ensureItemImageLoaded(item);
+    if (!item?.imageData) throw new Error(item?.imageFile ? 'Файл картинки не найден' : 'Нет данных изображения');
 
     const endpoint = settings.wardrobeDescEndpoint || settings.endpoint;
     const apiKey = settings.wardrobeDescApiKey || settings.apiKey;
@@ -1948,7 +2165,9 @@ function removeWardrobeItem(itemId) {
     for (const [rpgId, activeId] of Object.entries(settings.activeWardrobeRpg || {})) {
         if (activeId === itemId) delete settings.activeWardrobeRpg[rpgId];
     }
+    const removed = settings.wardrobeItems.filter(i => i.id === itemId);
     settings.wardrobeItems = settings.wardrobeItems.filter(i => i.id !== itemId);
+    deleteWardrobeFilesOf(removed, settings);
     // Don't call saveSettings() here to prevent panel collapse - caller will save after render
     updateWardrobeInjection();
 }
@@ -1964,6 +2183,9 @@ function setActiveWardrobe(itemId, target) {
         const key = target === 'char' ? 'activeWardrobeChar' : 'activeWardrobeUser';
         settings[key] = settings[key] === itemId ? null : itemId;
     }
+    // Put on (not taken off): remembered for «Недавно надетые».
+    const worn = itemId && getActiveWardrobeId(target, settings) === itemId ? settings.wardrobeItems.find(i => i.id === itemId) : null;
+    if (worn) worn.lastWornAt = Date.now();
     saveSettings();
     updateWardrobeInjection();
 }
@@ -1996,7 +2218,8 @@ function updateWardrobeItemDescription(itemId, description, format = getVisionDe
 async function generateWardrobeDescription(itemId) {
     const settings = getSettings();
     const item = settings.wardrobeItems.find(i => i.id === itemId);
-    if (!item?.imageData) throw new Error('Нет данных изображения');
+    await ensureItemImageLoaded(item);
+    if (!item?.imageData) throw new Error(item?.imageFile ? 'Файл картинки не найден' : 'Нет данных изображения');
 
     const endpoint = settings.wardrobeDescEndpoint || settings.endpoint;
     const apiKey = settings.wardrobeDescApiKey || settings.apiKey;
@@ -3158,6 +3381,8 @@ const MAX_IMAGE_REFS = 4;
 async function collectReferenceImages(prompt) {
     const settings = getSettings();
     const context = SillyTavern.getContext();
+    // Outfit / hairstyle pictures stored as files are read into memory first (same bytes as before).
+    await ensureWardrobeImagesLoaded(settings);
 
     const faceRefs = [];
     const clothingRefs = [];
@@ -6168,10 +6393,14 @@ function openReferenceImageEditor(imageData, title = 'Просмотр и обр
     });
 }
 
-function editSavedReferenceImage(item, render) {
+async function editSavedReferenceImage(item, render) {
+    if (!await ensureItemImageLoaded(item)) {
+        toastr.error('Файл картинки не найден', 'Гардероб');
+        return;
+    }
     return openReferenceImageEditor(item.imageData, item.name).then(async edited => {
         if (edited === null || edited === item.imageData) return;
-        item.imageData = await resizeImageBase64(edited, 512);
+        setItemImage(item, await resizeImageBase64(edited, 512));
         saveSettings();
         render();
         renderQuickWardrobeList();
@@ -6195,9 +6424,9 @@ function buildReferenceCard({ item, isActive, onSelect, onDelete, rerender }) {
     media.title = actionLabel;
     media.setAttribute('aria-pressed', String(isActive));
     media.setAttribute('aria-label', `${actionLabel}: ${item.name}`);
-    if (item.imageData) {
+    if (hasItemImage(item)) {
         const img = document.createElement('img');
-        img.src = `data:${detectMimeType(item.imageData)};base64,${item.imageData}`;
+        img.src = itemImageSrc(item);
         img.alt = '';
         media.appendChild(img);
     } else {
@@ -6227,7 +6456,7 @@ function buildReferenceCard({ item, isActive, onSelect, onDelete, rerender }) {
 
     const actions = document.createElement('div');
     actions.className = 'iig-ref-card-actions';
-    if (item.imageData) {
+    if (hasItemImage(item)) {
         const crop = document.createElement('button');
         crop.type = 'button';
         crop.className = 'iig-ref-card-btn';
@@ -8586,7 +8815,9 @@ let iigWardrobeModal = null;
 let iigCurrentWardrobeTab = 'char';
 // «Одежда» or «Причёски» inside the bot / user tab of the wardrobe window.
 let iigWardrobeKind = 'outfit';
-let iigWardrobeFilter = { category: 'all', search: '', tag: '' };
+let iigWardrobeFilter = { category: 'all', search: '', tag: '', favOnly: false };
+/** «Выбрать несколько» in the outfit list: ticked outfit ids of one tab. */
+const iigWardrobeSelection = { active: false, target: '', ids: new Set() };
 let iigRefGenState = {
     target: 'char',
     name: '',
@@ -8793,21 +9024,44 @@ function renderQuickWardrobeList() {
     const allTags = collectWardrobeTags(allItems);
     // A tag that no outfit of this tab has any more (deleted / renamed) stops filtering.
     if (iigWardrobeFilter.tag && !allTags.some(tag => tag.toLowerCase() === iigWardrobeFilter.tag.toLowerCase())) iigWardrobeFilter.tag = '';
-    const items = filterWardrobeItems(allItems, tagsVisible ? iigWardrobeFilter : { ...iigWardrobeFilter, tag: '' });
-    const imgSrc = item => `data:${detectMimeType(item.imageData)};base64,${item.imageData}`;
+    const sort = Object.hasOwn(WARDROBE_SORTS, settings.wardrobeSort) ? settings.wardrobeSort : 'added';
+    const items = sortWardrobeItems(filterWardrobeItems(allItems, tagsVisible ? iigWardrobeFilter : { ...iigWardrobeFilter, tag: '' }), sort);
+    const imgSrc = itemImageSrc;
+    const selection = iigWardrobeSelection;
+    if (selection.active && selection.target !== target) { selection.active = false; selection.ids.clear(); }
+    for (const id of [...selection.ids]) if (!allItems.some(item => item.id === id)) selection.ids.delete(id);
+    const selecting = selection.active;
 
     const toolbar = `
         <div class="iig-wardrobe-toolbar">
             <input type="search" class="text_pole iig-wardrobe-search" placeholder="Поиск по названию и описанию" aria-label="Поиск одежды" value="${escapeHtml(iigWardrobeFilter.search)}">
             <details class="iig-wardrobe-filter">
-                <summary title="Категория"><i class="fa-solid fa-filter" aria-hidden="true"></i><span>${escapeHtml(iigWardrobeFilter.category === 'all' ? 'Все' : (WARDROBE_CATEGORIES[iigWardrobeFilter.category] || 'Все'))}</span></summary>
-                <div class="iig-wardrobe-filter-menu" role="radiogroup" aria-label="Категория">
+                <summary title="Категория, порядок, избранное"><i class="fa-solid fa-filter" aria-hidden="true"></i><span>${escapeHtml(iigWardrobeFilter.category === 'all' ? 'Все' : (WARDROBE_CATEGORIES[iigWardrobeFilter.category] || 'Все'))}</span>${iigWardrobeFilter.favOnly ? '<i class="fa-solid fa-star iig-filter-fav-mark" aria-label="только избранные"></i>' : ''}</summary>
+                <div class="iig-wardrobe-filter-menu">
+                    <div class="iig-menu-title">Категория</div>
+                    <div class="iig-menu-group" role="radiogroup" aria-label="Категория">
                     ${[['all', 'Все категории'], ...Object.entries(WARDROBE_CATEGORIES)].map(([key, label]) => `
                         <label><input type="radio" name="iig_wardrobe_cat" value="${key}" ${iigWardrobeFilter.category === key ? 'checked' : ''}> ${escapeHtml(label)}</label>`).join('')}
+                    </div>
+                    <div class="iig-menu-title">Порядок <small>(избранные всегда сверху)</small></div>
+                    <div class="iig-menu-group" role="radiogroup" aria-label="Порядок">
+                    ${Object.entries(WARDROBE_SORTS).map(([key, label]) => `
+                        <label><input type="radio" name="iig_wardrobe_sort" value="${key}" ${sort === key ? 'checked' : ''}> ${escapeHtml(label)}</label>`).join('')}
+                    </div>
+                    <label class="iig-menu-divided"><input type="checkbox" class="iig-wardrobe-fav-only" ${iigWardrobeFilter.favOnly ? 'checked' : ''}> <i class="fa-solid fa-star" aria-hidden="true"></i> Только избранные</label>
                 </div>
             </details>
             <button type="button" class="menu_button iig-wardrobe-pill iig-wardrobe-auto${settings.wardrobeAutoDescribe ? ' is-on' : ''}" aria-pressed="${!!settings.wardrobeAutoDescribe}" title="Авто: описывать наряд сразу после добавления картинки"><i class="fa-solid fa-wand-magic-sparkles" aria-hidden="true"></i><span>Авто</span></button>
             <button type="button" class="menu_button iig-wardrobe-pill iig-wardrobe-tags-toggle${tagsVisible ? ' is-on' : ''}" aria-pressed="${tagsVisible}" title="${tagsVisible ? 'Скрыть теги' : 'Показать теги'}"><i class="fa-solid fa-tags" aria-hidden="true"></i><span>Теги</span></button>
+            <details class="iig-wardrobe-filter iig-wardrobe-more">
+                <summary title="Ещё: выбрать несколько, экспорт, импорт" aria-label="Ещё"><i class="fa-solid fa-ellipsis-vertical" aria-hidden="true"></i></summary>
+                <div class="iig-wardrobe-filter-menu">
+                    <button type="button" class="iig-menu-item iig-wardrobe-select-mode"><i class="fa-solid fa-check-double" aria-hidden="true"></i> ${selecting ? 'Закончить выбор' : 'Выбрать несколько'}</button>
+                    <button type="button" class="iig-menu-item iig-wardrobe-export" title="Все наряды и причёски с картинками в один файл"><i class="fa-solid fa-file-export" aria-hidden="true"></i> Экспорт гардероба</button>
+                    <button type="button" class="iig-menu-item iig-wardrobe-import" title="Добавить наряды из файла экспорта (уже существующие пропускаются)"><i class="fa-solid fa-file-import" aria-hidden="true"></i> Импорт из файла</button>
+                </div>
+            </details>
+            <input type="file" class="iig-wardrobe-import-file" accept=".json,application/json" hidden>
             <button type="button" class="menu_button iig-wardrobe-add" title="Добавить одежду (можно несколько картинок)" aria-label="Добавить одежду"><i class="fa-solid fa-plus" aria-hidden="true"></i></button>
             <input type="file" class="iig-wardrobe-add-file" accept="image/*" multiple hidden>
         </div>
@@ -8820,12 +9074,16 @@ function renderQuickWardrobeList() {
     const body = items.length === 0
         ? `<div class="iig-no-outfits">
                 <i class="fa-solid fa-shirt" aria-hidden="true"></i>
-                <p>${allItems.length === 0 ? 'Нет нарядов в гардеробе' : 'Ничего не найдено'}</p>
+                <p>${allItems.length === 0 ? 'Нет нарядов в гардеробе' : (iigWardrobeFilter.favOnly && !allItems.some(item => item.favorite) ? 'Нет избранных нарядов' : 'Ничего не найдено')}</p>
                 ${allItems.length === 0 ? '<small>Нажмите «+», чтобы добавить картинку одежды</small>' : ''}
            </div>`
-        : `<div class="iig-wardrobe-grid">${items.map(item => `
-            <div class="iig-wardrobe-card ${item.id === activeId ? 'iig-card-active' : ''}" data-id="${escapeHtml(item.id)}" role="button" tabindex="0" aria-pressed="${item.id === activeId}" title="${item.id === activeId ? 'Снять' : 'Надеть'}">
-                ${item.imageData
+        : `<div class="iig-wardrobe-grid${selecting ? ' iig-wardrobe-selecting' : ''}">${items.map(item => {
+            const selected = selecting && selection.ids.has(item.id);
+            const pressed = selecting ? selected : item.id === activeId;
+            const title = selecting ? (selected ? 'Убрать из выбора' : 'Выбрать') : (item.id === activeId ? 'Снять' : 'Надеть');
+            return `
+            <div class="iig-wardrobe-card ${item.id === activeId ? 'iig-card-active' : ''}${selected ? ' iig-card-selected' : ''}${item.favorite ? ' iig-card-favorite' : ''}" data-id="${escapeHtml(item.id)}" role="button" tabindex="0" aria-pressed="${pressed}" title="${title}">
+                ${hasItemImage(item)
                     ? `<img class="iig-wardrobe-card-img" src="${imgSrc(item)}" alt="${escapeHtml(item.name)}" draggable="false">`
                     : '<div class="iig-wardrobe-card-img iig-card-placeholder"><i class="fa-solid fa-shirt" aria-hidden="true"></i></div>'}
                 <div class="iig-wardrobe-card-body">
@@ -8834,12 +9092,15 @@ function renderQuickWardrobeList() {
                     ${tagsVisible && getWardrobeTags(item).length ? `<div class="iig-wardrobe-card-tags">${getWardrobeTags(item).map(tag => `<span class="iig-wardrobe-tag">#${escapeHtml(tag)}</span>`).join('')}</div>` : ''}
                 </div>
                 ${item.id === activeId ? '<div class="iig-card-check" aria-hidden="true"><i class="fa-solid fa-check"></i></div>' : ''}
+                ${selecting ? `<div class="iig-card-select-mark" aria-hidden="true"><i class="fa-solid fa-check"></i></div>${item.favorite ? '<div class="iig-card-fav-badge" aria-hidden="true"><i class="fa-solid fa-star"></i></div>' : ''}` : `
                 <div class="iig-card-tools">
-                    ${item.imageData ? `<button type="button" class="iig-card-tool iig-card-view" title="Открыть картинку / обрезать" aria-label="Открыть картинку ${escapeHtml(item.name)}"><i class="fa-solid fa-magnifying-glass-plus" aria-hidden="true"></i></button>` : ''}
-                    ${item.imageData ? `<button type="button" class="iig-card-tool iig-card-describe" data-id="${escapeHtml(item.id)}" title="Описать через AI" aria-label="Описать ${escapeHtml(item.name)}"><i class="fa-solid fa-wand-magic-sparkles" aria-hidden="true"></i></button>` : ''}
+                    <button type="button" class="iig-card-tool iig-card-fav${item.favorite ? ' is-on' : ''}" aria-pressed="${!!item.favorite}" title="${item.favorite ? 'Убрать из избранного' : 'В избранное'}" aria-label="${item.favorite ? 'Убрать из избранного' : 'В избранное'}: ${escapeHtml(item.name)}"><i class="fa-${item.favorite ? 'solid' : 'regular'} fa-star" aria-hidden="true"></i></button>
+                    ${hasItemImage(item) ? `<button type="button" class="iig-card-tool iig-card-view" title="Открыть картинку / обрезать" aria-label="Открыть картинку ${escapeHtml(item.name)}"><i class="fa-solid fa-magnifying-glass-plus" aria-hidden="true"></i></button>` : ''}
+                    ${hasItemImage(item) ? `<button type="button" class="iig-card-tool iig-card-describe" data-id="${escapeHtml(item.id)}" title="Описать через AI" aria-label="Описать ${escapeHtml(item.name)}"><i class="fa-solid fa-wand-magic-sparkles" aria-hidden="true"></i></button>` : ''}
                     <button type="button" class="iig-card-tool iig-card-delete" title="Удалить" aria-label="Удалить ${escapeHtml(item.name)}"><i class="fa-solid fa-trash" aria-hidden="true"></i></button>
-                </div>
-            </div>`).join('')}
+                </div>`}
+            </div>`;
+        }).join('')}
            </div>`;
 
     // Footer + description live in one sticky dock so the prompt text and tags stay pinned to the
@@ -8849,7 +9110,7 @@ function renderQuickWardrobeList() {
         <div class="iig-wardrobe-footer">
             <span class="iig-footer-label">Сейчас надето:</span>
             ${activeItem
-                ? `${activeItem.imageData ? `<img src="${imgSrc(activeItem)}" alt="">` : ''}
+                ? `${hasItemImage(activeItem) ? `<img src="${imgSrc(activeItem)}" alt="">` : ''}
                    <span class="iig-footer-name">${escapeHtml(activeItem.name)}</span>
                    <button type="button" class="menu_button iig-footer-clear" title="Снять" aria-label="Снять одежду"><i class="fa-solid fa-xmark"></i></button>`
                 : '<span class="iig-footer-name iig-footer-empty">ничего</span>'}
@@ -8866,7 +9127,34 @@ function renderQuickWardrobeList() {
         </div>` : ''}
         </div>`;
 
-    content.innerHTML = kindSwitch + toolbar + body + footer;
+    const selectedCount = selection.ids.size;
+    const off = selectedCount ? '' : 'disabled';
+    const allVisibleSelected = items.length > 0 && items.every(item => selection.ids.has(item.id));
+    // «Выбрать несколько»: the bottom dock becomes the actions for the ticked outfits.
+    const bulkDock = `
+        <div class="iig-wardrobe-dock iig-wardrobe-bulk" role="region" aria-label="Действия с выбранными нарядами">
+            <div class="iig-bulk-head">
+                <span class="iig-bulk-count">Выбрано: <b>${selectedCount}</b> из ${allItems.length}</span>
+                <button type="button" class="menu_button iig-bulk-all">${allVisibleSelected ? 'Снять все' : 'Все'}</button>
+                <button type="button" class="menu_button iig-bulk-done"><i class="fa-solid fa-check" aria-hidden="true"></i> Готово</button>
+            </div>
+            <div class="iig-bulk-row">
+                <select class="text_pole iig-bulk-category" aria-label="Категория для выбранных" ${off}>
+                    <option value="">Категория…</option>
+                    ${Object.entries(WARDROBE_CATEGORIES).map(([key, label]) => `<option value="${key}">${escapeHtml(label)}</option>`).join('')}
+                </select>
+                <button type="button" class="menu_button iig-bulk-describe" ${off} title="Описать выбранные через AI"><i class="fa-solid fa-wand-magic-sparkles" aria-hidden="true"></i> Описать</button>
+                <button type="button" class="menu_button iig-bulk-delete" ${off} title="Удалить выбранные"><i class="fa-solid fa-trash" aria-hidden="true"></i> Удалить</button>
+            </div>
+            <div class="iig-bulk-row">
+                <input type="text" class="text_pole iig-bulk-tag" list="iig_bulk_tag_list" placeholder="тег, например лето" aria-label="Тег для выбранных" ${off}>
+                <datalist id="iig_bulk_tag_list">${allTags.map(tag => `<option value="${escapeHtml(tag)}"></option>`).join('')}</datalist>
+                <button type="button" class="menu_button iig-bulk-tag-add" ${off} title="Добавить тег выбранным"><i class="fa-solid fa-plus" aria-hidden="true"></i> тег</button>
+                <button type="button" class="menu_button iig-bulk-tag-remove" ${off} title="Убрать тег у выбранных"><i class="fa-solid fa-minus" aria-hidden="true"></i> тег</button>
+            </div>
+        </div>`;
+
+    content.innerHTML = kindSwitch + toolbar + body + (selecting ? bulkDock : footer);
     bindWardrobeKindSwitch(content);
     bindWardrobeToolbar(content);
     bindDescFormatSwitch(content.querySelector('.iig-wardrobe-description'), format => {
@@ -8875,6 +9163,8 @@ function renderQuickWardrobeList() {
     });
     bindWardrobeCards(content, target, activeItem);
     bindWardrobeAdd(content, target);
+    bindWardrobeMoreMenu(content, target);
+    if (selecting) bindWardrobeBulk(content, target, items);
 }
 
 function bindWardrobeKindSwitch(content) {
@@ -8894,7 +9184,7 @@ function renderQuickHairstyleList(content, target, kindSwitch) {
     const items = needle
         ? allItems.filter(item => String(item.name || '').toLowerCase().includes(needle) || String(item.description || '').toLowerCase().includes(needle))
         : allItems;
-    const imgSrc = item => `data:${detectMimeType(item.imageData)};base64,${item.imageData}`;
+    const imgSrc = itemImageSrc;
 
     const toolbar = `
         <div class="iig-wardrobe-toolbar">
@@ -8910,7 +9200,7 @@ function renderQuickHairstyleList(content, target, kindSwitch) {
            </div>`
         : `<div class="iig-wardrobe-grid">${items.map(item => `
             <div class="iig-wardrobe-card ${item.id === activeId ? 'iig-card-active' : ''}" data-id="${escapeHtml(item.id)}" role="button" tabindex="0" aria-pressed="${item.id === activeId}" title="${item.id === activeId ? 'Снять' : 'Выбрать'}">
-                ${item.imageData
+                ${hasItemImage(item)
                     ? `<img class="iig-wardrobe-card-img" src="${imgSrc(item)}" alt="${escapeHtml(item.name)}" draggable="false">`
                     : '<div class="iig-wardrobe-card-img iig-card-placeholder"><i class="fa-solid fa-scissors" aria-hidden="true"></i></div>'}
                 <div class="iig-wardrobe-card-body">
@@ -8919,8 +9209,8 @@ function renderQuickHairstyleList(content, target, kindSwitch) {
                 </div>
                 ${item.id === activeId ? '<div class="iig-card-check" aria-hidden="true"><i class="fa-solid fa-check"></i></div>' : ''}
                 <div class="iig-card-tools">
-                    ${item.imageData ? `<button type="button" class="iig-card-tool iig-card-view" title="Открыть картинку / обрезать" aria-label="Открыть картинку ${escapeHtml(item.name)}"><i class="fa-solid fa-magnifying-glass-plus" aria-hidden="true"></i></button>` : ''}
-                    ${item.imageData ? `<button type="button" class="iig-card-tool iig-card-describe" title="Описать через AI" aria-label="Описать ${escapeHtml(item.name)}"><i class="fa-solid fa-wand-magic-sparkles" aria-hidden="true"></i></button>` : ''}
+                    ${hasItemImage(item) ? `<button type="button" class="iig-card-tool iig-card-view" title="Открыть картинку / обрезать" aria-label="Открыть картинку ${escapeHtml(item.name)}"><i class="fa-solid fa-magnifying-glass-plus" aria-hidden="true"></i></button>` : ''}
+                    ${hasItemImage(item) ? `<button type="button" class="iig-card-tool iig-card-describe" title="Описать через AI" aria-label="Описать ${escapeHtml(item.name)}"><i class="fa-solid fa-wand-magic-sparkles" aria-hidden="true"></i></button>` : ''}
                     <button type="button" class="iig-card-tool iig-card-delete" title="Удалить" aria-label="Удалить ${escapeHtml(item.name)}"><i class="fa-solid fa-trash" aria-hidden="true"></i></button>
                 </div>
             </div>`).join('')}
@@ -8930,7 +9220,7 @@ function renderQuickHairstyleList(content, target, kindSwitch) {
         <div class="iig-wardrobe-footer">
             <span class="iig-footer-label">Сейчас причёска:</span>
             ${activeItem
-                ? `${activeItem.imageData ? `<img src="${imgSrc(activeItem)}" alt="">` : ''}
+                ? `${hasItemImage(activeItem) ? `<img src="${imgSrc(activeItem)}" alt="">` : ''}
                    <span class="iig-footer-name">${escapeHtml(activeItem.name)}</span>
                    <button type="button" class="menu_button iig-footer-clear" title="Снять" aria-label="Снять причёску"><i class="fa-solid fa-xmark"></i></button>`
                 : '<span class="iig-footer-name iig-footer-empty">своя</span>'}
@@ -9064,6 +9354,7 @@ function filterWardrobeItems(items, filter) {
     const needle = String(filter?.search || '').trim().toLowerCase().replace(/^#/, '');
     const tag = String(filter?.tag || '').trim().toLowerCase();
     return items.filter(item => {
+        if (filter?.favOnly && !item.favorite) return false;
         if (category !== 'all' && (item.category || 'full') !== category) return false;
         if (tag && !getWardrobeTags(item).some(known => known.toLowerCase() === tag)) return false;
         if (!needle) return true;
@@ -9071,6 +9362,27 @@ function filterWardrobeItems(items, filter) {
             || String(item.description || '').toLowerCase().includes(needle)
             || getWardrobeTags(item).some(known => known.toLowerCase().includes(needle));
     });
+}
+
+const WARDROBE_SORTS = Object.freeze({ added: 'По добавлению', recent: 'Недавно надетые', name: 'По названию' });
+
+/** Favourites first, then the chosen order. «added» keeps the wardrobe's own order (oldest first). */
+function sortWardrobeItems(items, sort = 'added') {
+    return items
+        .map((item, index) => ({ item, index }))
+        .sort((a, b) => {
+            const fav = Number(Boolean(b.item.favorite)) - Number(Boolean(a.item.favorite));
+            if (fav) return fav;
+            if (sort === 'recent') {
+                const worn = (Number(b.item.lastWornAt) || 0) - (Number(a.item.lastWornAt) || 0);
+                if (worn) return worn;
+            } else if (sort === 'name') {
+                const byName = String(a.item.name || '').localeCompare(String(b.item.name || ''), 'ru', { numeric: true, sensitivity: 'base' });
+                if (byName) return byName;
+            }
+            return a.index - b.index;
+        })
+        .map(entry => entry.item);
 }
 
 function bindWardrobeToolbar(container) {
@@ -9091,6 +9403,18 @@ function bindWardrobeToolbar(container) {
             iigWardrobeFilter.category = radio.value;
             renderQuickWardrobeList();
         });
+    });
+    container.querySelectorAll('input[name="iig_wardrobe_sort"]').forEach(radio => {
+        radio.addEventListener('change', () => {
+            const settings = getSettings();
+            settings.wardrobeSort = Object.hasOwn(WARDROBE_SORTS, radio.value) ? radio.value : 'added';
+            saveSettings();
+            renderQuickWardrobeList();
+        });
+    });
+    container.querySelector('.iig-wardrobe-fav-only')?.addEventListener('change', event => {
+        iigWardrobeFilter.favOnly = event.target.checked;
+        renderQuickWardrobeList();
     });
     container.querySelector('.iig-wardrobe-auto')?.addEventListener('click', () => {
         const settings = getSettings();
@@ -9126,8 +9450,24 @@ function bindWardrobeCards(container, target, activeItem) {
         if (item) toastr[wasActive ? 'info' : 'success'](`${wasActive ? 'Снят' : 'Надет'}: ${item.name}`, 'Гардероб');
     };
 
+    // Click on a card: put on / take off; while «Выбрать несколько» is on: tick / untick.
+    const activate = itemId => {
+        if (!iigWardrobeSelection.active) { toggleItem(itemId); return; }
+        const ids = iigWardrobeSelection.ids;
+        if (ids.has(itemId)) ids.delete(itemId); else ids.add(itemId);
+        renderQuickWardrobeList();
+    };
+
     container.querySelectorAll('.iig-wardrobe-card').forEach(card => {
         const itemId = card.dataset.id;
+        card.querySelector('.iig-card-fav')?.addEventListener('click', event => {
+            event.stopPropagation();
+            const item = settings.wardrobeItems.find(i => i.id === itemId);
+            if (!item) return;
+            item.favorite = !item.favorite;
+            saveSettings();
+            renderQuickWardrobeList();
+        });
         // Click anywhere on the card (picture included) = put on / take off.
         // The picture itself opens only through the dedicated magnifier button.
         card.querySelector('.iig-card-view')?.addEventListener('click', event => {
@@ -9148,7 +9488,7 @@ function bindWardrobeCards(container, target, activeItem) {
         card.querySelector('.iig-card-describe')?.addEventListener('click', async event => {
             event.stopPropagation();
             const item = settings.wardrobeItems.find(i => i.id === itemId);
-            if (!item?.imageData) return;
+            if (!hasItemImage(item)) return;
             const btn = event.currentTarget;
             btn.disabled = true;
             btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin" aria-hidden="true"></i>';
@@ -9165,10 +9505,10 @@ function bindWardrobeCards(container, target, activeItem) {
                 btn.innerHTML = '<i class="fa-solid fa-wand-magic-sparkles" aria-hidden="true"></i>';
             }
         });
-        card.addEventListener('click', () => toggleItem(itemId));
+        card.addEventListener('click', () => activate(itemId));
         card.addEventListener('keydown', event => {
             if (event.target !== card) return;
-            if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); toggleItem(itemId); }
+            if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); activate(itemId); }
         });
     });
 
@@ -9200,6 +9540,243 @@ function bindWardrobeCards(container, target, activeItem) {
     }
 }
 
+/** Wardrobe views that show outfits of this tab: the window and the settings grid. */
+function refreshWardrobeViews(target) {
+    renderQuickWardrobeList();
+    if (target === 'char' || target === 'user') renderWardrobeGrid(target);
+}
+
+/** «⋯» in the outfit toolbar: select several, export, import. */
+function bindWardrobeMoreMenu(content, target) {
+    const menu = content.querySelector('.iig-wardrobe-more');
+    content.querySelector('.iig-wardrobe-select-mode')?.addEventListener('click', () => {
+        const selection = iigWardrobeSelection;
+        selection.active = !selection.active;
+        selection.target = target;
+        selection.ids.clear();
+        renderQuickWardrobeList();
+    });
+    content.querySelector('.iig-wardrobe-export')?.addEventListener('click', async event => {
+        const button = event.currentTarget;
+        button.disabled = true;
+        try {
+            await exportWardrobeToFile();
+        } catch (error) {
+            iigLog('ERROR', `Wardrobe export failed: ${error.message}`);
+            toastr.error(`Экспорт не удался: ${error.message}`, 'Гардероб');
+        } finally {
+            button.disabled = false;
+            if (menu) menu.open = false;
+        }
+    });
+    const importInput = content.querySelector('.iig-wardrobe-import-file');
+    content.querySelector('.iig-wardrobe-import')?.addEventListener('click', () => importInput?.click());
+    importInput?.addEventListener('change', async () => {
+        const file = importInput.files?.[0];
+        importInput.value = '';
+        if (!file) return;
+        try {
+            const { added, skipped, invalid } = await importWardrobeFromFile(file);
+            const extra = [skipped ? `уже были: ${skipped}` : '', invalid ? `пропущено битых: ${invalid}` : ''].filter(Boolean).join(', ');
+            if (added) toastr.success(`Импортировано: ${added}${extra ? ` (${extra})` : ''}`, 'Гардероб');
+            else toastr.info(`Ничего нового${extra ? `: ${extra}` : ''}`, 'Гардероб');
+            updateWardrobeInjection();
+            updateFloatingButtonBadge();
+            refreshWardrobeViews(target);
+            for (const other of ['char', 'user']) { renderWardrobeGrid(other); renderHairstyleGrid(other); }
+        } catch (error) {
+            iigLog('ERROR', `Wardrobe import failed: ${error.message}`);
+            toastr.error(`Импорт не удался: ${error.message}`, 'Гардероб');
+        }
+    });
+}
+
+/** Actions for the ticked outfits (the bottom dock while «Выбрать несколько» is on). */
+function bindWardrobeBulk(content, target, visibleItems) {
+    const settings = getSettings();
+    const selection = iigWardrobeSelection;
+    const selectedItems = () => settings.wardrobeItems.filter(item => item.target === target && selection.ids.has(item.id));
+
+    content.querySelector('.iig-bulk-done')?.addEventListener('click', () => {
+        selection.active = false;
+        selection.ids.clear();
+        renderQuickWardrobeList();
+    });
+    content.querySelector('.iig-bulk-all')?.addEventListener('click', () => {
+        const allSelected = visibleItems.length > 0 && visibleItems.every(item => selection.ids.has(item.id));
+        for (const item of visibleItems) {
+            if (allSelected) selection.ids.delete(item.id); else selection.ids.add(item.id);
+        }
+        renderQuickWardrobeList();
+    });
+    content.querySelector('.iig-bulk-category')?.addEventListener('change', event => {
+        const category = event.target.value;
+        if (!Object.hasOwn(WARDROBE_CATEGORIES, category)) return;
+        const items = selectedItems();
+        for (const item of items) item.category = category;
+        saveSettings();
+        toastr.success(`Категория «${WARDROBE_CATEGORIES[category]}»: ${items.length}`, 'Гардероб');
+        refreshWardrobeViews(target);
+    });
+    const tagInput = content.querySelector('.iig-bulk-tag');
+    const changeTags = add => {
+        const tags = normalizeWardrobeTags(tagInput?.value || '');
+        if (!tags.length) { tagInput?.focus(); return; }
+        const lower = tags.map(tag => tag.toLowerCase());
+        const items = selectedItems();
+        for (const item of items) {
+            item.tags = add
+                ? normalizeWardrobeTags([...getWardrobeTags(item), ...tags])
+                : getWardrobeTags(item).filter(tag => !lower.includes(tag.toLowerCase()));
+        }
+        saveSettings();
+        const shown = tags.map(tag => `#${tag}`).join(' ');
+        const word = tags.length > 1 ? (add ? 'Теги добавлены' : 'Теги убраны') : (add ? 'Тег добавлен' : 'Тег убран');
+        toastr.success(`${word}: ${shown} (нарядов: ${items.length})`, 'Гардероб');
+        refreshWardrobeViews(target);
+    };
+    content.querySelector('.iig-bulk-tag-add')?.addEventListener('click', () => changeTags(true));
+    content.querySelector('.iig-bulk-tag-remove')?.addEventListener('click', () => changeTags(false));
+    tagInput?.addEventListener('keydown', event => {
+        if (event.key === 'Enter') { event.preventDefault(); changeTags(true); }
+    });
+    content.querySelector('.iig-bulk-describe')?.addEventListener('click', () => {
+        const items = selectedItems();
+        const withImage = items.filter(hasItemImage);
+        if (!withImage.length) {
+            toastr.warning('У выбранных нарядов нет картинок: описывать нечего', 'Гардероб');
+            return;
+        }
+        if (withImage.length < items.length) toastr.info(`Без картинки, пропущено: ${items.length - withImage.length}`, 'Гардероб');
+        describeWardrobeItems(withImage);
+    });
+    content.querySelector('.iig-bulk-delete')?.addEventListener('click', () => {
+        const items = selectedItems();
+        if (!items.length || !confirm(`Удалить из гардероба выбранные наряды (${items.length})? Картинки тоже удалятся.`)) return;
+        for (const item of items) removeWardrobeItem(item.id);
+        selection.ids.clear();
+        updateFloatingButtonBadge();
+        saveSettings();
+        toastr.info(`Удалено: ${items.length}`, 'Гардероб');
+        refreshWardrobeViews(target);
+    });
+}
+
+// ---------- Wardrobe export / import ----------
+
+const WARDROBE_EXPORT_FORMAT = 'haruspics-wardrobe';
+
+/** Whole wardrobe (outfits + hairstyles of every tab) with the pictures inside, as one JSON object. */
+async function buildWardrobeExport(settings = getSettings()) {
+    await ensureWardrobeImagesLoaded(settings);
+    const pack = item => {
+        const copy = JSON.parse(JSON.stringify(item));
+        delete copy.imageFile;
+        copy.imageData = item.imageData || null;
+        return copy;
+    };
+    const missing = getWardrobeImageItems(settings).filter(item => item.imageFile && !item.imageData).length;
+    return {
+        missing,
+        data: {
+            format: WARDROBE_EXPORT_FORMAT,
+            version: 1,
+            exportedAt: new Date().toISOString(),
+            wardrobeItems: (settings.wardrobeItems || []).map(pack),
+            hairstyleItems: (settings.hairstyleItems || []).map(pack),
+        },
+    };
+}
+
+async function exportWardrobeToFile() {
+    const { data, missing } = await buildWardrobeExport();
+    if (!data.wardrobeItems.length && !data.hairstyleItems.length) {
+        toastr.info('Гардероб пуст: экспортировать нечего', 'Гардероб');
+        return;
+    }
+    const url = URL.createObjectURL(new Blob([JSON.stringify(data)], { type: 'application/json' }));
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `haruspics-wardrobe-${new Date().toISOString().slice(0, 10)}.json`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+    toastr.success(`Экспортировано: нарядов ${data.wardrobeItems.length}, причёсок ${data.hairstyleItems.length}${missing ? ` (без картинки: ${missing})` : ''}`, 'Гардероб');
+}
+
+const WARDROBE_BASE64_RE = /^[A-Za-z0-9+/]+={0,2}$/;
+
+/** One item from an export file → a clean wardrobe item (known fields only), or null when it is unusable. */
+function sanitizeImportedWardrobeItem(raw, kind) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+    const target = String(raw.target || 'char');
+    const targetOk = kind === 'hair' ? ['char', 'user'].includes(target) : /^(char|user|rpg:[^\s<>"'`]{1,120})$/.test(target);
+    if (!targetOk) return null;
+    const imageData = typeof raw.imageData === 'string' && raw.imageData.length > 16 && WARDROBE_BASE64_RE.test(raw.imageData) ? raw.imageData : null;
+    const prefix = kind === 'hair' ? 'hair_' : 'ward_';
+    const item = {
+        id: typeof raw.id === 'string' && /^[\w-]{1,100}$/.test(raw.id) ? raw.id : `${prefix}${Date.now()}_${Math.random().toString(36).substring(2, 8)}`,
+        name: String(raw.name || (kind === 'hair' ? 'Hairstyle' : 'Outfit')).slice(0, 200),
+        imageData,
+        description: String(raw.description || ''),
+        target,
+        createdAt: Number(raw.createdAt) || Date.now(),
+    };
+    if (raw.descriptions && typeof raw.descriptions === 'object') {
+        item.descriptions = { banana: String(raw.descriptions.banana || ''), novelai: String(raw.descriptions.novelai || '') };
+    }
+    if (kind === 'outfit') {
+        item.category = Object.hasOwn(WARDROBE_CATEGORIES, String(raw.category)) ? String(raw.category) : 'full';
+        item.tags = normalizeWardrobeTags(raw.tags);
+        if (raw.favorite === true) item.favorite = true;
+        if (Number(raw.lastWornAt) > 0) item.lastWornAt = Number(raw.lastWornAt);
+        if (raw.refGen && typeof raw.refGen === 'object') {
+            item.refGen = {
+                sourceDescription: String(raw.refGen.sourceDescription || ''),
+                refinedDescription: String(raw.refGen.refinedDescription || ''),
+                finalPrompt: String(raw.refGen.finalPrompt || ''),
+                flags: normalizeRefGenFlags(raw.refGen.flags),
+                createdAt: Number(raw.refGen.createdAt) || Date.now(),
+            };
+        }
+    }
+    const hasText = item.description || item.descriptions?.banana || item.descriptions?.novelai;
+    return imageData || hasText ? item : null;
+}
+
+/**
+ * Adds the outfits / hairstyles of an export file. Items whose id is already in the wardrobe are skipped, so
+ * importing the same backup twice changes nothing. Pictures land in settings first (safe), then move into files.
+ */
+async function importWardrobeFromFile(file) {
+    let data;
+    try { data = JSON.parse(await file.text()); } catch (_) { throw new Error('это не JSON-файл'); }
+    if (data?.format !== WARDROBE_EXPORT_FORMAT || !Array.isArray(data.wardrobeItems)) throw new Error('это не файл экспорта гардероба');
+    const settings = getSettings();
+    if (!Array.isArray(settings.wardrobeItems)) settings.wardrobeItems = [];
+    if (!Array.isArray(settings.hairstyleItems)) settings.hairstyleItems = [];
+    const known = new Set(getWardrobeImageItems(settings).map(item => item.id));
+    let added = 0;
+    let skipped = 0;
+    let invalid = 0;
+    for (const [list, kind] of [[data.wardrobeItems, 'outfit'], [Array.isArray(data.hairstyleItems) ? data.hairstyleItems : [], 'hair']]) {
+        for (const raw of list) {
+            const item = sanitizeImportedWardrobeItem(raw, kind);
+            if (!item) { invalid++; continue; }
+            if (known.has(item.id)) { skipped++; continue; }
+            known.add(item.id);
+            (kind === 'hair' ? settings.hairstyleItems : settings.wardrobeItems).push(item);
+            added++;
+        }
+    }
+    if (added) {
+        saveSettings();
+        migrateWardrobeImagesToFiles();
+    }
+    return { added, skipped, invalid };
+}
+
 function renderReferenceGenerator(content) {
     const settings = getSettings();
     const s = iigRefGenState;
@@ -9215,7 +9792,7 @@ function renderReferenceGenerator(content) {
             </div>
         </div>`;
     const flag = (key, label) => `<label class="checkbox_label"><input type="checkbox" class="iig-refgen-flag" data-flag="${key}" ${s.flags[key] ? 'checked' : ''}> <span>${label}</span></label>`;
-    const outfits = (settings.wardrobeItems || []).filter(i => i.imageData);
+    const outfits = (settings.wardrobeItems || []).filter(hasItemImage);
     const disabled = s.busy ? 'disabled' : '';
 
     content.innerHTML = `
@@ -9352,9 +9929,9 @@ function bindReferenceGenerator(content) {
     content.querySelectorAll('.iig-refgen-clear').forEach(button => {
         button.addEventListener('click', () => { s[button.dataset.slot] = null; rerender(); });
     });
-    $('#iig_refgen_pick_outfit')?.addEventListener('change', event => {
+    $('#iig_refgen_pick_outfit')?.addEventListener('change', async event => {
         const item = (settings.wardrobeItems || []).find(i => i.id === event.target.value);
-        if (!item?.imageData) return;
+        if (!await ensureItemImageLoaded(item)) return;
         s.outfitImage = item.imageData;
         rerender();
     });
@@ -9426,6 +10003,8 @@ async function refreshExtensionStylesheet() {
         applyImageDisplayMode();
         updateWardrobeInjection();
         updateImageModeInjection();
+        // Old base64 pictures → files, in the background so start-up is not slowed down.
+        setTimeout(() => migrateWardrobeImagesToFiles(), 3000);
         console.log('[IIG] Inline Image Generation v3.0 loaded');
     });
 

@@ -44,6 +44,7 @@ vm.runInContext([
     grab('isModelSafeImageBase64'), grab('normalizeReferenceImages', 'async function'),
     'globalThis.reencodeImageAsJpeg = async () => null;',
     'const naisteraNoRefModels = new Set(); globalThis.naisteraNoRefModels = naisteraNoRefModels;',
+    grabConst('NAISTERA_PRESETS'), 'let lastNaisteraFailure = null;',
     grab('generateImageNaistera', 'async function'),
 ].join('\n'), context);
 

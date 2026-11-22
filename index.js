@@ -3739,6 +3739,97 @@ function describeNaisteraRequest(body) {
     return parts.join(' | ');
 }
 
+/** Naistera presets (its 400 says: «invalid preset (use digital or realism)»). */
+const NAISTERA_PRESETS = ['digital', 'realism'];
+
+/** The last Naistera request that failed (text only, no pictures): what «Проверить Naistera» takes apart. */
+let lastNaisteraFailure = null;
+
+/** One test request to Naistera with the extension's token. Resolves to { ok, status, detail, ms }. */
+async function naisteraProbe(body, signal) {
+    const settings = getSettings();
+    const endpoint = normalizeNaisteraEndpoint(settings.endpoint);
+    const started = Date.now();
+    try {
+        const response = await fetch(`${endpoint}/api/generate`, {
+            method: 'POST',
+            headers: { Authorization: `Bearer ${settings.apiKey}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+            signal,
+        });
+        const text = await response.text().catch(() => '');
+        let data = null;
+        try { data = text ? JSON.parse(text) : null; } catch (_) { /* not JSON */ }
+        if (!response.ok) {
+            return { ok: false, status: response.status, detail: String(data?.detail ? (typeof data.detail === 'string' ? data.detail : JSON.stringify(data.detail)) : text).slice(0, 300), ms: Date.now() - started };
+        }
+        if (data?.job_id && !extractNaisteraDataUrl(data)) data = await pollNaisteraJob(endpoint, data.job_id, settings, signal);
+        const image = extractNaisteraDataUrl(data);
+        return image ? { ok: true, status: response.status, image, ms: Date.now() - started } : { ok: false, status: response.status, detail: 'в ответе нет картинки', ms: Date.now() - started };
+    } catch (error) {
+        return { ok: false, status: 0, detail: error?.message || String(error), ms: Date.now() - started };
+    }
+}
+
+const NAISTERA_TEST_PROMPT = 'A red apple on a wooden table, soft daylight, simple background';
+
+/**
+ * «Проверить Naistera»: finds what Naistera refuses, one change at a time, with the user's own token.
+ *   1. a plain test prompt, 1:1, the selected model (no → the model / token / server, not the extension's text);
+ *   2. the last failed prompt as it was, but 1:1 (yes → the format);
+ *   3. only the scene of that prompt, without character descriptions and style (yes → those; no → the scene text).
+ * Stops as soon as the answer is clear. Successful steps are real generations (they use the quota).
+ */
+async function runNaisteraDiagnostics(onLine = () => {}, signal) {
+    const settings = getSettings();
+    const model = normalizeNaisteraModel(settings.naisteraModel);
+    const lines = [];
+    const say = (text, kind = 'info') => { lines.push({ text, kind }); onLine(text, kind); };
+    const result = probe => probe.ok ? `OK (${Math.round(probe.ms / 1000)} с)` : `ошибка ${probe.status || ''}: ${probe.detail}`;
+    if (!settings.apiKey) { say('Не указан токен Naistera.', 'error'); return { verdict: 'no-token', lines }; }
+    if (!model) { say('Не выбрана модель Naistera.', 'error'); return { verdict: 'no-model', lines }; }
+
+    say(`1. Простой тестовый промпт, 1:1, ${model}…`);
+    const plain = await naisteraProbe({ prompt: NAISTERA_TEST_PROMPT, aspect_ratio: '1:1', model }, signal);
+    say(`   → ${result(plain)}`, plain.ok ? 'ok' : 'error');
+    if (!plain.ok) {
+        say(`Naistera не рисует даже простой запрос моделью ${model}. Текст и настройки расширения тут ни при чём: дело в модели, токене (квота, тариф) или сервере Naistera. Попробуйте другую модель или напишите в поддержку Naistera.`, 'verdict');
+        return { verdict: 'model-or-server', lines };
+    }
+    const last = lastNaisteraFailure;
+    if (!last) {
+        say('Простой запрос работает. Упавших запросов в этой сессии нет: сгенерируйте картинку, которая падает, и запустите проверку ещё раз.', 'verdict');
+        return { verdict: 'plain-ok', lines };
+    }
+    if (last.model !== model) say(`Последний упавший запрос был моделью ${last.model}, проверяю моделью ${model}.`);
+
+    if (last.aspect_ratio !== '1:1') {
+        say(`2. Последний упавший промпт (${last.prompt.length} символов) в формате 1:1 вместо ${last.aspect_ratio}…`);
+        const square = await naisteraProbe({ prompt: last.prompt, aspect_ratio: '1:1', model }, signal);
+        say(`   → ${result(square)}`, square.ok ? 'ok' : 'error');
+        if (square.ok) {
+            say(`В 1:1 этот же промпт рисуется, а в ${last.aspect_ratio} нет: ${model} на Naistera не справляется с форматом ${last.aspect_ratio}. Выберите другой формат.`, 'verdict');
+            return { verdict: 'format', lines };
+        }
+    } else {
+        say('2. Формат последнего запроса уже 1:1, этот шаг пропущен.');
+    }
+
+    if (last.scene && last.scene.trim() && last.scene.trim() !== last.prompt.trim()) {
+        say(`3. Только сцена (${last.scene.length} символов), без описаний персонажей и стиля…`);
+        const scene = await naisteraProbe({ prompt: last.scene, aspect_ratio: last.aspect_ratio, model }, signal);
+        say(`   → ${result(scene)}`, scene.ok ? 'ok' : 'error');
+        if (scene.ok) {
+            say('Сцена рисуется, а с описаниями персонажей / стилем нет. Причина в этих добавках: попробуйте «Описание персонажей → Не отправлять» или сократите внешность в профиле. Полный текст упавшего промпта записан в логи расширения.', 'verdict');
+            return { verdict: 'descriptions', lines };
+        }
+        say('Не рисуется даже сама сцена. Скорее всего, Naistera (Google) отклоняет её содержание: фильтр контента. Перегенерируйте промпт или смягчите его. Полный текст записан в логи расширения.', 'verdict');
+        return { verdict: 'scene', lines };
+    }
+    say('Простой запрос работает, а последний промпт нет, и отделить сцену от добавок нельзя. Скорее всего, Naistera (Google) отклоняет содержание промпта. Полный текст записан в логи расширения.', 'verdict');
+    return { verdict: 'prompt', lines };
+}
+
 /** The only formats Naistera takes (its 400 says: «use 1:1, 16:9, 9:16, 3:2, 2:3, 4:3, 3:4»). */
 const NAISTERA_ASPECT_RATIOS = ['1:1', '16:9', '9:16', '3:2', '2:3', '4:3', '3:4'];
 
@@ -3816,8 +3907,10 @@ async function generateImageNaistera(prompt, style, refData, options = {}) {
         : String(options.negativePrompt || '').trim();
     const negativePrompt = selectedGalleryNegative || String(settings.naisteraNegativePrompt || '').trim();
     if (negativePrompt && modelInfo?.negativePrompt === true) body.negative_prompt = negativePrompt;
-    const preset = String(options.preset ?? settings.naisteraPreset ?? '').trim();
-    if (preset) body.preset = preset;
+    // Naistera takes only «digital» / «realism» (anything else is a 400 «invalid preset»).
+    const preset = String(options.preset ?? settings.naisteraPreset ?? '').trim().toLowerCase();
+    if (NAISTERA_PRESETS.includes(preset)) body.preset = preset;
+    else if (preset) iigLog('WARN', `Naistera: preset "${preset}" is not one of ${NAISTERA_PRESETS.join(', ')}, not sent`);
 
     const sendRefs = imageRefs.length > 0 && modelInfo?.references !== false && !options._noRefs && !naisteraNoRefModels.has(model);
     const refsDropped = imageRefs.length > 0 && (options._noRefs || naisteraNoRefModels.has(model));
@@ -3838,6 +3931,7 @@ async function generateImageNaistera(prompt, style, refData, options = {}) {
     if (settings.naisteraPolling) body.sync = false;
 
     iigLog('INFO', `Naistera request: model=${model}, refs=${body.reference_objects?.length || 0}, polling=${!!settings.naisteraPolling}`);
+    const sentRequest = { scene: String(prompt || ''), prompt: body.prompt, aspect_ratio: body.aspect_ratio, model, preset: body.preset || '', refs: body.reference_objects?.length || 0, at: Date.now() };
 
     // Debug: show ref counts on mobile (temporary diagnostic)
     const refCount = body.reference_objects?.length || 0;
@@ -3868,6 +3962,8 @@ async function generateImageNaistera(prompt, style, refData, options = {}) {
             toastr.warning(`С картинками-референсами Naistera вернула 503, без них картинка получилась. До перезагрузки страницы референсы для ${model} идут текстом. Если так каждый раз, пришлите текст ошибки из логов.`, 'Naistera', { timeOut: 10000 });
             return image;
         }
+        lastNaisteraFailure = { ...sentRequest, status: response.status, detail: text.slice(0, 500) };
+        iigLog('ERROR', `Naistera ${response.status} for this prompt (${body.prompt.length} chars, ${body.aspect_ratio}, ${model}):\n${body.prompt}`);
         throw new Error(`Naistera API error (${response.status}): ${text.slice(0, 800)} [${describeNaisteraRequest(body)}]`);
     }
 
@@ -8158,8 +8254,12 @@ function createSettingsUI() {
                                     </select>
                                 </div>
                                 <div class="flex-row">
-                                    <label>Preset</label>
-                                    <input type="text" id="iig_naistera_preset" class="text_pole flex1" value="${escapeHtml(settings.naisteraPreset || '')}" placeholder="Необязательно">
+                                    <label for="iig_naistera_preset">Preset</label>
+                                    <select id="iig_naistera_preset" class="flex1">
+                                        <option value="" ${NAISTERA_PRESETS.includes(String(settings.naisteraPreset || '').toLowerCase()) ? '' : 'selected'}>Без пресета</option>
+                                        <option value="digital" ${String(settings.naisteraPreset || '').toLowerCase() === 'digital' ? 'selected' : ''}>Digital</option>
+                                        <option value="realism" ${String(settings.naisteraPreset || '').toLowerCase() === 'realism' ? 'selected' : ''}>Realism</option>
+                                    </select>
                                 </div>
                                 <div class="flex-row">
                                     <label>Negative prompt</label>
@@ -8184,6 +8284,14 @@ function createSettingsUI() {
                                 <div class="flex-row">
                                     <label>Таймаут polling (мс)</label>
                                     <input type="number" id="iig_naistera_poll_timeout" class="text_pole" value="${settings.naisteraPollTimeoutMs}" min="30000" max="900000" step="10000">
+                                </div>
+                                <div class="iig-naistera-check">
+                                    <div class="flex-row">
+                                        <button type="button" class="menu_button" id="iig_naistera_check"><i class="fa-solid fa-stethoscope" aria-hidden="true"></i> Проверить Naistera</button>
+                                        <button type="button" class="menu_button" id="iig_naistera_copy_failed" title="Текст последнего запроса, на котором Naistera выдала ошибку"><i class="fa-solid fa-copy" aria-hidden="true"></i> Упавший промпт</button>
+                                    </div>
+                                    <p class="hint">Находит, что именно Naistera не принимает: модель, формат, описания персонажей или текст сцены. Делает до 3 тестовых генераций, удачные тратят квоту.</p>
+                                    <div id="iig_naistera_check_result" class="iig-naistera-check-result" role="status" aria-live="polite"></div>
                                 </div>
                             </div>
 
@@ -8717,7 +8825,38 @@ function bindSettingsEvents() {
     });
 
     document.getElementById('iig_naistera_aspect_ratio')?.addEventListener('change', (e) => { settings.naisteraAspectRatio = e.target.value; saveSettings(); });
-    document.getElementById('iig_naistera_preset')?.addEventListener('input', (e) => { settings.naisteraPreset = e.target.value; saveSettings(); });
+    document.getElementById('iig_naistera_preset')?.addEventListener('change', (e) => { settings.naisteraPreset = NAISTERA_PRESETS.includes(e.target.value) ? e.target.value : ''; saveSettings(); });
+    document.getElementById('iig_naistera_check')?.addEventListener('click', async (e) => {
+        const button = e.currentTarget;
+        const out = document.getElementById('iig_naistera_check_result');
+        if (!confirm('Проверка отправит в Naistera до 3 тестовых генераций (удачные расходуют квоту). Продолжить?')) return;
+        button.disabled = true;
+        if (out) out.innerHTML = '';
+        const line = (text, kind) => {
+            if (!out) return;
+            const row = document.createElement('div');
+            row.className = `iig-check-line is-${kind}`;
+            row.textContent = text;
+            out.appendChild(row);
+        };
+        try {
+            const { verdict } = await runNaisteraDiagnostics(line);
+            iigLog('INFO', `Naistera check: ${verdict}`);
+        } catch (error) {
+            line(`Проверка прервалась: ${error.message}`, 'error');
+        } finally {
+            button.disabled = false;
+        }
+    });
+    document.getElementById('iig_naistera_copy_failed')?.addEventListener('click', async () => {
+        if (!lastNaisteraFailure) { toastr.info('В этой сессии запросов с ошибкой Naistera не было', 'Naistera'); return; }
+        try {
+            await navigator.clipboard.writeText(lastNaisteraFailure.prompt);
+            toastr.success(`Скопировано: ${lastNaisteraFailure.prompt.length} символов (${lastNaisteraFailure.aspect_ratio}, ${lastNaisteraFailure.model})`, 'Naistera');
+        } catch (_) {
+            toastr.error('Буфер обмена недоступен: текст есть в логах расширения', 'Naistera');
+        }
+    });
     document.getElementById('iig_naistera_negative_prompt')?.addEventListener('input', (e) => { settings.naisteraNegativePrompt = e.target.value; saveSettings(); });
     document.getElementById('iig_naistera_character_descriptions')?.addEventListener('change', (e) => { settings.naisteraCharacterDescriptionsMode = e.target.value; saveSettings(); });
     document.getElementById('iig_naistera_send_char_avatar')?.addEventListener('change', (e) => { settings.naisteraSendCharAvatar = e.target.checked; saveSettings(); });
@@ -9052,7 +9191,7 @@ function bindSettingsEvents() {
             }
             if (naisteraModelEl) naisteraModelEl.innerHTML = `<option value="${escapeHtml(s.naisteraModel || '')}" selected>${escapeHtml(s.naisteraModel || 'Выберите модель')}</option>`;
             if (naisteraAspectEl) naisteraAspectEl.value = s.naisteraAspectRatio || '1:1';
-            if (naisteraPresetEl) naisteraPresetEl.value = s.naisteraPreset || '';
+            if (naisteraPresetEl) naisteraPresetEl.value = NAISTERA_PRESETS.includes(String(s.naisteraPreset || '').toLowerCase()) ? String(s.naisteraPreset).toLowerCase() : '';
             if (naisteraNegativeEl) naisteraNegativeEl.value = s.naisteraNegativePrompt || '';
             if (naisteraDescriptionsEl) naisteraDescriptionsEl.value = s.naisteraCharacterDescriptionsMode || 'as-is';
             if (naisteraPollingEl) naisteraPollingEl.checked = !!s.naisteraPolling;

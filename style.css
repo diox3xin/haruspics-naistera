@@ -2268,3 +2268,12 @@ button.iig-wardrobe-tag:focus-visible { border-color: var(--iig-wr-accent); outl
 }
 .iig-wardrobe-dock.is-collapsed { padding-bottom: 0; }
 .iig-wardrobe-dock.is-collapsed .iig-wardrobe-description { display: none; }
+
+/* «Проверить Naistera»: step-by-step result */
+.iig-naistera-check { margin-top: 10px; padding-top: 8px; border-top: 1px solid rgba(255, 255, 255, .08); }
+.iig-naistera-check .menu_button { display: inline-flex; align-items: center; gap: 6px; }
+.iig-naistera-check-result { display: flex; flex-direction: column; gap: 3px; font-size: 13px; line-height: 1.35; }
+.iig-check-line { white-space: pre-wrap; word-break: break-word; color: #cfc8c8; }
+.iig-check-line.is-ok { color: #8fd18f; }
+.iig-check-line.is-error { color: #f08a8a; }
+.iig-check-line.is-verdict { margin-top: 4px; padding: 6px 8px; border-radius: 6px; background: rgba(255, 182, 193, .08); border: 1px solid rgba(255, 182, 193, .25); color: #eee; }

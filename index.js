@@ -8842,7 +8842,10 @@ function renderQuickWardrobeList() {
             </div>`).join('')}
            </div>`;
 
+    // Footer + description live in one sticky dock so the prompt text and tags stay pinned to the
+    // bottom of the window while the outfit grid scrolls under them (like a chat input box).
     const footer = `
+        <div class="iig-wardrobe-dock">
         <div class="iig-wardrobe-footer">
             <span class="iig-footer-label">Сейчас надето:</span>
             ${activeItem
@@ -8860,7 +8863,8 @@ function renderQuickWardrobeList() {
             <textarea id="iig_wardrobe_desc_${escapeHtml(activeItem.id)}" class="text_pole" rows="3" placeholder="Описание одежды, которое будет передано в промпт">${escapeHtml(getItemDescription(activeItem, getVisionDescFormat(), false))}</textarea>
             ${tagsVisible ? `<label class="iig-wardrobe-tags-label"><span><i class="fa-solid fa-tags" aria-hidden="true"></i> Теги <small>(через запятую, в промпт не идут)</small></span>
                 <input type="text" class="text_pole iig-wardrobe-tags-input" value="${escapeHtml(getWardrobeTags(activeItem).join(', '))}" placeholder="лето, casual, вечернее"></label>` : ''}
-        </div>` : ''}`;
+        </div>` : ''}
+        </div>`;
 
     content.innerHTML = kindSwitch + toolbar + body + footer;
     bindWardrobeKindSwitch(content);
@@ -8922,6 +8926,7 @@ function renderQuickHairstyleList(content, target, kindSwitch) {
             </div>`).join('')}
            </div>`;
     const footer = `
+        <div class="iig-wardrobe-dock">
         <div class="iig-wardrobe-footer">
             <span class="iig-footer-label">Сейчас причёска:</span>
             ${activeItem
@@ -8937,7 +8942,8 @@ function renderQuickHairstyleList(content, target, kindSwitch) {
                 ${descFormatSwitchHtml(getVisionDescFormat(), ensureItemDescriptions(activeItem).descriptions)}
             </div>
             <textarea id="iig_hair_desc_${escapeHtml(activeItem.id)}" class="text_pole iig-hair-desc" rows="3" placeholder="Описание причёски, которое будет передано в промпт">${escapeHtml(getItemDescription(activeItem, getVisionDescFormat(), false))}</textarea>
-        </div>` : ''}`;
+        </div>` : ''}
+        </div>`;
 
     content.innerHTML = kindSwitch + toolbar + body + footer;
     bindWardrobeKindSwitch(content);

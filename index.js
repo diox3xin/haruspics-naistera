@@ -116,6 +116,7 @@ const defaultSettings = Object.freeze({
     characterLibrarySelectedKey: '',
     wardrobeItems: [],
     wardrobeSort: 'added',
+    wardrobeDockCollapsed: false,
     // «Авто» in the wardrobe: a newly added outfit picture is described by the description model right away.
     wardrobeAutoDescribe: false,
     // Tags on the outfit cards and the tag filter row are shown (the «Теги» button hides them).
@@ -2617,6 +2618,11 @@ async function generateReferenceImage(state, onStatus, signal) {
             throw new Error('Заполните endpoint, ключ и модель генератора референсов');
         }
         onStatus?.('Генерация (свой API)...');
+        if (isCloseRouterEndpoint(settings.refGenEndpoint)) {
+            const api = { endpoint: settings.refGenEndpoint, apiKey: settings.refGenApiKey, model: settings.refGenModel };
+            const refData = { imageRefs, textOnlyClothing: [], textDirectives: [] };
+            return imageResultToBase64(await generateImageCloseRouter(prompt, '', refData, { api, aspectRatio: '2:3', negativePrompt: '', signal }));
+        }
         const content = [{ type: 'text', text: prompt }];
         for (const ref of imageRefs) content.push({ type: 'image_url', image_url: { url: `data:${ref.mimeType};base64,${ref.data}` } });
         const response = await fetch(buildOpenAIUrl(settings.refGenEndpoint, 'chat/completions'), {
@@ -4386,6 +4392,196 @@ async function generateImageOpenAIChat(prompt, style, refData, options = {}) {
 }
 
 // ============================================================
+// IMAGE GENERATION: CloseRouter (images API)
+// ============================================================
+//
+// CloseRouter serves every image model (Nano Banana / Gemini image, GPT Image, Imagen, FLUX…) only on
+// /v1/images/generations and /v1/images/edits; Gemini image is NOT available on /chat/completions there
+// ("endpoint not supported"). Rules from closerouter.dev/docs/image-reference:
+// - `size` sets only the proportions; Gemini resolution goes into `input.resolution` (1K/2K/4K, flash-lite: 1K only);
+// - fields outside the documented list are rejected, so no negative_prompt / aspect_ratio fields;
+// - reference pictures go to /images/edits as JSON `images` (data: URLs); text-only models (flash-lite, Imagen…) have
+//   no edits — their references are passed as text;
+// - 200 → data[].b64_json / url; 202 with object=image.request → poll GET /v1/media/requests/{id}.
+
+function isCloseRouterEndpoint(endpoint) {
+    return /closerouter/i.test(String(endpoint || ''));
+}
+
+/** closerouter.dev (the site) → api.closerouter.dev (the API). Any other address stays as it is. */
+function closeRouterBaseUrl(endpoint) {
+    return normalizeOpenAIBaseUrl(endpoint).replace(/^(https?:\/\/)(www\.)?closerouter\.dev(?=\/|$)/i, '$1api.closerouter.dev');
+}
+
+/** CloseRouter model ids are "provider/model": "gemini-3.1-flash-lite-image" → "google/gemini-3.1-flash-lite-image". */
+function closeRouterModelId(model) {
+    const id = String(model || '').trim();
+    if (!id || id.includes('/')) return id;
+    if (/^(gemini|imagen|nano-banana)/i.test(id)) return `google/${id}`;
+    if (/^(gpt-image|dall-e)/i.test(id)) return `openai/${id}`;
+    return id;
+}
+
+/** "W:H" → a "WxH" size with the same proportions (CloseRouter reads only the proportions from it). */
+function closeRouterSizeFor(aspectRatio, fallbackSize) {
+    const [w, h] = String(aspectRatio || '').split(':').map(Number);
+    if (w > 0 && h > 0) {
+        const long = 1024;
+        const short = Math.max(64, Math.round((long * Math.min(w, h) / Math.max(w, h)) / 8) * 8);
+        return w >= h ? `${long}x${short}` : `${short}x${long}`;
+    }
+    const size = String(fallbackSize || '');
+    return /^\d+x\d+$/.test(size) ? size : null;
+}
+
+/** Models that turned out to have no /images/edits (text input only) this session. */
+const closeRouterTextOnlyModels = new Set();
+
+/** Does this model take reference pictures? flash-lite and Imagen are text-only; others are learned on the first refusal. */
+function closeRouterTakesImages(modelId) {
+    return !/lite-image|imagen/i.test(modelId) && !closeRouterTextOnlyModels.has(modelId);
+}
+
+function isCloseRouterEndpointRefusal(status, text) {
+    return [400, 404, 405, 422].includes(status)
+        && /endpoint|operation|edits|not supported|unsupported|not available|не поддерж|недоступ/i.test(String(text || ''));
+}
+
+/** The error message from CloseRouter's JSON ({error:{message}}), or the raw text. */
+function closeRouterErrorText(text) {
+    try {
+        const data = JSON.parse(text);
+        const message = data?.error?.message || data?.message;
+        if (message) return String(message);
+    } catch (_) { /* not JSON */ }
+    return String(text || '').slice(0, 500);
+}
+
+function buildCloseRouterPrompt(prompt, style, refData, negative, withImages) {
+    const { imageRefs = [], textOnlyClothing = [], textDirectives = [] } = refData || {};
+    const parts = [];
+    if (style) parts.push(`[Style: ${style}]`);
+    parts.push(...textDirectives);
+    for (const c of textOnlyClothing) parts.push(`[CLOTHING: ${c.charName} is wearing: ${c.description}]`);
+    if (withImages && imageRefs.length) {
+        parts.push(buildReferenceLegend(imageRefs));
+    } else {
+        // No pictures go out: outfit descriptions still reach the model as text (hairstyles are already in the directives).
+        for (const ref of imageRefs) {
+            if (ref.type === 'clothing' && ref.description) parts.push(`[CLOTHING for ${ref.name}: ${ref.description}]`);
+        }
+    }
+    parts.push(prompt);
+    if (negative) parts.push(`Avoid: ${negative}`);
+    return parts.join('\n\n');
+}
+
+function sleepWithSignal(ms, signal) {
+    return new Promise((resolve, reject) => {
+        if (signal?.aborted) { reject(new DOMException('Aborted', 'AbortError')); return; }
+        const timer = setTimeout(resolve, ms);
+        signal?.addEventListener('abort', () => { clearTimeout(timer); reject(new DOMException('Aborted', 'AbortError')); }, { once: true });
+    });
+}
+
+function parseCloseRouterImage(result) {
+    return parseImageFromApiResponse(result)
+        || parseImageFromApiResponse(result?.result)
+        || parseImageFromApiResponse(result?.response)
+        || parseImageFromApiResponse(result?.output)
+        || parseImageFromApiResponse({ data: result?.results || result?.outputs || [] });
+}
+
+/** 202 «image.request»: the picture is still being made — poll its status (a new POST would pay for a new picture). */
+async function waitCloseRouterRequest(base, apiKey, request, signal, pollMs = 3000) {
+    const id = request?.id || request?.request_id;
+    if (!id) throw new Error('CloseRouter: генерация принята, но без id задачи');
+    for (let i = 0; i < 200; i++) {
+        await sleepWithSignal(pollMs, signal);
+        const response = await fetch(`${base}/v1/media/requests/${encodeURIComponent(id)}`, { headers: buildAuthHeaders(apiKey), signal });
+        if (!response.ok) {
+            if (response.status === 429 || response.status >= 500) continue;
+            throw new Error(`CloseRouter (${response.status}): ${closeRouterErrorText(await response.text())}`);
+        }
+        const data = await response.json();
+        if (parseCloseRouterImage(data)) return data;
+        const status = String(data?.status || data?.state || '').toLowerCase();
+        if (/fail|error|cancel|expired|outcome_unknown|rejected/.test(status)) {
+            const detail = data?.error?.message || data?.error || '';
+            throw new Error(`CloseRouter: генерация не удалась (${status})${detail ? `: ${typeof detail === 'string' ? detail : JSON.stringify(detail)}` : ''}`);
+        }
+    }
+    throw new Error('CloseRouter: картинка так и не пришла (задача ' + id + ')');
+}
+
+async function generateImageCloseRouter(prompt, style, refData, options = {}) {
+    const settings = getSettings();
+    // options.api: another endpoint / key / model (the reference generator's own API).
+    const api = options.api || settings;
+    const base = closeRouterBaseUrl(api.endpoint);
+    const model = closeRouterModelId(api.model);
+    const imageRefs = refData?.imageRefs || [];
+    const sendImages = imageRefs.length > 0 && closeRouterTakesImages(model);
+    if (imageRefs.length > 0 && !sendImages && !options._refsNoticeShown) {
+        toastr.info(`${model} не принимает картинки-референсы: лица и одежда переданы только текстом`, 'CloseRouter', { timeOut: 5000 });
+    }
+    const negative = options.negativePrompt == null ? getActiveNegativePrompt() : String(options.negativePrompt || '').trim();
+    const aspectRatio = options.aspectRatio || (settings.aspectRatio !== RANDOM_ASPECT_RATIO ? settings.aspectRatio : '');
+    const resolution = options.imageSize || settings.imageSize;
+
+    const body = {
+        model,
+        prompt: buildCloseRouterPrompt(prompt, style, refData, negative, sendImages),
+        n: 1,
+        response_format: 'b64_json',
+    };
+    const size = closeRouterSizeFor(aspectRatio, settings.size);
+    if (size) body.size = size;
+    // Gemini Pro / Flash: 1K, 2K, 4K. flash-lite takes only 1K, which is its default anyway.
+    if (isGeminiModel(model) && !/lite-image/i.test(model) && /^[124]K$/.test(String(resolution || ''))) body.input = { resolution };
+    if (sendImages) body.images = imageRefs.map(ref => `data:${ref.mimeType};base64,${ref.data}`);
+
+    const path = sendImages ? 'images/edits' : 'images/generations';
+    iigLog('INFO', `CloseRouter Request: ${path}, model=${model}, size=${body.size || '-'}, resolution=${body.input?.resolution || '-'}, refs=${sendImages ? imageRefs.length : 0}, prompt=${body.prompt.length} chars`);
+
+    const post = () => fetch(`${base}/v1/${path}`, {
+        method: 'POST',
+        headers: buildAuthHeaders(api.apiKey, { 'Content-Type': 'application/json' }),
+        body: JSON.stringify(body),
+        signal: options.signal,
+    });
+    let response = await post();
+    if (!response.ok) {
+        let text = await response.text();
+        // A resolution the model does not offer is refused before the run: draw in its default size instead.
+        if (response.status === 400 && body.input && /resolution/i.test(text)) {
+            iigLog('WARN', `CloseRouter: ${model} refused resolution ${body.input.resolution}, retrying without it`);
+            delete body.input;
+            response = await post();
+            if (!response.ok) text = await response.text();
+        }
+        if (!response.ok) {
+            // No /images/edits for this model: remember it and draw from text only.
+            if (sendImages && isCloseRouterEndpointRefusal(response.status, text)) {
+                closeRouterTextOnlyModels.add(model);
+                iigLog('WARN', `CloseRouter: ${model} has no images/edits (${response.status}), retrying text-only`);
+                toastr.info(`${model} не принимает картинки-референсы: лица и одежда переданы только текстом`, 'CloseRouter', { timeOut: 5000 });
+                return generateImageCloseRouter(prompt, style, refData, { ...options, _refsNoticeShown: true });
+            }
+            throw new Error(`API Error (${response.status}): ${closeRouterErrorText(text)}`);
+        }
+    }
+
+    let result = await response.json();
+    if (!parseCloseRouterImage(result) && (response.status === 202 || result?.object === 'image.request')) {
+        result = await waitCloseRouterRequest(base, api.apiKey, result, options.signal);
+    }
+    const image = parseCloseRouterImage(result);
+    if (!image) throw new Error('CloseRouter: в ответе нет картинки');
+    return image;
+}
+
+// ============================================================
 // IMAGE GENERATION: Gemini (nano-banana)
 // ============================================================
 
@@ -4626,6 +4822,10 @@ async function generateImageWithRetry(prompt, style, onStatusUpdate, options = {
             }
             if (['novelai', 'novelai-direct'].includes(settings.apiType)) {
                 return await generateImageNovelAI(prompt, style, refData, genOptions);
+            }
+            // CloseRouter has image models only on /images/generations and /images/edits, never on chat/completions.
+            if (isCloseRouterEndpoint(settings.endpoint) && ['openai', 'openai-chat', 'gemini'].includes(settings.apiType)) {
+                return await generateImageCloseRouter(prompt, style, refData, genOptions);
             }
             const useChatApi = settings.apiType === 'openai-chat' ||
                 (isRouterApi && (settings.apiType === 'openai' || settings.apiType === 'gemini'));
@@ -9106,13 +9306,14 @@ function renderQuickWardrobeList() {
     // Footer + description live in one sticky dock so the prompt text and tags stay pinned to the
     // bottom of the window while the outfit grid scrolls under them (like a chat input box).
     const footer = `
-        <div class="iig-wardrobe-dock">
+        <div class="iig-wardrobe-dock${activeItem && settings.wardrobeDockCollapsed ? ' is-collapsed' : ''}">
         <div class="iig-wardrobe-footer">
             <span class="iig-footer-label">Сейчас надето:</span>
             ${activeItem
                 ? `${hasItemImage(activeItem) ? `<img src="${imgSrc(activeItem)}" alt="">` : ''}
                    <span class="iig-footer-name">${escapeHtml(activeItem.name)}</span>
-                   <button type="button" class="menu_button iig-footer-clear" title="Снять" aria-label="Снять одежду"><i class="fa-solid fa-xmark"></i></button>`
+                   <button type="button" class="menu_button iig-footer-clear" title="Снять" aria-label="Снять одежду"><i class="fa-solid fa-xmark"></i></button>
+                   ${wardrobeDockToggleHtml(settings.wardrobeDockCollapsed)}`
                 : '<span class="iig-footer-name iig-footer-empty">ничего</span>'}
         </div>
         ${activeItem ? `
@@ -9164,7 +9365,55 @@ function renderQuickWardrobeList() {
     bindWardrobeCards(content, target, activeItem);
     bindWardrobeAdd(content, target);
     bindWardrobeMoreMenu(content, target);
+    bindWardrobeDockToggle(content);
     if (selecting) bindWardrobeBulk(content, target, items);
+}
+
+/** Chevron in the «Сейчас надето» row: hides / shows the description and tags under it. */
+function wardrobeDockToggleHtml(collapsed) {
+    const label = collapsed ? 'Показать описание и теги' : 'Скрыть описание и теги';
+    return `<button type="button" class="menu_button iig-dock-toggle" aria-expanded="${!collapsed}" title="${label}" aria-label="${label}"><i class="fa-solid fa-chevron-${collapsed ? 'up' : 'down'}" aria-hidden="true"></i></button>`;
+}
+
+/**
+ * Takes the focus from a field inside `container` so its «save on blur / change» handlers run. When the browser
+ * does not fire those events itself (the window is not focused), they are dispatched by hand — exactly once.
+ */
+function flushFocusedField(container) {
+    const field = container.contains(document.activeElement) ? document.activeElement : null;
+    if (!field || !('value' in field)) return;
+    let fired = false;
+    const mark = () => { fired = true; };
+    field.addEventListener('blur', mark, { once: true });
+    field.blur();
+    field.removeEventListener('blur', mark);
+    if (fired) return;
+    if (field.tagName === 'INPUT') field.dispatchEvent(new Event('change', { bubbles: true }));
+    field.dispatchEvent(new FocusEvent('blur'));
+}
+
+/** Collapses the bottom dock to one row (or opens it again); remembered between openings of the wardrobe. */
+function bindWardrobeDockToggle(content) {
+    const dock = content.querySelector('.iig-wardrobe-dock:not(.iig-wardrobe-bulk)');
+    const button = dock?.querySelector('.iig-dock-toggle');
+    if (!button) return;
+    button.addEventListener('click', event => {
+        event.stopPropagation();
+        const settings = getSettings();
+        settings.wardrobeDockCollapsed = !settings.wardrobeDockCollapsed;
+        saveSettings();
+        // No re-render: the text being typed stays as it is. A field that has the focus is saved first:
+        // its own «save on blur / change» handlers run (hiding a focused field fires no blur in some browsers).
+        flushFocusedField(dock);
+        if (!dock.isConnected) return; // the tags field re-rendered the wardrobe, already in the new state
+        const collapsed = settings.wardrobeDockCollapsed;
+        dock.classList.toggle('is-collapsed', collapsed);
+        const label = collapsed ? 'Показать описание и теги' : 'Скрыть описание и теги';
+        button.setAttribute('aria-expanded', String(!collapsed));
+        button.title = label;
+        button.setAttribute('aria-label', label);
+        button.innerHTML = `<i class="fa-solid fa-chevron-${collapsed ? 'up' : 'down'}" aria-hidden="true"></i>`;
+    });
 }
 
 function bindWardrobeKindSwitch(content) {
@@ -9216,13 +9465,14 @@ function renderQuickHairstyleList(content, target, kindSwitch) {
             </div>`).join('')}
            </div>`;
     const footer = `
-        <div class="iig-wardrobe-dock">
+        <div class="iig-wardrobe-dock${activeItem && settings.wardrobeDockCollapsed ? ' is-collapsed' : ''}">
         <div class="iig-wardrobe-footer">
             <span class="iig-footer-label">Сейчас причёска:</span>
             ${activeItem
                 ? `${hasItemImage(activeItem) ? `<img src="${imgSrc(activeItem)}" alt="">` : ''}
                    <span class="iig-footer-name">${escapeHtml(activeItem.name)}</span>
-                   <button type="button" class="menu_button iig-footer-clear" title="Снять" aria-label="Снять причёску"><i class="fa-solid fa-xmark"></i></button>`
+                   <button type="button" class="menu_button iig-footer-clear" title="Снять" aria-label="Снять причёску"><i class="fa-solid fa-xmark"></i></button>
+                   ${wardrobeDockToggleHtml(settings.wardrobeDockCollapsed)}`
                 : '<span class="iig-footer-name iig-footer-empty">своя</span>'}
         </div>
         ${activeItem ? `
@@ -9238,6 +9488,7 @@ function renderQuickHairstyleList(content, target, kindSwitch) {
     content.innerHTML = kindSwitch + toolbar + body + footer;
     bindWardrobeKindSwitch(content);
     bindWardrobeToolbar(content);
+    bindWardrobeDockToggle(content);
     bindDescFormatSwitch(content.querySelector('.iig-wardrobe-description'), format => {
         setWardrobeDescFormat(format);
         renderQuickWardrobeList();

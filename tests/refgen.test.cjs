@@ -21,6 +21,7 @@ function load(overrides = {}) {
         detectMimeType: () => 'image/png',
         buildOpenAIUrl: (base, p) => `${base}/v1/${p}`,
         buildAuthHeaders: (key, extra) => ({ ...extra, Authorization: `Bearer ${key}` }),
+        isCloseRouterEndpoint: endpoint => /closerouter/i.test(String(endpoint || '')),
         parseImageFromApiResponse: r => r.image || null,
         toastr: { warning() {}, error() {}, success() {} },
         addWardrobeItem: (name, imageData, target, category) => {

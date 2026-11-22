@@ -2257,3 +2257,14 @@ button.iig-wardrobe-tag:focus-visible { border-color: var(--iig-wr-accent); outl
 /* The filter button sits on the left (on phones it starts the second toolbar row): its menu opens to the right,
    so it never leaves the window. «⋯» is near the right edge and keeps opening to the left. */
 .iig-wardrobe-filter:not(.iig-wardrobe-more) > .iig-wardrobe-filter-menu { left: 0; right: auto; }
+
+/* Chevron that hides the description + tags of the bottom dock (one row stays, like a minimised chat box) */
+.iig-dock-toggle {
+    margin: 0 !important;
+    padding: 4px 8px !important;
+    min-width: 32px;
+    min-height: 32px;
+    flex-shrink: 0;
+}
+.iig-wardrobe-dock.is-collapsed { padding-bottom: 0; }
+.iig-wardrobe-dock.is-collapsed .iig-wardrobe-description { display: none; }

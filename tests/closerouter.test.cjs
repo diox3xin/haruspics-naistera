@@ -38,7 +38,7 @@ vm.runInContext([
     grab('normalizeReturnedImage'), grab('extractImageFromText'), grab('parseImageFromApiResponse'), grab('buildReferenceLegend'),
     grab('isCloseRouterEndpoint'), grab('closeRouterBaseUrl'), grab('closeRouterModelId'), grab('closeRouterSizeFor'),
     'const closeRouterTextOnlyModels = new Set(); globalThis.closeRouterTextOnlyModels = closeRouterTextOnlyModels;',
-    grab('closeRouterTakesImages'), grab('isCloseRouterEndpointRefusal'), grab('closeRouterErrorText'), grab('buildCloseRouterPrompt'),
+    grab('closeRouterTakesImages'), grab('closeRouterErrorText'), grab('buildCloseRouterPrompt'),
     grab('sleepWithSignal'), grab('parseCloseRouterImage'), grab('waitCloseRouterRequest', 'async function'),
     grab('generateImageCloseRouter', 'async function'),
 ].join('\n'), context);
@@ -63,16 +63,22 @@ test('addresses, model ids and sizes', () => {
     assert.equal(context.closeRouterSizeFor('', 'auto'), null);
 });
 
-test('flash-lite: /images/generations, text only, no unknown fields, references become text', async () => {
+test('flash-lite is tried with references; on a refusal it draws from text, no unknown fields, refs become text', async () => {
     reset({ negative: 'blurry' });
-    answers = [[200, { data: [{ b64_json: PNG }], usage: { cost_usd: 0.045 } }]];
+    answers = [
+        [400, { error: { code: 'invalid_request', message: 'Bad request' } }], // wording is not relied on
+        [200, { data: [{ b64_json: PNG }], usage: { cost_usd: 0.045 } }],
+    ];
     const image = await context.generateImageCloseRouter('a girl in a park', 'anime', {
         imageRefs: [ref('face', 'Hero'), ref('clothing', 'Hero', { outfitName: 'Shirt', description: 'white striped shirt' })],
         textDirectives: ['[HAIRSTYLE INSTRUCTION for "Hero"]: braid'], textOnlyClothing: [],
     }, { aspectRatio: '3:4' });
     assert.equal(image, `data:image/png;base64,${PNG}`);
-    assert.equal(calls.length, 1);
-    const [call] = calls;
+    assert.equal(calls.length, 2);
+    assert.equal(calls[0].url, 'https://api.closerouter.dev/v1/images/edits');
+    assert.equal(calls[0].body.images.length, 2, 'no hard-coded «lite = text only»');
+    assert.equal(calls[0].body.input, undefined, 'flash-lite: 1K only (documented), no resolution field');
+    const call = calls[1];
     assert.equal(call.url, 'https://api.closerouter.dev/v1/images/generations');
     assert.equal(call.auth, 'Bearer closerouter_abc');
     assert.equal(call.body.model, 'google/gemini-3.1-flash-lite-image');
@@ -83,6 +89,32 @@ test('flash-lite: /images/generations, text only, no unknown fields, references 
     assert.match(call.body.prompt, /braid/);
     assert.match(call.body.prompt, /Avoid: blurry$/);
     assert.match(toasts[0], /не принимает картинки-референсы/);
+    assert.equal(toasts.length, 1);
+
+    // remembered for the session: the next picture goes straight to generations
+    answers = [[200, { data: [{ b64_json: PNG }] }]];
+    await context.generateImageCloseRouter('scene', '', { imageRefs: [ref('face', 'Hero')] }, {});
+    assert.equal(calls[2].url, 'https://api.closerouter.dev/v1/images/generations');
+});
+
+test('if CloseRouter takes references for flash-lite, they are sent', async () => {
+    reset();
+    answers = [[200, { data: [{ b64_json: PNG }] }]];
+    await context.generateImageCloseRouter('scene', '', { imageRefs: [ref('clothing', 'Hero')] }, {});
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].url, 'https://api.closerouter.dev/v1/images/edits');
+    assert.equal(toasts.length, 0);
+});
+
+test('an edits error that also fails from text does not switch references off', async () => {
+    reset({ model: 'google/gemini-3.1-flash-image-preview' });
+    answers = [
+        [400, { error: { code: 'content_policy', message: 'Prompt was rejected by moderation' } }],
+        [400, { error: { code: 'content_policy', message: 'Prompt was rejected by moderation' } }],
+    ];
+    await assert.rejects(context.generateImageCloseRouter('scene', '', { imageRefs: [ref('face', 'Hero')] }, {}), /API Error \(400\): Prompt was rejected by moderation/);
+    assert.equal(context.closeRouterTextOnlyModels.has('google/gemini-3.1-flash-image-preview'), false);
+    assert.equal(toasts.length, 0);
 });
 
 test('a model with edits gets the references and the resolution', async () => {

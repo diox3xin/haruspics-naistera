@@ -4400,8 +4400,8 @@ async function generateImageOpenAIChat(prompt, style, refData, options = {}) {
 // ("endpoint not supported"). Rules from closerouter.dev/docs/image-reference:
 // - `size` sets only the proportions; Gemini resolution goes into `input.resolution` (1K/2K/4K, flash-lite: 1K only);
 // - fields outside the documented list are rejected, so no negative_prompt / aspect_ratio fields;
-// - reference pictures go to /images/edits as JSON `images` (data: URLs); text-only models (flash-lite, Imagen…) have
-//   no edits — their references are passed as text;
+// - reference pictures go to /images/edits as JSON `images` (data: URLs). Which models have edits is not hard-coded:
+//   the first refusal is remembered for the session and that model then gets its references as text;
 // - 200 → data[].b64_json / url; 202 with object=image.request → poll GET /v1/media/requests/{id}.
 
 function isCloseRouterEndpoint(endpoint) {
@@ -4437,14 +4437,13 @@ function closeRouterSizeFor(aspectRatio, fallbackSize) {
 /** Models that turned out to have no /images/edits (text input only) this session. */
 const closeRouterTextOnlyModels = new Set();
 
-/** Does this model take reference pictures? flash-lite and Imagen are text-only; others are learned on the first refusal. */
+/**
+ * Does this model take reference pictures? Every model is tried with /images/edits first; one that refuses it
+ * (no edits on CloseRouter for it today) is remembered until the page reloads and then drawn from text only.
+ * Nothing is hard-coded, so a model that gets edits later starts receiving references by itself.
+ */
 function closeRouterTakesImages(modelId) {
-    return !/lite-image|imagen/i.test(modelId) && !closeRouterTextOnlyModels.has(modelId);
-}
-
-function isCloseRouterEndpointRefusal(status, text) {
-    return [400, 404, 405, 422].includes(status)
-        && /endpoint|operation|edits|not supported|unsupported|not available|не поддерж|недоступ/i.test(String(text || ''));
+    return !closeRouterTextOnlyModels.has(modelId);
 }
 
 /** The error message from CloseRouter's JSON ({error:{message}}), or the raw text. */
@@ -4521,7 +4520,7 @@ async function generateImageCloseRouter(prompt, style, refData, options = {}) {
     const base = closeRouterBaseUrl(api.endpoint);
     const model = closeRouterModelId(api.model);
     const imageRefs = refData?.imageRefs || [];
-    const sendImages = imageRefs.length > 0 && closeRouterTakesImages(model);
+    const sendImages = imageRefs.length > 0 && !options._textOnly && closeRouterTakesImages(model);
     if (imageRefs.length > 0 && !sendImages && !options._refsNoticeShown) {
         toastr.info(`${model} не принимает картинки-референсы: лица и одежда переданы только текстом`, 'CloseRouter', { timeOut: 5000 });
     }
@@ -4561,12 +4560,15 @@ async function generateImageCloseRouter(prompt, style, refData, options = {}) {
             if (!response.ok) text = await response.text();
         }
         if (!response.ok) {
-            // No /images/edits for this model: remember it and draw from text only.
-            if (sendImages && isCloseRouterEndpointRefusal(response.status, text)) {
+            // /images/edits refused (the wording of the refusal is not relied on): one try from text only. The model is
+            // remembered as «no references» only when that text-only picture works, so an unrelated error (bad prompt,
+            // moderation…) does not switch references off; then the text-only error is the one shown.
+            if (sendImages && [400, 404, 405, 422].includes(response.status)) {
+                iigLog('WARN', `CloseRouter: ${model} refused images/edits (${response.status}: ${closeRouterErrorText(text)}), retrying text-only`);
+                const image = await generateImageCloseRouter(prompt, style, refData, { ...options, _textOnly: true, _refsNoticeShown: true });
                 closeRouterTextOnlyModels.add(model);
-                iigLog('WARN', `CloseRouter: ${model} has no images/edits (${response.status}), retrying text-only`);
                 toastr.info(`${model} не принимает картинки-референсы: лица и одежда переданы только текстом`, 'CloseRouter', { timeOut: 5000 });
-                return generateImageCloseRouter(prompt, style, refData, { ...options, _refsNoticeShown: true });
+                return image;
             }
             throw new Error(`API Error (${response.status}): ${closeRouterErrorText(text)}`);
         }

@@ -143,6 +143,9 @@ const defaultSettings = Object.freeze({
     // ===== NEW: Presets =====
     apiPresets: [],
     activePresetId: null,
+    // ===== Full presets: snapshot of every setting except wardrobe & libraries =====
+    fullPresets: [],
+    activeFullPresetId: null,
     // ===== NEW: Style Gallery =====
     styleGalleryItems: [],
     activeStyleIds: [],
@@ -336,6 +339,8 @@ function getSettings() {
         if (!Object.hasOwn(item, 'category')) item.category = 'full';
     }
     if (!s.activeWardrobeRpg || typeof s.activeWardrobeRpg !== 'object' || Array.isArray(s.activeWardrobeRpg)) s.activeWardrobeRpg = {};
+    if (!Array.isArray(s.fullPresets)) s.fullPresets = [];
+    if (s.activeFullPresetId && !s.fullPresets.some(p => p.id === s.activeFullPresetId)) s.activeFullPresetId = null;
     if (!Array.isArray(s.styleGalleryItems)) s.styleGalleryItems = [];
     if (!Array.isArray(s.activeStyleIds)) s.activeStyleIds = [];
     for (const item of s.styleGalleryItems) {
@@ -2775,6 +2780,184 @@ function renderPresetSelect() {
         opt.selected = p.id === currentVal;
         select.appendChild(opt);
     }
+}
+
+// ============================================================
+// FULL SETTINGS PRESETS
+// Snapshot of every setting (API, style/negative/prompt selection,
+// display mode, avatars, injection, retries...). Libraries and
+// per-character data stay shared and are NOT stored in a preset.
+// ============================================================
+
+const FULL_PRESET_EXCLUDED_KEYS = new Set([
+    // Wardrobe & hairstyles (items and which outfit is worn)
+    'wardrobeItems', 'activeWardrobeChar', 'activeWardrobeUser', 'activeWardrobeRpg',
+    'hairstyleItems', 'activeHairstyleChar', 'activeHairstyleUser',
+    // Per-character data
+    'characterProfiles', 'characterReferenceLibrary', '_characterProfilesMigrated',
+    'characterLibrarySelectedKind', 'characterLibrarySelectedKey', 'npcReferences',
+    // Shared libraries: a preset stores which items are selected, not the items
+    'styleGalleryItems', 'negativeGalleryItems', 'promptInstructionItems',
+    // Preset storage itself and pure UI state
+    'apiPresets', 'fullPresets', 'activeFullPresetId', 'collapsedSections',
+    'settingsUiState', 'wardrobeSort', 'wardrobeDockCollapsed', 'wardrobeTagsVisible', 'promptAppearanceOpen',
+]);
+
+function getFullPresetKeys() {
+    return Object.keys(defaultSettings).filter(key => !FULL_PRESET_EXCLUDED_KEYS.has(key));
+}
+
+function snapshotFullPresetValues(settings = getSettings()) {
+    const values = {};
+    for (const key of getFullPresetKeys()) {
+        if (Object.hasOwn(settings, key)) values[key] = structuredClone(settings[key]);
+    }
+    return values;
+}
+
+function saveCurrentAsFullPreset(name) {
+    const settings = getSettings();
+    const preset = {
+        id: 'fullpreset_' + Date.now() + '_' + Math.random().toString(36).substring(2, 6),
+        name: String(name || '').trim() || 'Пресет',
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        values: snapshotFullPresetValues(settings),
+    };
+    settings.fullPresets.push(preset);
+    settings.activeFullPresetId = preset.id;
+    saveSettings();
+    return preset;
+}
+
+function updateFullPresetFromCurrent(presetId) {
+    const settings = getSettings();
+    const preset = settings.fullPresets.find(p => p.id === presetId);
+    if (!preset) return null;
+    preset.values = snapshotFullPresetValues(settings);
+    preset.updatedAt = Date.now();
+    saveSettings();
+    return preset;
+}
+
+function applyFullPreset(presetId) {
+    const settings = getSettings();
+    const preset = settings.fullPresets.find(p => p.id === presetId);
+    if (!preset || !preset.values || typeof preset.values !== 'object') return null;
+    const allowed = new Set(getFullPresetKeys());
+    for (const [key, value] of Object.entries(preset.values)) {
+        // Keys missing from an older preset keep their current value.
+        if (allowed.has(key)) settings[key] = structuredClone(value);
+    }
+    settings.activeFullPresetId = presetId;
+    getSettings(); // re-run normalization (drops selections of deleted styles etc.)
+    saveSettings();
+    return preset;
+}
+
+function renameFullPreset(presetId, name) {
+    const settings = getSettings();
+    const preset = settings.fullPresets.find(p => p.id === presetId);
+    const clean = String(name || '').trim();
+    if (!preset || !clean) return null;
+    preset.name = clean;
+    saveSettings();
+    return preset;
+}
+
+function deleteFullPreset(presetId) {
+    const settings = getSettings();
+    settings.fullPresets = settings.fullPresets.filter(p => p.id !== presetId);
+    if (settings.activeFullPresetId === presetId) settings.activeFullPresetId = null;
+    saveSettings();
+}
+
+function renderFullPresetSelect() {
+    const settings = getSettings();
+    const select = document.getElementById('iig_full_preset_select');
+    if (!select) return;
+    const currentVal = settings.activeFullPresetId || '';
+    select.innerHTML = '<option value="">-- без пресета --</option>';
+    for (const p of settings.fullPresets) {
+        const opt = document.createElement('option');
+        opt.value = p.id;
+        opt.textContent = p.name;
+        opt.selected = p.id === currentVal;
+        select.appendChild(opt);
+    }
+}
+
+// Re-render the whole settings panel in place so every control shows the loaded values.
+function rebuildSettingsUI() {
+    const oldRoot = document.getElementById('iig_settings_root');
+    if (!oldRoot) return;
+    closeFaqHints();
+    const oldContent = oldRoot.querySelector('.inline-drawer-content');
+    const wasOpen = !!oldContent && getComputedStyle(oldContent).display !== 'none';
+    createSettingsUI(oldRoot);
+    if (!wasOpen) return;
+    const root = document.getElementById('iig_settings_root');
+    const content = root?.querySelector('.inline-drawer-content');
+    if (content) content.style.display = 'block';
+    root?.querySelector('.inline-drawer-icon')?.classList.replace('down', 'up');
+}
+
+function bindFullPresetEvents() {
+    const getSelectedPreset = () => {
+        const presetId = document.getElementById('iig_full_preset_select')?.value;
+        if (!presetId) { toastr.warning('Сначала выберите пресет', 'Пресеты настроек'); return null; }
+        return getSettings().fullPresets.find(p => p.id === presetId) || null;
+    };
+
+    document.getElementById('iig_full_preset_select')?.addEventListener('change', (e) => {
+        const presetId = e.target.value;
+        if (!presetId) {
+            getSettings().activeFullPresetId = null;
+            saveSettings();
+            return;
+        }
+        const preset = applyFullPreset(presetId);
+        if (!preset) { toastr.error('Пресет не найден', 'Пресеты настроек'); return; }
+        rebuildSettingsUI();
+        applyImageDisplayMode();
+        updateWardrobeInjection();
+        updateImageModeInjection();
+        toastr.success(`Пресет "${preset.name}" загружен`, 'Пресеты настроек');
+    });
+
+    document.getElementById('iig_full_preset_save')?.addEventListener('click', () => {
+        const name = prompt('Название пресета настроек:');
+        if (!name?.trim()) return;
+        const preset = saveCurrentAsFullPreset(name);
+        renderFullPresetSelect();
+        toastr.success(`Пресет "${preset.name}" сохранён`, 'Пресеты настроек');
+    });
+
+    document.getElementById('iig_full_preset_update')?.addEventListener('click', () => {
+        const preset = getSelectedPreset();
+        if (!preset) return;
+        if (!confirm(`Перезаписать пресет "${preset.name}" текущими настройками?`)) return;
+        updateFullPresetFromCurrent(preset.id);
+        toastr.success(`Пресет "${preset.name}" обновлён`, 'Пресеты настроек');
+    });
+
+    document.getElementById('iig_full_preset_rename')?.addEventListener('click', () => {
+        const preset = getSelectedPreset();
+        if (!preset) return;
+        const name = prompt('Новое название:', preset.name);
+        if (!name?.trim()) return;
+        renameFullPreset(preset.id, name);
+        renderFullPresetSelect();
+    });
+
+    document.getElementById('iig_full_preset_delete')?.addEventListener('click', () => {
+        const preset = getSelectedPreset();
+        if (!preset) return;
+        if (!confirm(`Удалить пресет "${preset.name}"?`)) return;
+        deleteFullPreset(preset.id);
+        renderFullPresetSelect();
+        toastr.info(`Пресет "${preset.name}" удалён`, 'Пресеты настроек');
+    });
 }
 
 // ============================================================
@@ -8074,7 +8257,7 @@ function bindRpgCharacterEvents(container, charProfile) {
     });
 }
 
-function createSettingsUI() {
+function createSettingsUI(replaceTarget = null) {
     const settings = getSettings();
     const container = document.getElementById('extensions_settings');
     if (!container) return;
@@ -8093,6 +8276,16 @@ function createSettingsUI() {
                         <input type="checkbox" id="iig_enabled" ${settings.enabled ? 'checked' : ''}>
                         <span>Включить генерацию картинок</span>
                     </label>
+
+                    <!-- ======= Full settings presets (stays above the tabs) ======= -->
+                    <div class="iig-full-presets-bar" title="Сохраняет всё сразу: API и модель, активные стили и негатив, инструкцию промпта и её API, отправку аватаров, режим отображения, инъекции, повторы и т.д. Не сохраняются: гардероб и причёски, профили персонажей, NPC и сами библиотеки стилей/негативов/инструкций (в пресете хранится только какие из них выбраны).">
+                        <label for="iig_full_preset_select"><i class="fa-solid fa-floppy-disk"></i> Пресет настроек</label>
+                        <select id="iig_full_preset_select" class="flex1"></select>
+                        <div class="menu_button" id="iig_full_preset_save" title="Сохранить все текущие настройки как новый пресет"><i class="fa-solid fa-plus"></i></div>
+                        <div class="menu_button" id="iig_full_preset_update" title="Перезаписать выбранный пресет текущими настройками"><i class="fa-solid fa-arrows-rotate"></i></div>
+                        <div class="menu_button" id="iig_full_preset_rename" title="Переименовать выбранный пресет"><i class="fa-solid fa-pen"></i></div>
+                        <div class="menu_button" id="iig_full_preset_delete" title="Удалить выбранный пресет" style="color:#cc5555;"><i class="fa-solid fa-trash"></i></div>
+                    </div>
 
                     <!-- ======= SECTION: Display mode ======= -->
                     <div class="iig-collapsible" data-section-id="display_mode">
@@ -8692,15 +8885,25 @@ function createSettingsUI() {
         </div>
     `;
 
-    container.insertAdjacentHTML('beforeend', html);
+    if (replaceTarget) {
+        // Rebuild in place: drop the old panel before binding so ids stay unique.
+        replaceTarget.insertAdjacentHTML('afterend', html);
+        replaceTarget.remove();
+    } else {
+        container.insertAdjacentHTML('beforeend', html);
+    }
 
     bindSettingsEvents();
+    bindFullPresetEvents();
     organizeSettingsTabs();
     initCollapsibleSections();
     initFaqButtons();
     updateCharAvatarPreview();
     renderPresetSelect();
+    renderFullPresetSelect();
 }
+
+let avatarDropdownOutsideClickBound = false;
 
 function bindSettingsEvents() {
     const settings = getSettings();
@@ -9035,10 +9238,14 @@ function bindSettingsEvents() {
         }
     });
 
-    document.addEventListener('click', (e) => {
-        const dropdown = document.getElementById('iig_avatar_dropdown');
-        if (dropdown && !dropdown.contains(e.target)) dropdown.classList.remove('open');
-    });
+    // Bound once: the panel can be rebuilt when a full preset is loaded.
+    if (!avatarDropdownOutsideClickBound) {
+        avatarDropdownOutsideClickBound = true;
+        document.addEventListener('click', (e) => {
+            const dropdown = document.getElementById('iig_avatar_dropdown');
+            if (dropdown && !dropdown.contains(e.target)) dropdown.classList.remove('open');
+        });
+    }
 
     document.getElementById('iig_refresh_avatars')?.addEventListener('click', async (e) => {
         e.stopPropagation();

@@ -2277,3 +2277,20 @@ button.iig-wardrobe-tag:focus-visible { border-color: var(--iig-wr-accent); outl
 .iig-check-line.is-ok { color: #8fd18f; }
 .iig-check-line.is-error { color: #f08a8a; }
 .iig-check-line.is-verdict { margin-top: 4px; padding: 6px 8px; border-radius: 6px; background: rgba(255, 182, 193, .08); border: 1px solid rgba(255, 182, 193, .25); color: #eee; }
+
+/* ===== Full settings presets bar (above the settings tabs) ===== */
+.iig-full-presets-bar {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-bottom: 10px;
+}
+.iig-full-presets-bar label {
+    flex-shrink: 0;
+    font-size: 12px;
+    opacity: 0.85;
+    white-space: nowrap;
+}
+.iig-full-presets-bar select {
+    min-width: 0;
+}
